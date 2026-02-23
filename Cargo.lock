@@ -897,22 +897,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quictun-spike"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aws-lc-rs",
- "bytes",
- "hex",
- "quinn",
- "rustls",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "quictun-tun"
 version = "0.1.0"
 dependencies = [
