@@ -273,11 +273,13 @@ sequenceDiagram
 
     Note over C,S: QUIC Connection Establishment (1-RTT)
 
-    C->>S: QUIC Initial<br/>ClientHello<br/>+ client_certificate_type=RawPublicKey<br/>+ server_certificate_type=RawPublicKey<br/>+ supported_groups=[P-256, P-384]<br/>+ signature_algorithms=[ECDSA-P256-SHA256]<br/>+ key_share=[P-256 ephemeral]
+    C->>S: QUIC Initial<br/>ClientHello<br/>+ client_certificate_type=RawPublicKey<br/>+ server_certificate_type=RawPublicKey<br/>+ supported_groups=[P-256, P-384, x25519]<br/>+ signature_algorithms=[ECDSA-P256-SHA256, Ed25519]<br/>+ key_share=[P-256 or x25519 ephemeral]
 
-    S->>C: QUIC Handshake<br/>ServerHello<br/>+ key_share=[P-256 ephemeral]<br/>+ EncryptedExtensions<br/>+ CertificateRequest<br/>+ Certificate(RPK: server_ed25519_pk)<br/>+ CertificateVerify<br/>+ Finished
+    Note right of S: FIPS mode: selects P-256 + ECDSA<br/>Non-FIPS: may select x25519 + Ed25519
 
-    C->>S: QUIC Handshake<br/>Certificate(RPK: client_ed25519_pk)<br/>+ CertificateVerify<br/>+ Finished
+    S->>C: QUIC Handshake<br/>ServerHello<br/>+ key_share=[selected group ephemeral]<br/>+ EncryptedExtensions<br/>+ CertificateRequest<br/>+ Certificate(RPK: server public key)<br/>+ CertificateVerify<br/>+ Finished
+
+    C->>S: QUIC Handshake<br/>Certificate(RPK: client public key)<br/>+ CertificateVerify<br/>+ Finished
 
     Note over C,S: 1-RTT Handshake Complete
 
@@ -498,23 +500,22 @@ Note: Inner TCP connections running through the tunnel perform their own congest
 
 ## 6. Cryptographic Design
 
-### 6.1 FIPS-Approved Cipher Suites
+### 6.1 Cipher Suite Selection
 
 QuicTun negotiates cipher suites via TLS 1.3's standard mechanism. By default, both FIPS-approved and non-FIPS cipher suites are available. When `fips_mode = true` is set, QuicTun restricts negotiation to FIPS-approved combinations only.
 
 ### Table 4: Cryptographic Algorithm Comparison
 
-| Function | QuicTun (FIPS) | WireGuard | FIPS 140-3 Approved |
+| Function | QuicTun (FIPS mode) | QuicTun (default mode) | WireGuard |
 |---|---|---|---|
-| Key exchange | ECDHE P-256 / P-384 | Curve25519 | P-256: Yes, Curve25519: No |
-| Authentication | ECDSA P-256 / Ed25519* | Curve25519 (static) | ECDSA: Yes, Ed25519: No** |
-| Symmetric cipher | AES-128-GCM / AES-256-GCM | ChaCha20-Poly1305 | AES-GCM: Yes, ChaCha20: No |
-| Hash / KDF | SHA-256 / SHA-384 (HKDF) | BLAKE2s (HMAC) | SHA-2: Yes, BLAKE2s: No |
-| MAC | GMAC (via AES-GCM) | Poly1305 | GMAC: Yes, Poly1305: No |
+| Key exchange | ECDHE P-256 / P-384 | ECDHE P-256 / P-384 / x25519 | Curve25519 |
+| Authentication | ECDSA P-256 / P-384 | ECDSA P-256 / Ed25519 | Curve25519 (static) |
+| Symmetric cipher | AES-128-GCM / AES-256-GCM | AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305 | ChaCha20-Poly1305 |
+| Hash / KDF | SHA-256 / SHA-384 (HKDF) | SHA-256 / SHA-384 (HKDF) | BLAKE2s (HMAC) |
+| MAC | GMAC (via AES-GCM) | GMAC or Poly1305 (via AEAD) | Poly1305 |
+| FIPS 140-3 | All approved | Mix of approved and non-approved | None approved |
 
-\* Ed25519 is supported for RPK authentication when FIPS mode is not required.
-
-\** Ed25519 is under consideration for FIPS approval (NIST SP 800-186) but is not yet on the approved list as of 2026.
+In default mode, TLS 1.3 negotiates the optimal cipher suite for the connection. Devices with hardware AES (AES-NI, ARMv8-CE) typically prefer AES-GCM for performance; devices without hardware AES prefer ChaCha20-Poly1305 for constant-time software execution. In FIPS mode, only FIPS-approved algorithms are permitted, and non-approved options (x25519, Ed25519, ChaCha20-Poly1305) are disabled.
 
 ### 6.2 FIPS Module Boundary
 
@@ -896,7 +897,7 @@ QuicTun (CID=4):
   = Available for inner IP packet: 1448 bytes
 
 WireGuard:
-  QUIC payload:                   1472 bytes
+  UDP payload:                    1472 bytes
   - WireGuard header:               16 bytes
   - Poly1305 tag:                    16 bytes
   = Available for inner IP packet: 1440 bytes
