@@ -1,4 +1,4 @@
-# QuicTun: A QUIC-Based VPN Tunnel with FIPS 140-3 Compliance for Enterprise Environments
+# QuicTun: A QUIC-Based Secure Tunnel Primitive Built on RFC-Standardized Protocols
 
 **Authors:** SeoulValley Engineering
 
@@ -10,25 +10,25 @@
 
 ## Abstract
 
-Enterprise VPN deployments face a fundamental tension between modern transport efficiency and regulatory compliance. WireGuard, while performant and elegant, employs the Noise protocol framework with non-FIPS-approved primitives (ChaCha20-Poly1305, Curve25519, BLAKE2s), rendering it ineligible for environments requiring FIPS 140-3 validation. Its fixed UDP port is trivially blocked by restrictive firewalls, and it lacks native support for connection migration — a critical feature for mobile workforces.
+WireGuard established a new standard for VPN simplicity, but its design choices — the Noise protocol framework with Curve25519, ChaCha20-Poly1305, and BLAKE2s — create barriers in environments requiring FIPS 140-3 compliance. Its fixed UDP port is trivially blocked by restrictive firewalls, and it lacks native support for connection migration.
 
-We present **QuicTun**, a VPN tunnel built directly on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), leveraging Raw Public Keys (RFC 7250) for WireGuard-style identity management without the overhead of X.509 certificate infrastructure. By adopting QUIC as the transport layer, QuicTun inherits encryption, multiplexing, congestion control, and connection migration as first-class protocol features rather than re-implementing them.
+We present **QuicTun**, a secure tunnel primitive built directly on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), leveraging Raw Public Keys (RFC 7250) for WireGuard-style identity management without the overhead of X.509 certificate infrastructure. Like WireGuard, QuicTun is a point-to-point tunnel — it creates a secure, encrypted link between two peers. What operators build on top of it (site-to-site VPN, remote access gateway, mesh overlay, multi-hop relay) is an application-layer concern, not a protocol concern. By adopting QUIC as the transport layer, QuicTun inherits encryption, multiplexing, congestion control, and connection migration as first-class protocol features rather than re-implementing them.
 
-Our per-packet overhead analysis demonstrates that QuicTun with zero-length Connection IDs achieves a **20-byte overhead** per tunneled packet — 37.5% less than WireGuard's 32-byte overhead — while operating over a fully RFC-standardized, FIPS-compliant protocol stack. QuicTun operates on UDP port 443, making it indistinguishable from standard QUIC/HTTP3 traffic to network middleboxes and DPI systems.
+Our per-packet overhead analysis demonstrates that QuicTun with zero-length Connection IDs achieves a **20-byte overhead** per tunneled packet — 37.5% less than WireGuard's 32-byte overhead — while operating over a fully RFC-standardized protocol stack. Because QuicTun's entire cryptographic layer delegates to aws-lc-rs (FIPS 140-3 Certificate #4631), deployments requiring FIPS compliance can enable it through configuration rather than architectural changes. QuicTun operates on UDP port 443, making it indistinguishable from standard QUIC/HTTP3 traffic to network middleboxes and DPI systems.
 
 ---
 
 ## 1. Introduction
 
-### 1.1 The Enterprise VPN Problem
+### 1.1 The Problem
 
-Enterprise networks require encrypted tunnels that satisfy three often-conflicting constraints:
+Encrypted tunnels are a foundational network primitive. The design space spans personal VPNs, site-to-site links, service mesh encryption, and enterprise remote access. Despite this diversity, most deployments share common requirements:
 
-1. **Regulatory compliance** — Government agencies (FedRAMP, DoD IL4/5), financial institutions (PCI-DSS), and healthcare organizations (HIPAA) mandate FIPS 140-3 validated cryptographic modules.
-2. **Network traversal** — Corporate firewalls, hotel networks, and national-level censorship systems increasingly block non-standard UDP traffic, requiring tunnels that blend with legitimate web traffic.
-3. **Mobile continuity** — Modern workforces roam between Wi-Fi, cellular, and wired networks, demanding seamless connection migration without session re-establishment.
+1. **Standards-based cryptography** — RFC-standardized, widely audited protocols reduce risk and enable regulatory compliance (FIPS 140-3) when needed.
+2. **Network traversal** — Firewalls, hotel networks, and restrictive enterprise environments increasingly block non-standard UDP traffic, requiring tunnels that blend with legitimate web traffic.
+3. **Mobile continuity** — Devices roam between Wi-Fi, cellular, and wired networks, requiring seamless connection migration without session re-establishment.
 
-Legacy solutions (IPsec/IKEv2, OpenVPN) satisfy compliance but suffer from protocol complexity and poor performance. WireGuard delivers simplicity and speed but fails on all three enterprise constraints.
+Legacy solutions (IPsec/IKEv2, OpenVPN) use standardized cryptography but suffer from protocol complexity and poor performance. WireGuard delivers simplicity and speed but uses non-standard cryptographic primitives, a fixed protocol fingerprint, and lacks connection migration.
 
 ### 1.2 WireGuard's Limitations
 
@@ -43,9 +43,9 @@ WireGuard [Donenfeld 2017] is widely recognized for its minimal attack surface (
 
 This paper makes the following contributions:
 
-1. **Architecture.** We present QuicTun, a VPN tunnel that uses QUIC datagrams (RFC 9221) for data-plane transport and QUIC streams for control-plane signaling, achieving clean separation of concerns over a single UDP flow.
+1. **Architecture.** We present QuicTun, a tunnel primitive that uses QUIC datagrams (RFC 9221) for data-plane transport and QUIC streams for control-plane signaling, achieving clean separation of concerns over a single UDP flow.
 2. **Overhead analysis.** We provide a byte-level comparison showing QuicTun achieves 20-byte per-packet overhead (with zero-length CIDs), compared to WireGuard's 32 bytes.
-3. **FIPS compliance.** We describe a complete FIPS 140-3 compliant cryptographic architecture using aws-lc-rs (Certificate #4631) as the validated module boundary.
+3. **FIPS-ready cryptography.** We describe a cryptographic architecture that delegates all primitives to aws-lc-rs (FIPS 140-3 Certificate #4631), enabling FIPS-compliant operation through a configuration flag without architectural changes.
 4. **Firewall traversal.** We demonstrate that QuicTun on UDP 443 is protocol-indistinguishable from standard HTTP/3 traffic to passive DPI systems.
 5. **Performance tiers.** We present a three-tier architecture (TUN, XDP/AF_XDP, DPDK) enabling deployment from 1 Gbps edge nodes to 100 Gbps data center gateways.
 
@@ -98,7 +98,7 @@ Several projects have explored QUIC for VPN tunneling:
 - **Hysteria** — A censorship-resistant proxy built on a modified QUIC implementation (quic-go) with custom congestion control (Brutal), optimized for lossy networks.
 - **oVPN over QUIC** — OpenVPN's experimental QUIC transport, which layers the existing OpenVPN protocol over QUIC streams, inheriting OpenVPN's significant per-packet overhead.
 
-None of these projects target enterprise FIPS compliance or provide the zero-overhead datagram tunneling that QuicTun achieves.
+None of these projects provide the zero-overhead datagram tunneling or FIPS-ready cryptographic architecture that QuicTun achieves.
 
 ### 2.5 FIPS 140-3
 
@@ -115,7 +115,7 @@ WireGuard's primitives — Curve25519, ChaCha20-Poly1305, BLAKE2s — are not FI
 
 | Feature | WireGuard | IPsec/IKEv2 | OpenVPN | MASQUE | **QuicTun** |
 |---|---|---|---|---|---|
-| FIPS 140-3 compliant | No | Yes | Yes | Yes | **Yes** |
+| FIPS 140-3 ready | No | Yes | Yes | Yes | **Yes** |
 | Connection migration | No | IKEv2 MOBIKE | No | Yes | **Yes** |
 | Built-in congestion control | No | No | No | Yes | **Yes** |
 | Firewall traversal (443) | No | UDP 500/4500 | TCP 443 | Yes | **Yes** |
@@ -134,7 +134,7 @@ WireGuard's primitives — Curve25519, ChaCha20-Poly1305, BLAKE2s — are not FI
 
 QuicTun is designed to satisfy the following goals:
 
-1. **FIPS 140-3 compliance.** All cryptographic operations must use FIPS-approved algorithms within a validated module boundary, enabling deployment in FedRAMP, DoD, and regulated financial environments.
+1. **FIPS-ready cryptographic architecture.** All cryptographic operations are delegated to a library with an existing FIPS 140-3 validation (aws-lc-rs). Enabling FIPS-compliant mode should require only a configuration change, not an architectural one.
 
 2. **Minimal per-packet overhead.** The tunnel must add no more overhead than WireGuard per tunneled packet, preserving effective MTU for inner protocols.
 
@@ -165,11 +165,14 @@ QuicTun assumes the following threat model:
 - Peer public keys are distributed through a trusted out-of-band channel
 - The operating system's random number generator is properly seeded
 
-### 3.3 Non-Goals
+### 3.3 Scope and Non-Goals
+
+QuicTun is a **tunnel primitive** — a secure, encrypted point-to-point link between two peers. Like WireGuard, it deliberately does not prescribe topology. Site-to-site VPN, remote access gateway, mesh overlay (analogous to Tailscale over WireGuard), and multi-hop relay are all valid compositions of QuicTun tunnels, built at the application or orchestration layer. The tunnel itself is topology-agnostic.
+
+The following are explicitly out of scope for the tunnel primitive:
 
 - **Anonymity.** QuicTun is not a Tor replacement. Traffic analysis resistance is not a design goal.
 - **Censorship circumvention.** While QuicTun resists casual DPI, it does not implement active probing countermeasures designed for adversarial censorship environments (e.g., China's GFW).
-- **Multi-hop routing.** QuicTun is a point-to-point tunnel, not a mesh or overlay network.
 - **Application-layer proxying.** QuicTun operates at Layer 3 (IP tunneling), not as an HTTP/SOCKS proxy.
 
 ---
@@ -178,7 +181,7 @@ QuicTun assumes the following threat model:
 
 ### 4.1 System Architecture
 
-QuicTun follows a split-plane architecture: a **control plane** using QUIC streams for reliable, ordered signaling, and a **data plane** using QUIC DATAGRAM frames for unreliable, low-overhead IP packet transport.
+QuicTun is a point-to-point tunnel primitive with a split-plane architecture: a **control plane** using QUIC streams for reliable, ordered signaling, and a **data plane** using QUIC DATAGRAM frames for unreliable, low-overhead IP packet transport.
 
 **Figure 1: System Architecture**
 
@@ -497,7 +500,7 @@ Note: Inner TCP connections running through the tunnel perform their own congest
 
 ### 6.1 FIPS-Approved Cipher Suites
 
-QuicTun negotiates cipher suites via TLS 1.3's standard mechanism. Only FIPS-approved combinations are enabled.
+QuicTun negotiates cipher suites via TLS 1.3's standard mechanism. By default, both FIPS-approved and non-FIPS cipher suites are available. When `fips_mode = true` is set, QuicTun restricts negotiation to FIPS-approved combinations only.
 
 ### Table 4: Cryptographic Algorithm Comparison
 
@@ -515,7 +518,7 @@ QuicTun negotiates cipher suites via TLS 1.3's standard mechanism. Only FIPS-app
 
 ### 6.2 FIPS Module Boundary
 
-QuicTun delegates all cryptographic operations to **aws-lc-rs**, the Rust wrapper around AWS-LC (AWS Libcrypto). AWS-LC holds FIPS 140-3 Certificate #4631 (Security Level 1), validated by an accredited NIST CMVP laboratory.
+QuicTun delegates all cryptographic operations to **aws-lc-rs**, the Rust wrapper around AWS-LC (AWS Libcrypto). AWS-LC holds FIPS 140-3 Certificate #4631 (Security Level 1), validated by an accredited NIST CMVP laboratory. This design choice means QuicTun does not need to implement or certify its own cryptographic module — it inherits FIPS readiness from the underlying library.
 
 ### Table 5: FIPS 140-3 Compliance Matrix
 
@@ -749,9 +752,9 @@ RPK authentication trades certificate infrastructure for trust-on-first-use (TOF
 - **No revocation infrastructure.** RPK does not support CRL or OCSP. Key revocation is managed by removing the key from the server's allowlist — similar to WireGuard's model.
 - **Key distribution.** RPK requires a separate mechanism for distributing and verifying public keys. In enterprise environments, this can be automated via configuration management (Ansible, Terraform) or a lightweight key directory.
 
-### 10.4 FIPS Verification
+### 10.4 Enabling FIPS Mode
 
-To verify FIPS 140-3 compliance in a QuicTun deployment:
+For deployments requiring FIPS 140-3 compliance, QuicTun can be configured for FIPS-compliant operation without architectural changes:
 
 1. Confirm `aws-lc-rs` is compiled with the `fips` feature flag
 2. Verify the aws-lc shared library matches the validated module (hash comparison against CMVP certificate #4631)
@@ -765,11 +768,12 @@ To verify FIPS 140-3 compliance in a QuicTun deployment:
 
 ### 11.1 Deployment Scenarios
 
-QuicTun targets three primary deployment scenarios:
+As a tunnel primitive, QuicTun is building-block agnostic. The following scenarios illustrate how it can be composed, not an exhaustive list:
 
-1. **Remote access VPN.** Mobile clients connect to a QuicTun gateway. Connection migration ensures seamless roaming. FIPS compliance enables government and regulated-industry deployment.
-2. **Site-to-site tunnel.** Branch offices connect to data centers via persistent tunnels. Zero-length CIDs minimize overhead on stable links. XDP/DPDK tiers handle high-throughput interconnects.
-3. **Cloud-native service mesh.** Kubernetes pods use QuicTun sidecars for encrypted east-west traffic. The lightweight overhead (20–28 bytes) and 1-RTT handshake minimize performance impact.
+1. **Remote access.** Mobile clients connect to a QuicTun gateway. Connection migration ensures seamless roaming. FIPS mode can be enabled for regulated environments.
+2. **Site-to-site tunnel.** Persistent tunnels between sites. Zero-length CIDs minimize overhead on stable links. XDP/DPDK tiers handle high-throughput interconnects.
+3. **Mesh overlay.** An orchestration layer (analogous to Tailscale or Nebula) can compose multiple QuicTun tunnels into a mesh network. Each tunnel remains a simple peer-to-peer link; the orchestrator manages topology, key distribution, and peer discovery.
+4. **Cloud-native service mesh.** Kubernetes pods use QuicTun sidecars for encrypted east-west traffic. The lightweight overhead (20–28 bytes) and 1-RTT handshake minimize performance impact.
 
 ### 11.2 Overhead in Context: MTU Analysis
 
@@ -831,9 +835,9 @@ QuicTun (CID=0) provides **12 additional bytes** of inner MTU compared to WireGu
 
 ## 12. Conclusion
 
-QuicTun demonstrates that QUIC provides a superior VPN transport layer compared to custom protocols like WireGuard's Noise-based design, particularly for enterprise environments with regulatory and operational constraints.
+QuicTun demonstrates that QUIC provides a superior transport for secure tunneling compared to custom protocols like WireGuard's Noise-based design.
 
-By building on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), QuicTun inherits encryption, congestion control, connection migration, and multiplexing as standardized protocol features. The use of QUIC DATAGRAM frames (RFC 9221) achieves a 20-byte per-packet overhead with zero-length Connection IDs — 37.5% less than WireGuard's 32 bytes — while operating entirely within FIPS 140-3 validated cryptographic boundaries via aws-lc-rs (Certificate #4631).
+By building on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), QuicTun inherits encryption, congestion control, connection migration, and multiplexing as standardized protocol features. The use of QUIC DATAGRAM frames (RFC 9221) achieves a 20-byte per-packet overhead with zero-length Connection IDs — 37.5% less than WireGuard's 32 bytes. Because all cryptographic operations delegate to aws-lc-rs (FIPS 140-3 Certificate #4631), FIPS-compliant operation is a configuration choice, not an engineering project.
 
 Raw Public Key authentication (RFC 7250) preserves WireGuard's elegant identity model — peers identified by public keys, no certificate authority required — while remaining compatible with enterprise PKI through TLS 1.3's certificate type negotiation.
 
@@ -841,7 +845,7 @@ Operating on UDP port 443, QuicTun is indistinguishable from HTTP/3 traffic to p
 
 The three-tier performance architecture (TUN, XDP/AF_XDP, DPDK) enables deployment from laptop endpoints to 100 Gbps data center gateways, scaling with hardware investment rather than protocol redesign.
 
-QuicTun does not aim to replace WireGuard in all scenarios. For personal VPN use, homelab deployments, and environments without compliance requirements, WireGuard's simplicity and in-kernel performance remain compelling. QuicTun targets the enterprise segment where FIPS compliance, firewall traversal, and connection migration are not optional features but deployment prerequisites.
+Like WireGuard, QuicTun is a tunnel primitive — it creates a secure point-to-point link and does not prescribe how that link is used. Site-to-site VPN, remote access, mesh overlay, multi-hop relay, and service mesh encryption are all valid compositions, built at the orchestration layer rather than embedded in the tunnel protocol.
 
 ---
 
