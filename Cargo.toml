@@ -5,6 +5,7 @@ members = [
     "quictun-core",
     "quictun-tun",
     "quictun-cli",
+    "spike",
 ]
 
 [workspace.package]
