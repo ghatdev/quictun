@@ -13,8 +13,8 @@ pub async fn run_forwarding_loop(
     tun: &TunDevice,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let max_datagram_size = connection.max_datagram_size().unwrap_or(1200);
-    tracing::info!(max_datagram_size, "forwarding loop started");
+    let initial_max = connection.max_datagram_size().unwrap_or(1200);
+    tracing::info!(max_datagram_size = initial_max, "forwarding loop started");
 
     let mut buf = vec![0u8; 65535];
 
@@ -22,10 +22,12 @@ pub async fn run_forwarding_loop(
         tokio::select! {
             result = tun.recv(&mut buf) => {
                 let n = result?;
-                if n > max_datagram_size {
+                // Check dynamically — DPLPMTUD may have updated the path MTU
+                let max = connection.max_datagram_size().unwrap_or(1200);
+                if n > max {
                     warn!(
                         packet_size = n,
-                        max = max_datagram_size,
+                        max,
                         "dropping oversized packet from TUN"
                     );
                     continue;

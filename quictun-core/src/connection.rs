@@ -72,9 +72,13 @@ pub fn build_client_config(
 }
 
 /// Build a transport config with datagram support and optional keepalive.
+///
+/// Sets `initial_mtu` to 1452 (1500 - 20 IPv4 - 8 UDP - 20 safety margin)
+/// so that DPLPMTUD starts near Ethernet MTU instead of the QUIC minimum of 1200.
 pub fn make_transport_config(keepalive: Option<Duration>) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(65535));
+    transport.initial_mtu(1452);
     if let Some(interval) = keepalive {
         transport.keep_alive_interval(Some(interval));
     }
