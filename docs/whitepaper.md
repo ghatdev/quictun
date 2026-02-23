@@ -124,6 +124,7 @@ WireGuard's primitives — Curve25519, ChaCha20-Poly1305, BLAKE2s — are not FI
 | DPI resistance | Low | Low | Medium | High | **High** |
 | RFC standardized transport | No | Yes | No | Yes | **Yes** |
 | Kernel-mode data path | Yes | Yes | No | No | **Yes (XDP)** |
+| Path MTU discovery | ICMP-based | ICMP-based | ICMP-based | DPLPMTUD | **DPLPMTUD** |
 | Code complexity | ~4K LoC | ~100K+ LoC | ~100K+ LoC | Varies | **~15K LoC** |
 
 ---
@@ -494,7 +495,22 @@ QuicTun supports pluggable congestion control algorithms:
 - **BBR v2** — Recommended for high-BDP paths (data center interconnects, satellite links)
 - **NewReno** (RFC 9002 default) — Conservative baseline
 
-Note: Inner TCP connections running through the tunnel perform their own congestion control. The interaction between inner and outer congestion control (the "TCP-in-TCP" problem) is mitigated by using DATAGRAM frames (unreliable) rather than QUIC streams (reliable), ensuring the outer QUIC layer does not retransmit lost datagrams.
+Note: Inner TCP connections running through the tunnel perform their own congestion control. The interaction between inner and outer congestion control is mitigated by using DATAGRAM frames (unreliable) rather than QUIC streams (reliable), ensuring the outer QUIC layer does not retransmit lost datagrams. When QUIC's congestion control drops a datagram due to congestion, the inner TCP detects the loss via its own mechanisms and adapts. This is preferable to WireGuard's approach, where the tunnel has no congestion awareness and inner TCP must discover congestion entirely on its own.
+
+### 5.8 Path MTU Discovery
+
+QUIC incorporates Datagram Packetization Layer PMTU Discovery (DPLPMTUD, RFC 8899), which discovers the path MTU without relying on ICMP "Fragmentation Needed" messages. This is a significant operational advantage over WireGuard, which relies on the operating system's standard PMTUD mechanism.
+
+Traditional PMTUD depends on ICMP messages that are frequently blocked by firewalls, middleboxes, and security appliances. When ICMP is filtered, PMTUD fails silently, causing either black-holed packets (too large, silently dropped) or suboptimal MTU (too conservative, wasting bandwidth). This is a common operational problem known as "PMTUD black hole."
+
+QUIC's DPLPMTUD probes the path by sending progressively larger packets and observing which are acknowledged. It does not rely on any ICMP feedback:
+
+1. Start with a baseline MTU (1200 bytes, the QUIC minimum)
+2. Send probe packets at increasing sizes
+3. If a probe is acknowledged, the MTU can be raised
+4. If a probe is lost, the current MTU is maintained
+
+This allows QuicTun to automatically discover and use the optimal MTU on any network path, including paths where ICMP is blocked — a scenario that causes persistent problems for WireGuard deployments behind restrictive firewalls.
 
 ---
 
@@ -739,7 +755,7 @@ QuicTun inherits the security properties of TLS 1.3 (RFC 8446), which have been 
 | Property | WireGuard | QuicTun | Notes |
 |---|---|---|---|
 | Forward secrecy | Yes (Noise) | Yes (ECDHE) | Both provide per-session ephemeral keys |
-| Identity hiding | Yes (encrypted handshake) | Partial (SNI visible*) | *ECH (Encrypted ClientHello) can mitigate |
+| Identity hiding | Yes (encrypted handshake) | Yes with RPK (no SNI); partial with X.509 | RPK: no domain name to leak. X.509: SNI visible without ECH |
 | Replay protection | Counter-based | Packet number-based | Both effective; QUIC additionally authenticates packet numbers |
 | Denial-of-service resistance | Cookie mechanism | Retry token + address validation | QUIC's RETRY mechanism is analogous to WG's cookie |
 | Quantum resistance | No | No (future: ML-KEM) | Both vulnerable to harvest-now-decrypt-later |
@@ -909,13 +925,15 @@ QuicTun (CID=0) provides **12 additional bytes** of inner MTU compared to WireGu
 
 Security-related tradeoffs (cipher agility, code surface, state machine complexity, etc.) are addressed in detail in Section 10.3. The following are operational and ecosystem limitations:
 
-1. **Congestion control interaction.** The interaction between QUIC's outer congestion control and inner TCP congestion control can cause suboptimal throughput in some scenarios. While DATAGRAM frames mitigate the worst cases (the outer layer does not retransmit lost datagrams), the double congestion control remains a known limitation of all encrypted tunnels.
+1. **Congestion control interaction.** The interaction between QUIC's outer congestion control and inner TCP congestion control can cause suboptimal throughput in some scenarios. DATAGRAM frames mitigate the worst cases (the outer layer does not retransmit lost datagrams), and the congestion control algorithm is fully configurable (CUBIC, BBR, NewReno) with tunable parameters (initial window, max window, pacing). Operators can select the algorithm best suited to their network path characteristics.
 
-2. **RPK ecosystem maturity.** TLS 1.3 with RPK (RFC 7250) has limited deployment. The rustls implementation landed RPK support in version 0.23.16, and known issues remain (rustls#2257). Interoperability with non-Rust TLS stacks may require additional testing.
+2. **No silent rejection.** QUIC requires responding to valid Initial packets (RFC 9000). Unlike WireGuard, which silently drops packets from unknown peers, QuicTun must respond to connection attempts — confirming a QUIC server exists at the address. However, the response is a standard QUIC handshake indistinguishable from HTTP/3. Rate-limiting and Retry tokens (address validation) can be configured to mitigate resource exhaustion from connection floods.
 
-3. **Performance ceiling without kernel bypass.** The user-space TUN tier is limited by system call overhead and memory copies. Achieving WireGuard's in-kernel performance requires the XDP or DPDK tiers, which add deployment complexity.
+3. **RPK ecosystem maturity.** TLS 1.3 with RPK (RFC 7250) has limited deployment. The rustls implementation landed RPK support in version 0.23.16, and known issues remain (rustls#2257). Interoperability with non-Rust TLS stacks may require additional testing.
 
-4. **Traffic analysis.** While QuicTun is protocol-indistinguishable from HTTP/3 at the packet level, VPN traffic has a distinctive statistical profile — larger, more uniform packet sizes than typical web browsing. Sustained traffic analysis (not per-packet DPI) could identify QuicTun traffic. This is a limitation shared by all VPN protocols.
+4. **Performance ceiling without kernel bypass.** The user-space TUN tier is limited by system call overhead and memory copies. Achieving WireGuard's in-kernel performance requires the XDP or DPDK tiers, which add deployment complexity.
+
+5. **Traffic analysis.** While QuicTun is protocol-indistinguishable from HTTP/3 at the packet level, VPN traffic has a distinctive statistical profile — larger, more uniform packet sizes than typical web browsing. Sustained traffic analysis (not per-packet DPI) could identify QuicTun traffic. This is a limitation shared by all VPN protocols.
 
 ### 11.4 Future Work
 
@@ -935,7 +953,7 @@ Security-related tradeoffs (cipher agility, code surface, state machine complexi
 
 QuicTun demonstrates that QUIC provides a superior transport for secure tunneling compared to custom protocols like WireGuard's Noise-based design.
 
-By building on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), QuicTun inherits encryption, congestion control, connection migration, and multiplexing as standardized protocol features. The use of QUIC DATAGRAM frames (RFC 9221) achieves a 20-byte per-packet overhead with zero-length Connection IDs — 37.5% less than WireGuard's 32 bytes. Because all cryptographic operations delegate to aws-lc-rs (FIPS 140-3 Certificate #4631), FIPS-compliant operation is a configuration choice, not an engineering project.
+By building on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), QuicTun inherits encryption, congestion control, connection migration, path MTU discovery (DPLPMTUD), and multiplexing as standardized protocol features. The use of QUIC DATAGRAM frames (RFC 9221) achieves a 20-byte per-packet overhead with zero-length Connection IDs — 37.5% less than WireGuard's 32 bytes. Because all cryptographic operations delegate to aws-lc-rs (FIPS 140-3 Certificate #4631), FIPS-compliant operation is a configuration choice, not an engineering project.
 
 Raw Public Key authentication (RFC 7250) preserves WireGuard's elegant identity model — peers identified by public keys, no certificate authority required — while remaining compatible with enterprise PKI through TLS 1.3's certificate type negotiation.
 
@@ -956,6 +974,7 @@ Like WireGuard, QuicTun is a tunnel primitive — it creates a secure point-to-p
 - [RFC 9000] J. Iyengar, M. Thomson, "QUIC: A UDP-Based Multiplexed and Secure Transport," May 2021. Proposed Standard.
 - [RFC 9001] M. Thomson, S. Turner, "Using TLS to Secure QUIC," May 2021. Proposed Standard.
 - [RFC 9002] J. Iyengar, I. Swett, "QUIC Loss Detection and Congestion Control," May 2021. Proposed Standard.
+- [RFC 8899] G. Fairhurst, T. Jones, M. Tüxen, I. Rüngeler, T. Völker, "Packetization Layer Path MTU Discovery for Datagram Transports," September 2020. Proposed Standard.
 - [RFC 9114] M. Bishop, "HTTP/3," June 2022. Proposed Standard.
 - [RFC 9221] T. Pauly, E. Kinnear, D. Schinazi, "An Unreliable Datagram Extension to QUIC," March 2022. Proposed Standard.
 - [RFC 9298] D. Schinazi, "Proxying UDP in HTTP," August 2022. Proposed Standard.
