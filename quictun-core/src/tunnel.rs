@@ -14,6 +14,7 @@ pub async fn run_forwarding_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let max_datagram_size = connection.max_datagram_size().unwrap_or(1200);
+    tracing::info!(max_datagram_size, "forwarding loop started");
 
     let mut buf = vec![0u8; 65535];
 

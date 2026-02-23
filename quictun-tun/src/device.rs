@@ -35,7 +35,9 @@ impl TunDevice {
             .mtu(mtu)
             .build_async()?;
 
-        let actual_name = name.unwrap_or("tun?").to_string();
+        let actual_name = device
+            .name()
+            .unwrap_or_else(|_| name.unwrap_or("tun?").to_string());
         tracing::info!(name = %actual_name, address = %address, prefix_len, mtu, "TUN device created");
 
         Ok(Self {
