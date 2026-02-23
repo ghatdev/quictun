@@ -56,6 +56,26 @@ impl TunDevice {
         self.inner.send(buf).await
     }
 
+    /// Wait until the TUN device is readable (has queued packets).
+    pub async fn readable(&self) -> std::io::Result<()> {
+        self.inner.readable().await
+    }
+
+    /// Non-blocking read. Returns `Err(WouldBlock)` when no packet is queued.
+    pub fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.try_recv(buf)
+    }
+
+    /// Wait until the TUN device is writable.
+    pub async fn writable(&self) -> std::io::Result<()> {
+        self.inner.writable().await
+    }
+
+    /// Non-blocking write. Returns `Err(WouldBlock)` when the device can't accept data.
+    pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.try_send(buf)
+    }
+
     /// Return the interface name.
     pub fn name(&self) -> &str {
         &self.name

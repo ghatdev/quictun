@@ -69,28 +69,36 @@ pub async fn run_forwarding_loop_parallel(
     let conn_tx = connection.clone();
     let tun_rx = tun.clone();
 
-    // TUN → QUIC task
+    // TUN → QUIC task (drain loop: read all queued packets per readability notification)
     let tun_to_quic = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
-            let n = match tun_rx.recv(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "TUN recv failed");
-                    return;
-                }
-            };
-            let max = conn_tx.max_datagram_size().unwrap_or(1200);
-            if n > max {
-                warn!(packet_size = n, max, "dropping oversized packet from TUN");
-                continue;
-            }
-            debug!(size = n, "TUN → QUIC");
-            if let Err(e) =
-                conn_tx.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n]))
-            {
-                tracing::error!(error = %e, "QUIC send failed");
+            if let Err(e) = tun_rx.readable().await {
+                tracing::error!(error = %e, "TUN readable failed");
                 return;
+            }
+            loop {
+                match tun_rx.try_recv(&mut buf) {
+                    Ok(n) => {
+                        let max = conn_tx.max_datagram_size().unwrap_or(1200);
+                        if n > max {
+                            warn!(packet_size = n, max, "dropping oversized packet from TUN");
+                            continue;
+                        }
+                        debug!(size = n, "TUN → QUIC");
+                        if let Err(e) =
+                            conn_tx.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n]))
+                        {
+                            tracing::error!(error = %e, "QUIC send failed");
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        tracing::error!(error = %e, "TUN recv failed");
+                        return;
+                    }
+                }
             }
         }
     });
