@@ -831,6 +831,8 @@ RPK uses a SubjectPublicKeyInfo structure, which is ASN.1-encoded. ASN.1 parsing
 
 **Response:** RPK's SubjectPublicKeyInfo is a minimal, fixed-structure ASN.1 blob — 91 bytes for ECDSA P-256. It contains exactly two fields: an algorithm identifier and a public key. This is fundamentally different from parsing arbitrary X.509 certificate chains (which involve variable-length extension lists, name constraints, validity periods, policy OIDs, and chain-building logic — the actual historical source of ASN.1 parsing vulnerabilities). The RPK parsing surface is comparable to parsing a fixed-format binary header. Additionally, in a purpose-built implementation, the ASN.1 parser can be reduced to a single-purpose decoder for SubjectPublicKeyInfo rather than a general-purpose ASN.1 parser.
 
+Critically, ASN.1 parsing occurs **only during the TLS handshake** — a one-time event at connection setup. The data plane (QUIC DATAGRAM frames carrying tunneled IP packets) involves no ASN.1 whatsoever. Even connection migration re-uses existing TLS session keys without re-authentication. A hypothetical ASN.1 parsing vulnerability would therefore be exploitable only during the handshake window (milliseconds), never during the data transfer phase that constitutes the vast majority of a tunnel's lifetime.
+
 ### 10.4 RPK vs X.509 Security Considerations
 
 RPK authentication trades certificate infrastructure for trust-on-first-use (TOFU) or out-of-band key distribution:
