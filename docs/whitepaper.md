@@ -78,7 +78,7 @@ WireGuard [Donenfeld 2017] established a new benchmark for VPN simplicity. Its k
 - **Cryptokey routing** — A routing table that maps allowed IP ranges to peer public keys, merging routing and access control into a single primitive.
 - **Minimal state machine** — No session negotiation, no cipher agility, no version negotiation. The protocol has exactly four message types.
 
-These choices produce an exceptionally clean protocol but preclude FIPS compliance, cipher agility, and connection migration.
+These choices produce an exceptionally clean protocol but preclude FIPS compliance, cipher agility, and connection migration. Recent work [Yuce 2025] demonstrated that replacing ChaCha20 with AES-GCM in WireGuard yields 11–19% throughput gains on AES-NI hardware, but required modifying WireGuard's source code since the protocol has no cipher negotiation mechanism — both peers must be manually configured to use the same cipher.
 
 ### 2.3 MASQUE and Industry Adoption
 
@@ -573,11 +573,27 @@ All key material is stored within the aws-lc-rs module boundary and zeroized on 
 
 QuicTun provides three data-plane tiers, enabling deployment across the performance spectrum from edge devices to data center gateways.
 
+### 7.0 Empirical Context: Where the Bottleneck Actually Is
+
+Recent empirical work provides critical context for performance estimates. Yuce et al. [Yuce 2025] modified WireGuard to support AES-GCM with AES-NI and measured performance across kernel and user-space implementations. Their key findings:
+
+1. **Encryption accounts for only ~7% of CPU time.** Flame graph analysis shows the kernel networking stack (conntrack, netfilter, routing) dominates processing. Encryption is not the bottleneck.
+
+2. **AES-GCM with AES-NI outperforms ChaCha20-Poly1305** by 11% in kernel mode and 19.5% in user-space, with 2.2% lower CPU usage and 5.5% fewer TCP retransmissions.
+
+3. **User-space implementations achieve competitive throughput.** BoringTun (user-space WireGuard in Rust) with AES-GCM achieved ~17.6 Gbps on a 4-core Intel i7 (~4.4 Gbps per core).
+
+4. **User-space can outperform kernel in multi-core scenarios** due to better thread scheduling and memory locality control, avoiding kernel spinlocks and softIRQ bottlenecks.
+
+5. **WireGuard's lack of cipher negotiation is a practical limitation.** Their AES implementation requires both peers to use the same cipher, with no way to negotiate. They identify dynamic cipher selection as "promising future work."
+
+These findings directly validate QuicTun's design choices: TLS 1.3 provides the cipher negotiation WireGuard lacks, AES-GCM is the faster cipher on AES-NI hardware, and user-space implementations with kernel bypass (XDP/DPDK) are the established path to high throughput. Critically, since encryption is only ~7% of processing time, QuicTun's additional per-packet overhead (QUIC header protection, congestion control state updates, frame construction) has modest impact on total throughput.
+
 ### Table 6: Performance Tier Characteristics
 
 | Tier | Mechanism | Expected Throughput | Latency Overhead | Use Case |
 |---|---|---|---|---|
-| **Tier 1: TUN** | User-space TUN device, tokio event loop | 1–5 Gbps | ~50 μs | Laptops, edge routers, containers |
+| **Tier 1: TUN** | User-space TUN device, tokio event loop | 2–5 Gbps | ~50 μs | Laptops, edge routers, containers |
 | **Tier 2: XDP/AF_XDP** | eBPF fast path, kernel bypass for data plane | 10–25 Gbps | ~10 μs | Branch gateways, medium servers |
 | **Tier 3: DPDK** | Full kernel bypass, poll-mode drivers | 25–100 Gbps | ~5 μs | Data center gateways, backbone nodes |
 
@@ -615,7 +631,7 @@ The baseline tier uses a standard TUN interface with the `tokio` async runtime:
 - IP packets are read from the TUN device, wrapped in QUIC DATAGRAM frames, and sent via a UDP socket.
 - `quinn` manages the QUIC connection state, including congestion control and key updates.
 - This tier requires no special kernel modules or capabilities beyond `CAP_NET_ADMIN` for TUN device creation.
-- Expected performance: 1–5 Gbps depending on CPU and MTU configuration.
+- Expected performance: 2–5 Gbps per core depending on CPU and MTU configuration. User-space WireGuard implementations with AES-GCM achieve ~4.4 Gbps per core [Yuce 2025]; QuicTun adds QUIC protocol overhead but benefits from the same AES-NI acceleration.
 
 ### 7.2 Tier 2: XDP/AF_XDP (Hybrid Kernel Bypass)
 
@@ -809,7 +825,7 @@ WireGuard uses a single, fixed cipher suite (Curve25519 + ChaCha20-Poly1305 + BL
 
 All five are considered strong. There is no "weak" suite to downgrade to, unlike TLS 1.2 where export-grade and RC4 suites existed. QuicTun further restricts the allowed set in configuration: operators can limit to a single suite if desired, achieving WireGuard-level fixity while retaining the option to change later.
 
-Moreover, cipher agility provides a concrete benefit: the ability to select the optimal cipher for the hardware. On modern x86 with AES-NI, AES-128-GCM is faster than ChaCha20-Poly1305. On devices without hardware AES acceleration, ChaCha20-Poly1305 is faster and constant-time in software. WireGuard is locked to ChaCha20 regardless of hardware capabilities.
+Moreover, cipher agility provides a concrete benefit: the ability to select the optimal cipher for the hardware. Empirical measurements confirm that AES-GCM with AES-NI outperforms ChaCha20-Poly1305 by 11–19% on x86 hardware with hardware acceleration [Yuce 2025]. On devices without hardware AES acceleration, ChaCha20-Poly1305 is faster and constant-time in software. WireGuard is locked to ChaCha20 regardless of hardware capabilities, leaving performance on the table on every AES-NI-equipped system.
 
 #### 10.3.3 Concern: AES-GCM Side Channels on Devices Without Hardware AES
 
@@ -820,7 +836,7 @@ AES-GCM implemented in software (without AES-NI or ARMv8-CE) is vulnerable to ca
 - **Devices without hardware AES** (pre-2010 x86, pre-ARMv8 ARM, some embedded): These devices do not require FIPS compliance. They negotiate ChaCha20-Poly1305, which is constant-time in software. No side-channel risk.
 - **Devices requiring FIPS mode** (enterprise, government): These are overwhelmingly modern x86/ARM64 with hardware AES-NI (Intel since Westmere 2010, AMD since Bulldozer 2011) or ARMv8-CE (since 2013, all smartphones since ~2015). Hardware AES eliminates timing side-channels. No side-channel risk.
 
-The intersection of "requires FIPS" and "lacks hardware AES" is effectively empty in 2026. QuicTun's cipher agility turns this concern into an advantage: it uses the right cipher for the hardware, where WireGuard is locked to ChaCha20 even when AES-GCM would be faster.
+The intersection of "requires FIPS" and "lacks hardware AES" is effectively empty in 2026. QuicTun's cipher agility turns this concern into an advantage: it uses the right cipher for the hardware. Empirical measurements show AES-GCM with AES-NI delivers 11–19% higher throughput than ChaCha20-Poly1305 on the same hardware, with 2.2% lower CPU usage [Yuce 2025]. WireGuard is locked to ChaCha20 even when AES-GCM would be faster and more efficient.
 
 #### 10.3.4 Concern: QUIC State Machine Complexity
 
@@ -987,6 +1003,7 @@ Like WireGuard, QuicTun is a tunnel primitive — it creates a secure point-to-p
 - [Cremers et al. 2017] C. Cremers, M. Horvat, J. Hoyland, S. Scott, T. van der Merwe, "A Comprehensive Symbolic Analysis of TLS 1.3," in *Proceedings of the 2017 ACM SIGSAC Conference on Computer and Communications Security*, 2017.
 - [Høiland-Jørgensen et al. 2018] T. Høiland-Jørgensen et al., "The eXpress Data Path: Fast Programmable Packet Processing in the Operating System Kernel," in *Proceedings of the 14th International Conference on emerging Networking EXperiments and Technologies (CoNEXT)*, 2018.
 - [Jaeger 2023] B. Jaeger, "Accelerating QUIC with AF_XDP," Master's thesis, Technical University of Munich, 2023.
+- [Yuce 2025] M. F. Yuce et al., "WireGuard-AES: Hardware based encryption to WireGuard for VPN gateways," *SoftwareX*, vol. 31, 102314, 2025. doi:10.1016/j.softx.2025.102314.
 
 ### Industry Sources
 
