@@ -766,7 +766,15 @@ WireGuard's core value proposition is auditability through minimalism — approx
 
 A purpose-built implementation covering only this subset could reduce the protocol code to approximately **15–25K lines of Rust**, with the FIPS-validated crypto module (aws-lc-rs) as the only irreducible external dependency. This is a natural maturation path — analogous to Cloudflare building quiche (a focused QUIC library) rather than using a general-purpose implementation — and does not require protocol changes.
 
-The crypto module cannot and should not be replaced: it is the FIPS-validated boundary, and its trust is backed by formal CMVP certification (Certificate #4631).
+The crypto module is the one dependency that must be trusted — but even here, it is not architecturally locked in. rustls provides a pluggable `CryptoProvider` trait, allowing the crypto backend to be swapped without protocol or application changes:
+
+| Backend | Language | FIPS Validated | Notes |
+|---|---|---|---|
+| aws-lc-rs | Rust wrapping C (AWS-LC) | Yes (#4631) | rustls default since 0.23 |
+| ring | Mostly Rust + asm | No | Former rustls default, less C surface |
+| Custom provider | Any | Depends | Implement `CryptoProvider` trait |
+
+For FIPS-required deployments, aws-lc-rs is currently the practical choice. For non-FIPS deployments, `ring` already offers a smaller C surface. If a pure-Rust or alternative FIPS-validated library emerges in the future, QuicTun can adopt it by changing the crypto provider — no protocol or architectural changes required.
 
 #### 10.3.2 Concern: Cipher Agility Enables Downgrade Attacks
 
