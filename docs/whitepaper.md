@@ -726,7 +726,7 @@ keepalive = 25
 
 QuicTun inherits the security properties of TLS 1.3 (RFC 8446), which have been formally verified [Cremers et al. 2017]:
 
-- **Confidentiality.** All tunnel traffic is encrypted with AES-GCM, providing IND-CPA security.
+- **Confidentiality.** All tunnel traffic is encrypted with AES-GCM or ChaCha20-Poly1305, providing IND-CPA security.
 - **Integrity.** AEAD construction provides ciphertext integrity; any modification is detected.
 - **Replay protection.** QUIC packet numbers provide replay protection at the transport layer.
 - **Forward secrecy.** ECDHE key exchange ensures that compromise of long-term keys does not reveal past session keys.
@@ -744,7 +744,94 @@ QuicTun inherits the security properties of TLS 1.3 (RFC 8446), which have been 
 | Quantum resistance | No | No (future: ML-KEM) | Both vulnerable to harvest-now-decrypt-later |
 | Post-compromise security | No | No | Neither protocol provides PCS |
 
-### 10.3 RPK vs X.509 Security Considerations
+### 10.3 Security Tradeoffs: Concerns and Responses
+
+Building on QUIC+TLS 1.3 rather than a custom protocol like Noise introduces a different security profile. This section addresses each concern directly.
+
+#### 10.3.1 Concern: Larger Code Surface Than WireGuard
+
+WireGuard's core value proposition is auditability through minimalism — approximately 4,000 lines of kernel code. The current QuicTun implementation delegates to general-purpose libraries:
+
+| Component | General-purpose library | Approximate LoC |
+|---|---|---|
+| QUIC engine | quinn | ~50K |
+| TLS 1.3 engine | rustls | ~30K |
+| Crypto primitives | AWS-LC (C) | ~500K |
+| **Total trusted code** | | **~580K** |
+
+**Response:** The dependency on general-purpose libraries is an *implementation choice*, not an *architectural constraint*. QuicTun uses a strict subset of QUIC and TLS 1.3:
+
+- **Minimal QUIC needed:** Initial/Handshake packets, short header packets, DATAGRAM frames, connection migration (PATH_CHALLENGE/PATH_RESPONSE), congestion control, and a small number of control streams. Not needed: HTTP/3, QPACK, full stream multiplexing, priority signaling, push streams.
+- **Minimal TLS 1.3 needed:** 1-RTT handshake with mutual RPK authentication, 2–3 cipher suites, HKDF key schedule, KeyUpdate. Not needed: session tickets, PSK resumption, X.509 chain building, OCSP, SCT, dozens of extensions.
+
+A purpose-built implementation covering only this subset could reduce the protocol code to approximately **15–25K lines of Rust**, with the FIPS-validated crypto module (aws-lc-rs) as the only irreducible external dependency. This is a natural maturation path — analogous to Cloudflare building quiche (a focused QUIC library) rather than using a general-purpose implementation — and does not require protocol changes.
+
+The crypto module cannot and should not be replaced: it is the FIPS-validated boundary, and its trust is backed by formal CMVP certification (Certificate #4631).
+
+#### 10.3.2 Concern: Cipher Agility Enables Downgrade Attacks
+
+WireGuard uses a single, fixed cipher suite (Curve25519 + ChaCha20-Poly1305 + BLAKE2s). There is nothing to negotiate, and therefore nothing to downgrade. QuicTun, via TLS 1.3, negotiates cipher suites during the handshake.
+
+**Response:** TLS 1.3 dramatically reduced downgrade risk compared to earlier TLS versions. The handshake transcript hash covers all negotiation messages, making active downgrade attacks detectable. Legacy algorithms (RSA key exchange, CBC mode, MD5, SHA-1) were removed entirely from TLS 1.3. The remaining negotiable cipher suites in TLS 1.3 are:
+
+| Cipher Suite | Status |
+|---|---|
+| `TLS_AES_128_GCM_SHA256` | Mandatory to implement |
+| `TLS_AES_256_GCM_SHA384` | Common |
+| `TLS_CHACHA20_POLY1305_SHA256` | Common |
+| `TLS_AES_128_CCM_SHA256` | Rare (IoT) |
+| `TLS_AES_128_CCM_8_SHA256` | Rare (IoT) |
+
+All five are considered strong. There is no "weak" suite to downgrade to, unlike TLS 1.2 where export-grade and RC4 suites existed. QuicTun further restricts the allowed set in configuration: operators can limit to a single suite if desired, achieving WireGuard-level fixity while retaining the option to change later.
+
+Moreover, cipher agility provides a concrete benefit: the ability to select the optimal cipher for the hardware. On modern x86 with AES-NI, AES-128-GCM is faster than ChaCha20-Poly1305. On devices without hardware AES acceleration, ChaCha20-Poly1305 is faster and constant-time in software. WireGuard is locked to ChaCha20 regardless of hardware capabilities.
+
+#### 10.3.3 Concern: AES-GCM Side Channels on Devices Without Hardware AES
+
+AES-GCM implemented in software (without AES-NI or ARMv8-CE) is vulnerable to cache-timing attacks. WireGuard's ChaCha20-Poly1305 is constant-time in software by design.
+
+**Response:** This concern is valid in theory but applies to an empty set of practical deployments. TLS 1.3 includes `TLS_CHACHA20_POLY1305_SHA256` as a standard cipher suite — the same algorithm WireGuard uses. The deployment matrix resolves cleanly:
+
+- **Devices without hardware AES** (pre-2010 x86, pre-ARMv8 ARM, some embedded): These devices do not require FIPS compliance. They negotiate ChaCha20-Poly1305, which is constant-time in software. No side-channel risk.
+- **Devices requiring FIPS mode** (enterprise, government): These are overwhelmingly modern x86/ARM64 with hardware AES-NI (Intel since Westmere 2010, AMD since Bulldozer 2011) or ARMv8-CE (since 2013, all smartphones since ~2015). Hardware AES eliminates timing side-channels. No side-channel risk.
+
+The intersection of "requires FIPS" and "lacks hardware AES" is effectively empty in 2026. QuicTun's cipher agility turns this concern into an advantage: it uses the right cipher for the hardware, where WireGuard is locked to ChaCha20 even when AES-GCM would be faster.
+
+#### 10.3.4 Concern: QUIC State Machine Complexity
+
+QUIC's state machine handles connection establishment, migration, path validation, idle timeout, stream management, key updates, congestion windows, and anti-amplification limits. WireGuard has three states: no handshake, handshake in progress, and established.
+
+**Response:** This is an irreducible tradeoff — the price of features. Connection migration requires path validation states. Congestion control requires window management. Multiplexing requires stream states. Each feature QuicTun provides over WireGuard adds states to the machine.
+
+The mitigation is twofold: (1) the QUIC state machine is specified in an IETF RFC that has undergone extensive review, not invented ad hoc, and (2) QuicTun uses only a subset of QUIC states (no HTTP/3 streams, no push, no QPACK). A purpose-built implementation would have a smaller state machine than a full QUIC implementation, though still larger than WireGuard's.
+
+This is an honest tradeoff: more features require more complexity. QuicTun's position is that connection migration, congestion control, and FIPS-ready cryptography are worth the additional states.
+
+#### 10.3.5 Concern: 0-RTT Replay Risk
+
+QUIC supports 0-RTT session resumption, which is inherently vulnerable to replay attacks. For a VPN tunnel, replayed 0-RTT data could mean replayed tunneled IP packets.
+
+**Response:** QuicTun disables 0-RTT data by default. The tunnel uses 1-RTT handshakes for initial connections and can use session tickets for faster reconnection without sending application data in the 0-RTT window. If 0-RTT is enabled for latency-sensitive deployments, the inner protocol's own replay protection (e.g., TCP sequence numbers, application-layer idempotency) provides a second layer of defense. The configuration makes the tradeoff explicit.
+
+#### 10.3.6 Concern: Connection ID Linkability During Migration
+
+If a client migrates from one network to another (e.g., Wi-Fi to cellular) without rotating its Connection ID, an observer present on both networks can link the two sessions and track the client.
+
+**Response:** QUIC provides a CID rotation mechanism via `NEW_CONNECTION_ID` frames (RFC 9000, Section 5.1). QuicTun rotates CIDs on every migration event: when a network change is detected, the client switches to a previously unused CID before sending packets on the new path. The old CID is retired via `RETIRE_CONNECTION_ID`. An observer on the old network sees one CID; an observer on the new network sees a different CID. Correlation requires access to the encrypted mapping between old and new CIDs, which is protected by the QUIC encryption layer.
+
+#### 10.3.7 Concern: QUIC Spin Bit Leaks RTT Metadata
+
+The QUIC short header includes a spin bit (1 bit) that enables passive on-path observers to measure round-trip time. WireGuard leaks no equivalent metadata.
+
+**Response:** The spin bit is a minor metadata leak (1 bit per packet, revealing RTT to passive observers on the path). It does not affect confidentiality or integrity. QUIC allows endpoints to randomly set the spin bit to disable RTT measurement (RFC 9000, Section 17.4). QuicTun can be configured to randomize the spin bit, eliminating this signal at the cost of losing passive RTT measurement for network diagnostics.
+
+#### 10.3.8 Concern: ASN.1 Parsing Surface (Even with RPK)
+
+RPK uses a SubjectPublicKeyInfo structure, which is ASN.1-encoded. ASN.1 parsing has historically been a source of vulnerabilities in TLS implementations.
+
+**Response:** RPK's SubjectPublicKeyInfo is a minimal, fixed-structure ASN.1 blob — 91 bytes for ECDSA P-256. It contains exactly two fields: an algorithm identifier and a public key. This is fundamentally different from parsing arbitrary X.509 certificate chains (which involve variable-length extension lists, name constraints, validity periods, policy OIDs, and chain-building logic — the actual historical source of ASN.1 parsing vulnerabilities). The RPK parsing surface is comparable to parsing a fixed-format binary header. Additionally, in a purpose-built implementation, the ASN.1 parser can be reduced to a single-purpose decoder for SubjectPublicKeyInfo rather than a general-purpose ASN.1 parser.
+
+### 10.4 RPK vs X.509 Security Considerations
 
 RPK authentication trades certificate infrastructure for trust-on-first-use (TOFU) or out-of-band key distribution:
 
@@ -752,7 +839,7 @@ RPK authentication trades certificate infrastructure for trust-on-first-use (TOF
 - **No revocation infrastructure.** RPK does not support CRL or OCSP. Key revocation is managed by removing the key from the server's allowlist — similar to WireGuard's model.
 - **Key distribution.** RPK requires a separate mechanism for distributing and verifying public keys. In enterprise environments, this can be automated via configuration management (Ansible, Terraform) or a lightweight key directory.
 
-### 10.4 Enabling FIPS Mode
+### 10.5 Enabling FIPS Mode
 
 For deployments requiring FIPS 140-3 compliance, QuicTun can be configured for FIPS-compliant operation without architectural changes:
 
@@ -809,15 +896,15 @@ QuicTun (CID=0) provides **12 additional bytes** of inner MTU compared to WireGu
 
 ### 11.3 Limitations
 
-1. **Cipher agility as attack surface.** QuicTun supports multiple cipher suites (via TLS 1.3 negotiation), unlike WireGuard's fixed cryptographic choices. While FIPS compliance requires this flexibility, cipher negotiation introduces downgrade attack potential. Mitigation: QuicTun enforces a minimum security level and logs negotiated cipher suite for monitoring.
+Security-related tradeoffs (cipher agility, code surface, state machine complexity, etc.) are addressed in detail in Section 10.3. The following are operational and ecosystem limitations:
 
-2. **QUIC protocol complexity.** The QUIC specification (RFC 9000) is significantly more complex than WireGuard's protocol. While QuicTun delegates QUIC implementation to the battle-tested `quinn` library, the larger specification surface increases the potential for implementation bugs.
+1. **Congestion control interaction.** The interaction between QUIC's outer congestion control and inner TCP congestion control can cause suboptimal throughput in some scenarios. While DATAGRAM frames mitigate the worst cases (the outer layer does not retransmit lost datagrams), the double congestion control remains a known limitation of all encrypted tunnels.
 
-3. **Congestion control interaction.** The interaction between QUIC's outer congestion control and inner TCP congestion control can cause suboptimal throughput in some scenarios. While DATAGRAM frames mitigate the worst cases, the double congestion control remains a known limitation of all encrypted tunnels.
+2. **RPK ecosystem maturity.** TLS 1.3 with RPK (RFC 7250) has limited deployment. The rustls implementation landed RPK support in version 0.23.16, and known issues remain (rustls#2257). Interoperability with non-Rust TLS stacks may require additional testing.
 
-4. **RPK ecosystem maturity.** TLS 1.3 with RPK (RFC 7250) has limited deployment. The rustls implementation landed RPK support in version 0.23.16, and known issues remain (rustls#2257). Interoperability with non-Rust TLS stacks may require additional testing.
+3. **Performance ceiling without kernel bypass.** The user-space TUN tier is limited by system call overhead and memory copies. Achieving WireGuard's in-kernel performance requires the XDP or DPDK tiers, which add deployment complexity.
 
-5. **Performance ceiling without kernel bypass.** The user-space TUN tier is limited by system call overhead and memory copies. Achieving WireGuard's in-kernel performance requires the XDP or DPDK tiers, which add deployment complexity.
+4. **Traffic analysis.** While QuicTun is protocol-indistinguishable from HTTP/3 at the packet level, VPN traffic has a distinctive statistical profile — larger, more uniform packet sizes than typical web browsing. Sustained traffic analysis (not per-packet DPI) could identify QuicTun traffic. This is a limitation shared by all VPN protocols.
 
 ### 11.4 Future Work
 
