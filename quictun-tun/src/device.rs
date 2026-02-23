@@ -8,6 +8,30 @@ pub enum TunError {
     Create(#[from] std::io::Error),
 }
 
+/// Options for TUN device creation.
+#[derive(Debug, Clone)]
+pub struct TunOptions {
+    pub address: Ipv4Addr,
+    pub prefix_len: u8,
+    pub mtu: u16,
+    pub name: Option<String>,
+    #[cfg(target_os = "linux")]
+    pub multi_queue: bool,
+}
+
+impl TunOptions {
+    pub fn new(address: Ipv4Addr, prefix_len: u8, mtu: u16) -> Self {
+        Self {
+            address,
+            prefix_len,
+            mtu,
+            name: None,
+            #[cfg(target_os = "linux")]
+            multi_queue: false,
+        }
+    }
+}
+
 /// Thin async wrapper over a `tun-rs` TUN device.
 pub struct TunDevice {
     inner: AsyncDevice,
@@ -24,25 +48,61 @@ impl TunDevice {
         mtu: u16,
         name: Option<&str>,
     ) -> Result<Self, TunError> {
+        Self::create_with_options(&TunOptions {
+            address,
+            prefix_len,
+            mtu,
+            name: name.map(|s| s.to_string()),
+            #[cfg(target_os = "linux")]
+            multi_queue: false,
+        })
+    }
+
+    /// Create a TUN device with full options (including multi-queue on Linux).
+    pub fn create_with_options(opts: &TunOptions) -> Result<Self, TunError> {
         let mut builder = tun_rs::DeviceBuilder::new();
 
-        if let Some(n) = name {
+        if let Some(ref n) = opts.name {
             builder = builder.name(n);
         }
 
+        #[cfg(target_os = "linux")]
+        if opts.multi_queue {
+            builder = builder.multi_queue(true);
+        }
+
         let device = builder
-            .ipv4(address, prefix_len, None)
-            .mtu(mtu)
+            .ipv4(opts.address, opts.prefix_len, None)
+            .mtu(opts.mtu)
             .build_async()?;
 
         let actual_name = device
             .name()
-            .unwrap_or_else(|_| name.unwrap_or("tun?").to_string());
-        tracing::info!(name = %actual_name, address = %address, prefix_len, mtu, "TUN device created");
+            .unwrap_or_else(|_| opts.name.as_deref().unwrap_or("tun?").to_string());
+        tracing::info!(
+            name = %actual_name,
+            address = %opts.address,
+            prefix_len = opts.prefix_len,
+            mtu = opts.mtu,
+            "TUN device created"
+        );
 
         Ok(Self {
             inner: device,
             name: actual_name,
+        })
+    }
+
+    /// Clone this TUN queue (Linux multi-queue only).
+    ///
+    /// The device must have been created with `multi_queue: true`.
+    /// Each clone gets its own fd; the kernel distributes packets by flow hash.
+    #[cfg(target_os = "linux")]
+    pub fn try_clone(&self) -> Result<Self, TunError> {
+        let cloned = self.inner.try_clone()?;
+        Ok(Self {
+            inner: cloned,
+            name: self.name.clone(),
         })
     }
 

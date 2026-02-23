@@ -1,3 +1,3 @@
 mod device;
 
-pub use device::TunDevice;
+pub use device::{TunDevice, TunError, TunOptions};

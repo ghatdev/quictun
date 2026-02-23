@@ -39,6 +39,9 @@ enum Command {
         /// QUIC send window in bytes (0 = default)
         #[arg(long, default_value = "0")]
         send_window: u64,
+        /// Number of TUN queues (Linux multi-queue; requires --queues > 1)
+        #[arg(long, default_value = "1")]
+        queues: usize,
     },
 }
 
@@ -55,6 +58,7 @@ fn main() -> anyhow::Result<()> {
             recv_buf,
             send_buf,
             send_window,
-        } => up::run(&config, serial, newreno, recv_buf, send_buf, send_window),
+            queues,
+        } => up::run(&config, serial, newreno, recv_buf, send_buf, send_window, queues),
     }
 }

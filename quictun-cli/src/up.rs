@@ -3,12 +3,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_os = "linux"))]
+use anyhow::bail;
 use anyhow::{Context, Result};
 use quictun_core::config::{Config, Role};
 use quictun_core::connection::{self, TransportTuning};
 use quictun_core::tunnel;
 use quictun_crypto::{PrivateKey, PublicKey};
-use quictun_tun::TunDevice;
+use quictun_tun::{TunDevice, TunOptions};
 use tokio::signal;
 use tokio::sync::watch;
 
@@ -19,6 +21,7 @@ pub fn run(
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
+    queues: usize,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(run_async(
@@ -28,6 +31,7 @@ pub fn run(
         recv_buf,
         send_buf,
         send_window,
+        queues,
     ))
 }
 
@@ -38,6 +42,7 @@ async fn run_async(
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
+    queues: usize,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -80,10 +85,29 @@ async fn run_async(
         recv_buf,
         send_buf,
         send_window,
+        queues,
         "starting quictun"
     );
 
-    let tun = TunDevice::create(addr.addr(), addr.prefix_len(), config.mtu(), None)
+    // Validate multi-queue configuration
+    #[cfg(not(target_os = "linux"))]
+    if queues > 1 {
+        bail!("--queues > 1 requires Linux (IFF_MULTI_QUEUE)");
+    }
+
+    let use_multi_queue = queues > 1;
+
+    let tun_opts = {
+        #[allow(unused_mut)]
+        let mut opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+        #[cfg(target_os = "linux")]
+        {
+            opts.multi_queue = use_multi_queue;
+        }
+        opts
+    };
+
+    let tun = TunDevice::create_with_options(&tun_opts)
         .context("failed to create TUN device")?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -149,7 +173,20 @@ async fn run_async(
         }
     };
 
-    if parallel {
+    if use_multi_queue {
+        // Build N queue handles: the original + (N-1) clones
+        let mut tun_queues: Vec<Arc<TunDevice>> = Vec::with_capacity(queues);
+        tun_queues.push(Arc::new(tun));
+        #[cfg(target_os = "linux")]
+        for _ in 1..queues {
+            let cloned = tun_queues[0]
+                .try_clone()
+                .context("failed to clone TUN queue")?;
+            tun_queues.push(Arc::new(cloned));
+        }
+        tracing::info!(queues = tun_queues.len(), "multi-queue TUN ready");
+        tunnel::run_forwarding_loop_multiqueue(connection, tun_queues, shutdown_rx).await?;
+    } else if parallel {
         tunnel::run_forwarding_loop_parallel(connection, Arc::new(tun), shutdown_rx).await?;
     } else {
         tunnel::run_forwarding_loop(connection, &tun, shutdown_rx).await?;
