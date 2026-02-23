@@ -4,6 +4,9 @@ mod up;
 
 use clap::{Parser, Subcommand};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "quictun", about = "WireGuard-like tunnel over QUIC")]
 struct Cli {

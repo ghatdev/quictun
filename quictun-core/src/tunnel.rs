@@ -69,16 +69,17 @@ pub async fn run_forwarding_loop_parallel(
     let conn_tx = connection.clone();
     let tun_rx = tun.clone();
 
-    // TUN → QUIC task (drain loop: read all queued packets per readability notification)
+    // TUN → QUIC task (drain loop + zero-copy: fresh Vec per packet, ownership to Bytes)
     let tun_to_quic = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
+        let max_packet = conn_tx.max_datagram_size().unwrap_or(1452);
         loop {
             if let Err(e) = tun_rx.readable().await {
                 tracing::error!(error = %e, "TUN readable failed");
                 return;
             }
             loop {
-                match tun_rx.try_recv(&mut buf) {
+                let mut packet = vec![0u8; max_packet];
+                match tun_rx.try_recv(&mut packet) {
                     Ok(n) => {
                         let max = conn_tx.max_datagram_size().unwrap_or(1200);
                         if n > max {
@@ -86,9 +87,8 @@ pub async fn run_forwarding_loop_parallel(
                             continue;
                         }
                         debug!(size = n, "TUN → QUIC");
-                        if let Err(e) =
-                            conn_tx.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n]))
-                        {
+                        packet.truncate(n);
+                        if let Err(e) = conn_tx.send_datagram(bytes::Bytes::from(packet)) {
                             tracing::error!(error = %e, "QUIC send failed");
                             return;
                         }
