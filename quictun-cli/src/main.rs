@@ -21,6 +21,21 @@ enum Command {
     Up {
         /// Path to the TOML config file
         config: String,
+        /// Use parallel forwarding (separate tasks for TUN→QUIC and QUIC→TUN)
+        #[arg(long)]
+        parallel: bool,
+        /// Use BBR congestion control instead of NewReno
+        #[arg(long)]
+        bbr: bool,
+        /// Datagram receive buffer size in bytes
+        #[arg(long, default_value = "65535")]
+        recv_buf: usize,
+        /// Datagram send buffer size in bytes
+        #[arg(long, default_value = "1048576")]
+        send_buf: usize,
+        /// QUIC send window in bytes (0 = default)
+        #[arg(long, default_value = "0")]
+        send_window: u64,
     },
 }
 
@@ -30,6 +45,13 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Genkey => genkey::run(),
         Command::Pubkey => pubkey::run(),
-        Command::Up { config } => up::run(&config),
+        Command::Up {
+            config,
+            parallel,
+            bbr,
+            recv_buf,
+            send_buf,
+            send_window,
+        } => up::run(&config, parallel, bbr, recv_buf, send_buf, send_window),
     }
 }

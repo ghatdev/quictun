@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Result;
-use quictun_core::connection;
+use quictun_core::connection::{self, TransportTuning};
 use quictun_crypto::PrivateKey;
 
 /// Integration test: QUIC datagram round-trip with pinned RPK authentication.
@@ -18,8 +18,8 @@ async fn datagram_echo_round_trip() -> Result<()> {
     let keepalive = Some(Duration::from_secs(5));
 
     // Build configs pinned to each other's keys
-    let server_config = connection::build_server_config(&server_key, &[client_pubkey], keepalive)?;
-    let client_config = connection::build_client_config(&client_key, &server_pubkey, keepalive)?;
+    let server_config = connection::build_server_config(&server_key, &[client_pubkey], keepalive, &TransportTuning::default())?;
+    let client_config = connection::build_client_config(&client_key, &server_pubkey, keepalive, &TransportTuning::default())?;
 
     // Bind server on ephemeral port
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
@@ -84,11 +84,11 @@ async fn rejects_unknown_client_key() -> Result<()> {
 
     // Server only allows the authorized client
     let server_config =
-        connection::build_server_config(&server_key, &[authorized_pubkey], keepalive)?;
+        connection::build_server_config(&server_key, &[authorized_pubkey], keepalive, &TransportTuning::default())?;
 
     // Unauthorized client tries to connect
     let client_config =
-        connection::build_client_config(&unauthorized_client_key, &server_pubkey, keepalive)?;
+        connection::build_client_config(&unauthorized_client_key, &server_pubkey, keepalive, &TransportTuning::default())?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let server_endpoint = quinn::Endpoint::server(server_config, bind_addr)?;

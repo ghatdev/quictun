@@ -1,22 +1,44 @@
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quictun_core::config::{Config, Role};
-use quictun_core::connection;
+use quictun_core::connection::{self, TransportTuning};
 use quictun_core::tunnel;
 use quictun_crypto::{PrivateKey, PublicKey};
 use quictun_tun::TunDevice;
 use tokio::signal;
 use tokio::sync::watch;
 
-pub fn run(config_path: &str) -> Result<()> {
+pub fn run(
+    config_path: &str,
+    parallel: bool,
+    bbr: bool,
+    recv_buf: usize,
+    send_buf: usize,
+    send_window: u64,
+) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-    rt.block_on(run_async(config_path))
+    rt.block_on(run_async(
+        config_path,
+        parallel,
+        bbr,
+        recv_buf,
+        send_buf,
+        send_window,
+    ))
 }
 
-async fn run_async(config_path: &str) -> Result<()> {
+async fn run_async(
+    config_path: &str,
+    parallel: bool,
+    bbr: bool,
+    recv_buf: usize,
+    send_buf: usize,
+    send_window: u64,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -37,11 +59,24 @@ async fn run_async(config_path: &str) -> Result<()> {
 
     let keepalive = peer.keepalive.map(Duration::from_secs);
 
+    let tuning = TransportTuning {
+        datagram_recv_buffer: recv_buf,
+        datagram_send_buffer: send_buf,
+        send_window,
+        use_bbr: bbr,
+        ..Default::default()
+    };
+
     tracing::info!(
         role = ?role,
         address = %addr,
         mtu = config.mtu(),
         peer_fingerprint = %peer_pubkey.fingerprint(),
+        ?parallel,
+        ?bbr,
+        recv_buf,
+        send_buf,
+        send_window,
         "starting quictun"
     );
 
@@ -67,7 +102,7 @@ async fn run_async(config_path: &str) -> Result<()> {
             let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
             let server_config =
-                connection::build_server_config(&private_key, &[peer_pubkey], keepalive)
+                connection::build_server_config(&private_key, &[peer_pubkey], keepalive, &tuning)
                     .context("failed to build server config")?;
 
             let endpoint = quinn::Endpoint::server(server_config, bind_addr)
@@ -88,7 +123,7 @@ async fn run_async(config_path: &str) -> Result<()> {
             let server_endpoint = peer.endpoint.context("connector requires peer endpoint")?;
 
             let client_config =
-                connection::build_client_config(&private_key, &peer_pubkey, keepalive)
+                connection::build_client_config(&private_key, &peer_pubkey, keepalive, &tuning)
                     .context("failed to build client config")?;
 
             let mut endpoint =
@@ -111,7 +146,11 @@ async fn run_async(config_path: &str) -> Result<()> {
         }
     };
 
-    tunnel::run_forwarding_loop(connection, &tun, shutdown_rx).await?;
+    if parallel {
+        tunnel::run_forwarding_loop_parallel(connection, Arc::new(tun), shutdown_rx).await?;
+    } else {
+        tunnel::run_forwarding_loop(connection, &tun, shutdown_rx).await?;
+    }
 
     tracing::info!("tunnel closed");
     Ok(())
