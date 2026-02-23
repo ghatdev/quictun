@@ -1,0 +1,20 @@
+[package]
+name = "quictun-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "quictun"
+path = "src/main.rs"
+
+[dependencies]
+quictun-crypto = { workspace = true }
+quictun-core = { workspace = true }
+quictun-tun = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

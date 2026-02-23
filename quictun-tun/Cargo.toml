@@ -1,0 +1,10 @@
+[package]
+name = "quictun-tun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tun-rs = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

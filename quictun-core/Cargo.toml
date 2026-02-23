@@ -1,0 +1,20 @@
+[package]
+name = "quictun-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quictun-crypto = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+base64 = { workspace = true }
+ipnet = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+quictun-tun = { workspace = true }
+bytes = { workspace = true }

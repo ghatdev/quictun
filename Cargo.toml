@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "quictun-crypto",
+    "quictun-core",
+    "quictun-tun",
+    "quictun-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+quictun-crypto = { path = "quictun-crypto" }
+quictun-core = { path = "quictun-core" }
+quictun-tun = { path = "quictun-tun" }
+
+# QUIC + TLS
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+rustls = { version = "0.23.20", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
+aws-lc-rs = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+base64 = "0.22"
+
+# Crypto utilities
+sha2 = "0.10"
+hex = "0.4"
+
+# Networking
+ipnet = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# TUN device
+tun-rs = { version = "2", features = ["async"] }
