@@ -21,17 +21,17 @@ enum Command {
     Up {
         /// Path to the TOML config file
         config: String,
-        /// Use parallel forwarding (separate tasks for TUN→QUIC and QUIC→TUN)
+        /// Use serial forwarding (single select loop) instead of parallel
         #[arg(long)]
-        parallel: bool,
-        /// Use BBR congestion control instead of NewReno
+        serial: bool,
+        /// Use NewReno congestion control instead of BBR
         #[arg(long)]
-        bbr: bool,
+        newreno: bool,
         /// Datagram receive buffer size in bytes
-        #[arg(long, default_value = "65535")]
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
         recv_buf: usize,
         /// Datagram send buffer size in bytes
-        #[arg(long, default_value = "1048576")]
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
         send_buf: usize,
         /// QUIC send window in bytes (0 = default)
         #[arg(long, default_value = "0")]
@@ -47,11 +47,11 @@ fn main() -> anyhow::Result<()> {
         Command::Pubkey => pubkey::run(),
         Command::Up {
             config,
-            parallel,
-            bbr,
+            serial,
+            newreno,
             recv_buf,
             send_buf,
             send_window,
-        } => up::run(&config, parallel, bbr, recv_buf, send_buf, send_window),
+        } => up::run(&config, serial, newreno, recv_buf, send_buf, send_window),
     }
 }

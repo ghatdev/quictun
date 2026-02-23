@@ -14,8 +14,8 @@ use tokio::sync::watch;
 
 pub fn run(
     config_path: &str,
-    parallel: bool,
-    bbr: bool,
+    serial: bool,
+    newreno: bool,
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
@@ -23,8 +23,8 @@ pub fn run(
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(run_async(
         config_path,
-        parallel,
-        bbr,
+        serial,
+        newreno,
         recv_buf,
         send_buf,
         send_window,
@@ -33,8 +33,8 @@ pub fn run(
 
 async fn run_async(
     config_path: &str,
-    parallel: bool,
-    bbr: bool,
+    serial: bool,
+    newreno: bool,
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
@@ -59,6 +59,9 @@ async fn run_async(
 
     let keepalive = peer.keepalive.map(Duration::from_secs);
 
+    let parallel = !serial;
+    let bbr = !newreno;
+
     let tuning = TransportTuning {
         datagram_recv_buffer: recv_buf,
         datagram_send_buffer: send_buf,
@@ -72,8 +75,8 @@ async fn run_async(
         address = %addr,
         mtu = config.mtu(),
         peer_fingerprint = %peer_pubkey.fingerprint(),
-        ?parallel,
-        ?bbr,
+        parallel,
+        bbr,
         recv_buf,
         send_buf,
         send_window,

@@ -86,11 +86,11 @@ pub struct TransportTuning {
 impl Default for TransportTuning {
     fn default() -> Self {
         Self {
-            datagram_recv_buffer: 65535,
-            datagram_send_buffer: 1048576,
+            datagram_recv_buffer: 8 * 1024 * 1024, // 8 MB
+            datagram_send_buffer: 8 * 1024 * 1024,  // 8 MB
             initial_mtu: 1452,
             send_window: 0, // 0 = use default
-            use_bbr: false,
+            use_bbr: true,
         }
     }
 }
