@@ -23,4 +23,3 @@ mimalloc = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 quictun-uring = { workspace = true }
-quictun-compio = { workspace = true }

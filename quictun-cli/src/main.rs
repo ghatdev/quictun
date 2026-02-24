@@ -47,9 +47,6 @@ enum Command {
         /// Use io_uring data plane (Linux only)
         #[arg(long)]
         iouring: bool,
-        /// Use compio async data plane (Linux only)
-        #[arg(long)]
-        compio: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -73,10 +70,8 @@ fn main() -> anyhow::Result<()> {
             send_window,
             queues,
             iouring,
-            compio,
         } => up::run(
             &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring,
-            compio,
         ),
         Command::Down { config } => down::run(&config),
     }
