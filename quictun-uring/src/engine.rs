@@ -122,6 +122,7 @@ pub fn run(
     let mut stats_channel_packets: u64 = 0;
     let mut stats_sends_ok: u64 = 0;
     let mut stats_sends_fail: u64 = 0;
+    let mut stats_tx_stalls: u64 = 0;
     let mut stats_last = std::time::Instant::now();
 
     loop {
@@ -279,14 +280,17 @@ pub fn run(
             }
 
             // Drain quinn transmits directly to buffer pool → io_uring.
-            // poll_transmit → transmit_buf → pool slot → WriteFixed SQE.
-            // Eliminates the intermediate [u8; 2048] stack buffer + Vec<transmits>.
-            stats_transmits += drain_transmits(
+            // Stops early if pool is low (back-pressure), quinn holds the rest.
+            let (n, stalled) = drain_transmits(
                 &mut quic,
                 &mut ring,
                 &mut pool,
                 &mut transmit_buf,
-            )? as u64;
+            )?;
+            stats_transmits += n as u64;
+            if stalled {
+                stats_tx_stalls += 1;
+            }
 
             // Update timer from connection state.
             update_timer(&mut quic, &timer);
@@ -302,6 +306,7 @@ pub fn run(
                 channel_packets = stats_channel_packets,
                 sends_ok = stats_sends_ok,
                 sends_fail = stats_sends_fail,
+                tx_stalls = stats_tx_stalls,
                 free_bufs = pool.available(),
                 "engine: stats"
             );
@@ -313,31 +318,51 @@ pub fn run(
             stats_channel_packets = 0;
             stats_sends_ok = 0;
             stats_sends_fail = 0;
+            stats_tx_stalls = 0;
             stats_last = std::time::Instant::now();
         }
     }
 }
 
+/// Minimum free buffers to reserve for recv resubmits and TUN writes.
+/// Prevents transmit drain from starving the receive path.
+const RESERVED_BUFS: usize = 64;
+
 /// Drain quinn-proto transmit queue directly into buffer pool + io_uring SQEs.
 ///
 /// Path: poll_transmit → transmit_buf (Vec) → pool slot → WriteFixed SQE.
 /// This is 1 copy (Vec → pool) instead of the previous 2 (Vec → stack → pool).
-/// Returns the number of transmits drained.
+///
+/// Back-pressure: stops draining when pool is low (≤ RESERVED_BUFS free).
+/// Quinn-proto holds remaining transmits internally until the next iteration,
+/// when completed send SQEs return buffers to the pool. This prevents the
+/// catastrophic pattern of dropping QUIC packets → congestion collapse.
+///
+/// Returns (drained_count, stalled: bool).
 fn drain_transmits(
     quic: &mut QuicState,
     ring: &mut IoUring,
     pool: &mut BufferPool,
     transmit_buf: &mut Vec<u8>,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     let conn = match quic.connection.as_mut() {
         Some(c) => c,
-        None => return Ok(0),
+        None => return Ok((0, false)),
     };
 
     let now = Instant::now();
     let mut count = 0;
+    let mut stalled = false;
 
     loop {
+        // Back-pressure: stop if pool is low, leaving headroom for recv/TUN ops.
+        // Quinn-proto keeps remaining transmits in its internal queue — they'll
+        // be drained next iteration after send completions free buffers.
+        if pool.available() <= RESERVED_BUFS {
+            stalled = true;
+            break;
+        }
+
         transmit_buf.clear();
         match conn.poll_transmit(now, 1, transmit_buf) {
             Some(transmit) => {
@@ -349,13 +374,13 @@ fn drain_transmits(
         }
     }
 
-    Ok(count)
+    Ok((count, stalled))
 }
 
-/// Submit a UDP send by copying directly from a Vec into a pool slot.
+/// Submit a UDP send by copying directly from a source buffer into a pool slot.
 ///
-/// Unlike `submit_udp_send` which takes a `&[u8]`, this copies from the
-/// transmit_buf at a known length, avoiding an intermediate stack buffer.
+/// Called by `drain_transmits` which already checks pool availability
+/// via back-pressure (RESERVED_BUFS). Should not fail under normal operation.
 fn submit_udp_send_direct(
     ring: &mut IoUring,
     pool: &mut BufferPool,
@@ -365,7 +390,9 @@ fn submit_udp_send_direct(
     let idx = match pool.alloc() {
         Some(i) => i,
         None => {
-            warn!("engine: buffer pool exhausted, dropping UDP send");
+            // Should not happen — drain_transmits checks pool.available() > RESERVED_BUFS.
+            // If it does, the transmit was already consumed from quinn. Log and continue.
+            debug!("engine: unexpected buffer pool exhaustion in send_direct");
             return Ok(());
         }
     };
@@ -378,8 +405,7 @@ fn submit_udp_send_direct(
             .build()
             .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (udp send)"))?;
+    push_sqe(ring, &entry)?;
     Ok(())
 }
 
@@ -407,8 +433,7 @@ fn submit_udp_recv(ring: &mut IoUring, pool: &mut BufferPool) -> Result<()> {
             .build()
             .user_data(bufpool::encode_user_data(OP_UDP_RECV, idx));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (udp recv)"))?;
+    push_sqe(ring, &entry)?;
     Ok(())
 }
 
@@ -430,8 +455,7 @@ fn submit_udp_send(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> Re
             .build()
             .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (udp send)"))?;
+    push_sqe(ring, &entry)?;
     Ok(())
 }
 
@@ -453,8 +477,7 @@ fn submit_tun_write(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> R
             .build()
             .user_data(bufpool::encode_user_data(OP_TUN_WRITE, idx));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (tun write)"))?;
+    push_sqe(ring, &entry)?;
     Ok(())
 }
 
@@ -464,8 +487,7 @@ fn submit_timer_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
         .build()
         .user_data(bufpool::encode_user_data(OP_TIMER, 0));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (timer)"))?;
+    push_sqe(ring, &entry)?;
     Ok(())
 }
 
@@ -475,8 +497,7 @@ fn submit_notify_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
         .build()
         .user_data(bufpool::encode_user_data(OP_WAKE, 0));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (notify)"))?;
+    push_sqe(ring, &entry)?;
     Ok(())
 }
 
@@ -486,8 +507,24 @@ fn submit_shutdown_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
         .build()
         .user_data(bufpool::encode_user_data(OP_SHUTDOWN, 0));
 
-    unsafe { ring.submission().push(&entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ full (shutdown)"))?;
+    push_sqe(ring, &entry)?;
+    Ok(())
+}
+
+/// Push an SQE to the submission queue, flushing if full.
+///
+/// If the SQ is full, submits all pending entries to the kernel and retries.
+/// This handles bursts where drain_transmits + recv resubmits + TUN writes
+/// exceed the ring size (256) in a single iteration.
+fn push_sqe(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> Result<()> {
+    // Each submission() call borrows ring mutably; must drop before calling submit().
+    if unsafe { ring.submission().push(entry) }.is_ok() {
+        return Ok(());
+    }
+    // SQ full — flush pending SQEs to kernel, then retry.
+    ring.submit().context("engine: SQ flush failed")?;
+    unsafe { ring.submission().push(entry) }
+        .map_err(|_| anyhow::anyhow!("engine: SQ still full after flush"))?;
     Ok(())
 }
 
