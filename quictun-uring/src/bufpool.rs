@@ -8,7 +8,9 @@ use io_uring::IoUring;
 pub const BUF_SIZE: usize = 2048;
 
 /// Number of buffers in the pool.
-const POOL_SIZE: usize = 256;
+/// Must be ≤ 1024 (kernel UIO_MAXIOV limit for register_buffers).
+/// 1024 × 2048 = 2 MB per pool (each reader/engine thread has its own pool).
+const POOL_SIZE: usize = 1024;
 
 // Operation type tags packed into the upper 4 bits of user_data.
 pub const OP_TUN_READ: u64 = 0;
