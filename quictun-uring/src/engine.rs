@@ -109,7 +109,7 @@ pub fn run(
         .register_files(&fds)
         .context("engine: failed to register files")?;
 
-    // Register send/TUN buffer pool for zero-copy I/O (WriteFixed/ReadFixed).
+    // Register send/TUN buffer pool for zero-copy I/O (SendZc/WriteFixed).
     pool.register(&ring)?;
 
     info!(sqpoll, "engine: io_uring initialized (registered fds + buffers)");
@@ -277,11 +277,17 @@ pub fn run(
                 }
 
                 OP_UDP_SEND => {
-                    if result < 0 {
-                        let err = std::io::Error::from_raw_os_error(-result);
-                        debug!(error = %err, "engine: UDP send error");
+                    let flags = cqe.flags();
+                    if cqueue::notif(flags) {
+                        // Notification: kernel is done with the buffer, safe to reuse.
+                        pool.free(idx);
+                    } else {
+                        // Completion: check result, but don't free buffer yet.
+                        if result < 0 {
+                            let err = std::io::Error::from_raw_os_error(-result);
+                            debug!(error = %err, "engine: UDP send error");
+                        }
                     }
-                    pool.free(idx);
                 }
 
                 OP_TUN_WRITE => {
@@ -391,8 +397,8 @@ const RESERVED_BUFS: usize = 64;
 
 /// Drain quinn-proto transmit queue directly into buffer pool + io_uring SQEs.
 ///
-/// Path: poll_transmit → transmit_buf (Vec) → pool slot → WriteFixed SQE.
-/// This is 1 copy (Vec → pool) instead of the previous 2 (Vec → stack → pool).
+/// Path: poll_transmit → transmit_buf (Vec) → pool slot → SendZc SQE.
+/// This is 1 copy (Vec → pool); SendZc avoids the kernel-side copy to socket buffer.
 ///
 /// Back-pressure: stops draining when pool is low (≤ RESERVED_BUFS free).
 /// Quinn-proto holds remaining transmits internally until the next iteration,
@@ -438,7 +444,10 @@ fn drain_transmits(
     Ok((count, stalled))
 }
 
-/// Submit a UDP send by copying directly from a source buffer into a pool slot.
+/// Submit a zero-copy UDP send by copying data into a pool slot, then using SendZc.
+///
+/// SendZc skips the kernel-side copy from registered buffer to socket buffer.
+/// Produces 2 CQEs: completion (check result) + notification (free buffer).
 ///
 /// Called by `drain_transmits` which already checks pool availability
 /// via back-pressure (RESERVED_BUFS). Should not fail under normal operation.
@@ -461,10 +470,10 @@ fn submit_udp_send_direct(
     let len = len.min(BUF_SIZE);
     dst[..len].copy_from_slice(&src[..len]);
 
-    let entry =
-        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
-            .build()
-            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
+    let entry = opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
+        .buf_index(Some(idx as u16))
+        .build()
+        .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
 
     push_sqe(ring, &entry)?;
     Ok(())
@@ -524,7 +533,9 @@ fn reprovide_buffer(ring: &mut IoUring, recv_pool: &ProvidedPool, bid: u16) -> R
     Ok(())
 }
 
-/// Submit a UDP send using registered fd + registered buffer.
+/// Submit a zero-copy UDP send using registered fd + registered buffer.
+///
+/// SendZc produces 2 CQEs: completion (check result) + notification (free buffer).
 fn submit_udp_send(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> Result<()> {
     let idx = match pool.alloc() {
         Some(i) => i,
@@ -536,10 +547,10 @@ fn submit_udp_send(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> Re
     let len = data.len().min(BUF_SIZE);
     pool.slice_mut(idx)[..len].copy_from_slice(&data[..len]);
 
-    let entry =
-        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
-            .build()
-            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
+    let entry = opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
+        .buf_index(Some(idx as u16))
+        .build()
+        .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
 
     push_sqe(ring, &entry)?;
     Ok(())
