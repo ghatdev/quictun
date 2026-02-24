@@ -11,7 +11,7 @@ use crate::bufpool::BUF_SIZE;
 /// QUIC state owned exclusively by the engine thread.
 ///
 /// The engine thread drives the quinn-proto state machine. All I/O is
-/// performed after `drive()` returns, using the returned `DriveResult`.
+/// performed after `process_events()` returns, using the returned `DriveResult`.
 pub struct QuicState {
     pub endpoint: Endpoint,
     pub connection: Option<quinn_proto::Connection>,
@@ -37,37 +37,47 @@ impl QuicState {
     }
 }
 
-/// Result of driving the QUIC connection state machine.
+/// Result of processing QUIC connection events.
 ///
-/// Collected by the engine thread, consumed immediately after.
-/// Defers all I/O to the caller.
+/// Pre-allocated once and reused across loop iterations via `process_events()`.
+/// Contains application-level output (datagrams, connection state).
+/// Transmit draining is handled separately by the engine's `drain_transmits`.
 pub struct DriveResult {
-    /// UDP packets to send: (length, data buffer).
-    pub transmits: Vec<(usize, [u8; BUF_SIZE])>,
     /// Decrypted TUN packets received from the peer.
     pub datagrams: Vec<Bytes>,
-    /// Next timeout deadline for the timer.
-    pub timer_deadline: Option<Instant>,
     /// Whether the QUIC connection just became established.
     pub connected: bool,
     /// Whether the connection was lost.
     pub connection_lost: bool,
 }
 
-/// Drive the QUIC connection: poll endpoint events, app events, drain transmits.
+impl DriveResult {
+    pub fn new() -> Self {
+        Self {
+            datagrams: Vec::new(),
+            connected: false,
+            connection_lost: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.datagrams.clear();
+        self.connected = false;
+        self.connection_lost = false;
+    }
+}
+
+/// Process QUIC connection events: poll endpoint events and application events.
 ///
-/// Returns a DriveResult containing all data needed for I/O operations.
-pub fn drive(state: &mut QuicState) -> DriveResult {
-    let mut result = DriveResult {
-        transmits: Vec::new(),
-        datagrams: Vec::new(),
-        timer_deadline: None,
-        connected: false,
-        connection_lost: false,
-    };
+/// Fills `result` with datagrams and connection state changes.
+/// Does NOT drain transmits or update timer — the engine handles those
+/// directly via `drain_transmits` to write into the buffer pool with zero
+/// intermediate copies.
+pub fn process_events(state: &mut QuicState, result: &mut DriveResult) {
+    result.clear();
 
     let (Some(conn), Some(conn_ch)) = (state.connection.as_mut(), state.ch) else {
-        return result;
+        return;
     };
 
     // 1. Process endpoint events.
@@ -97,33 +107,12 @@ pub fn drive(state: &mut QuicState) -> DriveResult {
             Event::HandshakeDataReady | Event::Stream(_) => {}
         }
     }
-
-    // 3. Drain transmit queue.
-    let now = Instant::now();
-    let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
-    loop {
-        transmit_buf.clear();
-        match conn.poll_transmit(now, 1, &mut transmit_buf) {
-            Some(transmit) => {
-                let len = transmit.size;
-                let mut buf = [0u8; BUF_SIZE];
-                buf[..len].copy_from_slice(&transmit_buf[..len]);
-                result.transmits.push((len, buf));
-            }
-            None => break,
-        }
-    }
-
-    // 4. Update timer deadline.
-    result.timer_deadline = conn.poll_timeout();
-
-    result
 }
 
 /// Handle a DatagramEvent from endpoint.handle().
 ///
 /// Mutates endpoint/connection state and collects any response transmits.
-/// Caller should follow with `drive()` to complete state machine processing.
+/// Caller should follow with `process_events()` to complete state machine processing.
 pub fn handle_datagram_event(
     state: &mut QuicState,
     event: DatagramEvent,

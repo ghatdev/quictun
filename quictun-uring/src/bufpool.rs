@@ -74,6 +74,15 @@ impl BufferPool {
         &self.storage[start..start + len]
     }
 
+    /// Get a mutable slice of buffer at `idx` (full BUF_SIZE).
+    ///
+    /// Used by `drain_transmits` to let quinn-proto write directly into pool buffers,
+    /// eliminating intermediate copies.
+    pub fn slice_mut(&mut self, idx: usize) -> &mut [u8] {
+        // SAFETY: storage is pinned, idx is within POOL_SIZE, and we have &mut self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(idx), BUF_SIZE) }
+    }
+
     /// Get the raw pointer for SQE construction.
     pub fn ptr(&self, idx: usize) -> *mut u8 {
         let start = idx * BUF_SIZE;

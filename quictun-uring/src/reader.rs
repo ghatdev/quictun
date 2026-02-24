@@ -72,6 +72,8 @@ pub fn run(
 
         let cqes: Vec<_> = ring.completion().collect();
 
+        let mut sent_any = false;
+
         for cqe in cqes {
             let user_data = cqe.user_data();
             let result = cqe.result();
@@ -98,8 +100,7 @@ pub fn run(
                     match tx.try_send(packet) {
                         Ok(()) => {
                             stats_sent += 1;
-                            // Wake the engine thread's io_uring via eventfd.
-                            write_eventfd(notify_fd);
+                            sent_any = true;
                         }
                         Err(crossbeam_channel::TrySendError::Full(_)) => {
                             stats_dropped += 1;
@@ -125,6 +126,11 @@ pub fn run(
             }
         }
 
+        // One eventfd write per CQE batch instead of per-packet.
+        if sent_any {
+            write_eventfd(notify_fd);
+        }
+
         if stats_last.elapsed() >= std::time::Duration::from_secs(2) {
             info!(
                 tun_reads = stats_tun_reads,
@@ -138,8 +144,6 @@ pub fn run(
             stats_dropped = 0;
             stats_last = std::time::Instant::now();
         }
-
-        ring.submit().context("reader: submit flush failed")?;
     }
 }
 

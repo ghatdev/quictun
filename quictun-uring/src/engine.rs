@@ -30,9 +30,13 @@ const FD_SHUTDOWN: u32 = 4;
 /// Run the engine thread: owns all QUIC state exclusively (no Mutex).
 ///
 /// Handles three event sources via io_uring:
-/// - UDP recv: incoming QUIC packets → endpoint.handle() → drive()
-/// - Timer: connection timeouts → handle_timeout() → drive()
-/// - Channel (via eventfd): TUN packets from reader → send_datagram() → drive()
+/// - UDP recv: incoming QUIC packets → endpoint.handle()
+/// - Timer: connection timeouts → handle_timeout()
+/// - Channel (via eventfd): TUN packets from reader → send_datagram()
+///
+/// Events are batched: all CQEs are handled first (feeding quinn state machine),
+/// then a single process_events() + drain_transmits() produces I/O for the batch.
+/// This coalesces ACKs (N packets → 1 ACK instead of N ACKs).
 ///
 /// Uses registered fds and registered buffers for reduced kernel overhead.
 pub fn run(
@@ -87,10 +91,19 @@ pub fn run(
     let mut shutdown_buf = [0u8; 8];
     submit_shutdown_read(&mut ring, &mut shutdown_buf)?;
 
+    // Pre-allocate reusable buffers (avoids per-iteration allocation).
+    let mut drive_result = shared::DriveResult::new();
+    let mut resp_transmits: Vec<(usize, [u8; BUF_SIZE])> = Vec::new();
+    let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+
     // Drain initial handshake transmits (connector ClientHello / listener ServerHello).
     if quic.connection.is_some() {
-        let result = shared::drive(&mut quic);
-        do_io(&mut ring, &mut pool, &timer, &result, &[])?;
+        shared::process_events(&mut quic, &mut drive_result);
+        for dg in &drive_result.datagrams {
+            submit_tun_write(&mut ring, &mut pool, dg)?;
+        }
+        drain_transmits(&mut quic, &mut ring, &mut pool, &mut transmit_buf)?;
+        update_timer(&mut quic, &timer);
     }
 
     // Arm timer from initial connection state (connector may have a pending timeout).
@@ -112,10 +125,19 @@ pub fn run(
     let mut stats_last = std::time::Instant::now();
 
     loop {
+        // submit_and_wait submits all accumulated SQEs AND waits for ≥1 CQE.
+        // No separate ring.submit() needed — one syscall per iteration.
         ring.submit_and_wait(1)
             .context("engine: submit_and_wait failed")?;
 
         let cqes: Vec<_> = ring.completion().collect();
+
+        // Phase 1: Handle all events (no drive/IO yet).
+        // Feed packets into quinn state machine, accumulate response transmits.
+        let mut had_udp = false;
+        let mut had_timer = false;
+        let mut had_wake = false;
+        resp_transmits.clear();
 
         for cqe in cqes {
             let user_data = cqe.user_data();
@@ -137,11 +159,9 @@ pub fn run(
                     let data = bytes::BytesMut::from(pool.slice(idx, len));
                     pool.free(idx);
 
-                    // Handle incoming packet, drive state machine.
+                    // Feed packet into quinn state machine (no drive yet).
                     let now = Instant::now();
                     let remote_addr = quic.remote_addr;
-
-                    let mut resp_tx = Vec::new();
                     if let Some(event) = quic.endpoint.handle(
                         now,
                         remote_addr,
@@ -150,30 +170,15 @@ pub fn run(
                         data,
                         &mut response_buf,
                     ) {
-                        resp_tx =
+                        let mut tx =
                             shared::handle_datagram_event(&mut quic, event, &mut response_buf);
+                        resp_transmits.append(&mut tx);
                     }
                     response_buf.clear();
 
-                    let drive_result = shared::drive(&mut quic);
-                    stats_datagrams += drive_result.datagrams.len() as u64;
-                    stats_transmits += drive_result.transmits.len() as u64;
-
-                    // Resubmit UDP recv.
+                    // Resubmit UDP recv (pushed to SQ, submitted by next submit_and_wait).
                     submit_udp_recv(&mut ring, &mut pool)?;
-
-                    if drive_result.connection_lost {
-                        info!("engine: connection lost, signaling shutdown");
-                        signal_shutdown(shutdown_fd);
-                        return Ok(());
-                    }
-                    do_io(
-                        &mut ring,
-                        &mut pool,
-                        &timer,
-                        &drive_result,
-                        &resp_tx,
-                    )?;
+                    had_udp = true;
                 }
 
                 OP_TIMER => {
@@ -182,30 +187,15 @@ pub fn run(
                     if let Some(conn) = quic.connection.as_mut() {
                         conn.handle_timeout(now);
                     }
-                    let drive_result = shared::drive(&mut quic);
-                    stats_transmits += drive_result.transmits.len() as u64;
-
                     // Resubmit timer read.
                     submit_timer_read(&mut ring, &mut timer_buf)?;
-
-                    if drive_result.connection_lost {
-                        info!("engine: connection lost (timeout), signaling shutdown");
-                        signal_shutdown(shutdown_fd);
-                        return Ok(());
-                    }
-                    do_io(
-                        &mut ring,
-                        &mut pool,
-                        &timer,
-                        &drive_result,
-                        &[],
-                    )?;
+                    had_timer = true;
                 }
 
                 OP_WAKE => {
                     stats_channel_wakes += 1;
 
-                    // Drain all packets from the channel in one batch.
+                    // Drain all packets from the channel — queue into quinn.
                     let mut batch_count: u64 = 0;
                     while let Ok(packet) = rx.try_recv() {
                         batch_count += 1;
@@ -233,25 +223,9 @@ pub fn run(
                     }
                     stats_channel_packets += batch_count;
 
-                    // Single drive() call for the entire batch.
-                    let drive_result = shared::drive(&mut quic);
-                    stats_transmits += drive_result.transmits.len() as u64;
-
                     // Resubmit channel eventfd read.
                     submit_notify_read(&mut ring, &mut notify_buf)?;
-
-                    if drive_result.connection_lost {
-                        info!("engine: connection lost, signaling shutdown");
-                        signal_shutdown(shutdown_fd);
-                        return Ok(());
-                    }
-                    do_io(
-                        &mut ring,
-                        &mut pool,
-                        &timer,
-                        &drive_result,
-                        &[],
-                    )?;
+                    had_wake = true;
                 }
 
                 OP_UDP_SEND => {
@@ -281,6 +255,43 @@ pub fn run(
             }
         }
 
+        // Phase 2: Single process_events + I/O for ALL events in this batch.
+        // N UDP packets → 1 drive → coalesced ACKs instead of N separate ACKs.
+        // Transmits go directly from quinn → buffer pool (1 copy, not 3).
+        if had_udp || had_timer || had_wake {
+            shared::process_events(&mut quic, &mut drive_result);
+            stats_datagrams += drive_result.datagrams.len() as u64;
+
+            if drive_result.connection_lost {
+                info!("engine: connection lost, signaling shutdown");
+                signal_shutdown(shutdown_fd);
+                return Ok(());
+            }
+
+            // Write decrypted datagrams to TUN.
+            for dg in &drive_result.datagrams {
+                submit_tun_write(&mut ring, &mut pool, dg)?;
+            }
+
+            // Send response transmits (handshake: version negotiation, etc.).
+            for (len, data) in &resp_transmits {
+                submit_udp_send(&mut ring, &mut pool, &data[..*len])?;
+            }
+
+            // Drain quinn transmits directly to buffer pool → io_uring.
+            // poll_transmit → transmit_buf → pool slot → WriteFixed SQE.
+            // Eliminates the intermediate [u8; 2048] stack buffer + Vec<transmits>.
+            stats_transmits += drain_transmits(
+                &mut quic,
+                &mut ring,
+                &mut pool,
+                &mut transmit_buf,
+            )? as u64;
+
+            // Update timer from connection state.
+            update_timer(&mut quic, &timer);
+        }
+
         if stats_last.elapsed() >= std::time::Duration::from_secs(2) {
             info!(
                 udp_recvs = stats_udp_recvs,
@@ -304,41 +315,82 @@ pub fn run(
             stats_sends_fail = 0;
             stats_last = std::time::Instant::now();
         }
-
-        ring.submit().context("engine: submit flush failed")?;
     }
 }
 
-/// Perform I/O operations from a DriveResult.
-fn do_io(
+/// Drain quinn-proto transmit queue directly into buffer pool + io_uring SQEs.
+///
+/// Path: poll_transmit → transmit_buf (Vec) → pool slot → WriteFixed SQE.
+/// This is 1 copy (Vec → pool) instead of the previous 2 (Vec → stack → pool).
+/// Returns the number of transmits drained.
+fn drain_transmits(
+    quic: &mut QuicState,
     ring: &mut IoUring,
     pool: &mut BufferPool,
-    timer: &Timer,
-    result: &shared::DriveResult,
-    response_transmits: &[(usize, [u8; BUF_SIZE])],
+    transmit_buf: &mut Vec<u8>,
+) -> Result<usize> {
+    let conn = match quic.connection.as_mut() {
+        Some(c) => c,
+        None => return Ok(0),
+    };
+
+    let now = Instant::now();
+    let mut count = 0;
+
+    loop {
+        transmit_buf.clear();
+        match conn.poll_transmit(now, 1, transmit_buf) {
+            Some(transmit) => {
+                let len = transmit.size;
+                submit_udp_send_direct(ring, pool, transmit_buf, len)?;
+                count += 1;
+            }
+            None => break,
+        }
+    }
+
+    Ok(count)
+}
+
+/// Submit a UDP send by copying directly from a Vec into a pool slot.
+///
+/// Unlike `submit_udp_send` which takes a `&[u8]`, this copies from the
+/// transmit_buf at a known length, avoiding an intermediate stack buffer.
+fn submit_udp_send_direct(
+    ring: &mut IoUring,
+    pool: &mut BufferPool,
+    src: &[u8],
+    len: usize,
 ) -> Result<()> {
-    // Write decrypted datagrams to TUN.
-    for datagram in &result.datagrams {
-        submit_tun_write(ring, pool, datagram)?;
-    }
+    let idx = match pool.alloc() {
+        Some(i) => i,
+        None => {
+            warn!("engine: buffer pool exhausted, dropping UDP send");
+            return Ok(());
+        }
+    };
+    let dst = pool.slice_mut(idx);
+    let len = len.min(BUF_SIZE);
+    dst[..len].copy_from_slice(&src[..len]);
 
-    // Send UDP packets (from drive: ACKs, retransmits, etc.).
-    for (len, data) in &result.transmits {
-        submit_udp_send(ring, pool, &data[..*len])?;
-    }
+    let entry =
+        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
 
-    // Send response transmits (from endpoint.handle: version negotiation, etc.).
-    for (len, data) in response_transmits {
-        submit_udp_send(ring, pool, &data[..*len])?;
-    }
-
-    // Update timer.
-    match result.timer_deadline {
-        Some(deadline) => timer.arm(deadline),
-        None => timer.disarm(),
-    }
-
+    unsafe { ring.submission().push(&entry) }
+        .map_err(|_| anyhow::anyhow!("engine: SQ full (udp send)"))?;
     Ok(())
+}
+
+/// Update the timer from the current QUIC connection state.
+fn update_timer(quic: &mut QuicState, timer: &Timer) {
+    if let Some(conn) = quic.connection.as_mut() {
+        match conn.poll_timeout() {
+            Some(deadline) => timer.arm(deadline),
+            None => timer.disarm(),
+        }
+    }
 }
 
 /// Submit a UDP recv using registered fd + registered buffer.
