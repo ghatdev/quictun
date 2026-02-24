@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::{Context, Result, bail};
 
@@ -10,69 +10,65 @@ const BUF_SIZE: i32 = 8 * 1024 * 1024; // 8 MB
 /// Connected mode allows using simple Read/Write io_uring ops instead of
 /// RecvMsg/SendMsg with msghdr structs.
 pub fn create_udp(local: SocketAddr, remote: SocketAddr) -> Result<OwnedFd> {
-    let (domain, addr_len) = match local {
-        SocketAddr::V4(_) => (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>()),
-        SocketAddr::V6(_) => (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>()),
-    };
+    let fd = create_udp_socket(local).context("create_udp")?;
+    connect_to_peer(&fd, remote).context("connect_to_peer")?;
+    Ok(fd)
+}
 
-    // SAFETY: standard socket creation syscall.
-    let fd = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+/// Create a bound-only (unconnected) UDP socket suitable for listener startup.
+///
+/// The socket is bound to `local` but NOT connected — use `recvfrom_first()` to
+/// learn the peer address, then `connect_to_peer()` to enter connected mode.
+pub fn create_udp_unbound(local: SocketAddr) -> Result<OwnedFd> {
+    create_udp_socket(local).context("create_udp_unbound")
+}
+
+/// Blocking `recvfrom()` — waits for the first UDP packet and returns
+/// (bytes_read, peer_address). Used once at listener startup to learn the
+/// peer address before entering the io_uring loop.
+///
+/// The socket MUST be in blocking mode when this is called (the default from
+/// `create_udp_unbound`).
+pub fn recvfrom_first(fd: &OwnedFd, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+    let n = unsafe {
+        libc::recvfrom(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
             0,
+            &mut storage as *mut _ as *mut libc::sockaddr,
+            &mut addr_len,
         )
     };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("socket() failed");
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let raw = fd.as_raw_fd();
-
-    // Set buffer sizes.
-    setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_RCVBUF, BUF_SIZE)
-        .context("SO_RCVBUF")?;
-    setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_SNDBUF, BUF_SIZE)
-        .context("SO_SNDBUF")?;
-
-    // IP_DONTFRAG / IPV6_DONTFRAG — required for QUIC MTUD.
-    match local {
-        SocketAddr::V4(_) => {
-            // Linux: IP_MTU_DISCOVER = IP_PMTUDISC_PROBE
-            setsockopt_int(raw, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_PROBE)
-                .context("IP_MTU_DISCOVER")?;
-        }
-        SocketAddr::V6(_) => {
-            setsockopt_int(raw, libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_PROBE)
-                .context("IPV6_MTU_DISCOVER")?;
-        }
+    if n < 0 {
+        return Err(std::io::Error::last_os_error()).context("recvfrom() failed");
     }
 
-    // Bind.
-    let bind_addr = sockaddr_from(local);
-    // SAFETY: valid fd and sockaddr.
-    let ret = unsafe {
-        libc::bind(raw, &bind_addr as *const _ as *const libc::sockaddr, addr_len as libc::socklen_t)
-    };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error()).context("bind() failed");
-    }
+    let peer = sockaddr_to_std(&storage)?;
+    Ok((n as usize, peer))
+}
 
-    // Connect (connected mode for single peer).
+/// Connect a previously unbound socket to `remote`, enabling Read/Write ops.
+pub fn connect_to_peer(fd: &OwnedFd, remote: SocketAddr) -> Result<()> {
     let remote_addr = sockaddr_from(remote);
     let remote_len = match remote {
         SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
         SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
     };
-    // SAFETY: valid fd and sockaddr.
     let ret = unsafe {
-        libc::connect(raw, &remote_addr as *const _ as *const libc::sockaddr, remote_len as libc::socklen_t)
+        libc::connect(
+            fd.as_raw_fd(),
+            &remote_addr as *const _ as *const libc::sockaddr,
+            remote_len as libc::socklen_t,
+        )
     };
     if ret < 0 {
         return Err(std::io::Error::last_os_error()).context("connect() failed");
     }
-
-    Ok(fd)
+    Ok(())
 }
 
 /// Get the local address a socket is bound to (after OS assigns ephemeral port).
@@ -91,27 +87,74 @@ pub fn local_addr(fd: &OwnedFd) -> Result<SocketAddr> {
         return Err(std::io::Error::last_os_error()).context("getsockname() failed");
     }
 
-    match storage.ss_family as i32 {
-        libc::AF_INET => {
-            let addr: &libc::sockaddr_in = unsafe { &*(&storage as *const _ as *const _) };
-            let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-            let port = u16::from_be(addr.sin_port);
-            Ok(SocketAddr::new(ip.into(), port))
-        }
-        libc::AF_INET6 => {
-            let addr: &libc::sockaddr_in6 = unsafe { &*(&storage as *const _ as *const _) };
-            let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
-            let port = u16::from_be(addr.sin6_port);
-            Ok(SocketAddr::new(ip.into(), port))
-        }
-        f => bail!("unexpected address family: {f}"),
-    }
+    sockaddr_to_std(&storage)
 }
 
-// --- helpers ---
+// --- internal helpers ---
+
+/// Create a nonblocking UDP socket, set buffer sizes + PMTUD, bind to `local`.
+fn create_udp_socket(local: SocketAddr) -> Result<OwnedFd> {
+    let (domain, addr_len) = match local {
+        SocketAddr::V4(_) => (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>()),
+        SocketAddr::V6(_) => (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>()),
+    };
+
+    let fd = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket() failed");
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let raw = fd.as_raw_fd();
+
+    // Set buffer sizes.
+    setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_RCVBUF, BUF_SIZE).context("SO_RCVBUF")?;
+    setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_SNDBUF, BUF_SIZE).context("SO_SNDBUF")?;
+
+    // IP_DONTFRAG / IPV6_DONTFRAG — required for QUIC MTUD.
+    match local {
+        SocketAddr::V4(_) => {
+            setsockopt_int(
+                raw,
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                libc::IP_PMTUDISC_PROBE,
+            )
+            .context("IP_MTU_DISCOVER")?;
+        }
+        SocketAddr::V6(_) => {
+            setsockopt_int(
+                raw,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                libc::IPV6_PMTUDISC_PROBE,
+            )
+            .context("IPV6_MTU_DISCOVER")?;
+        }
+    }
+
+    // Bind.
+    let bind_addr = sockaddr_from(local);
+    let ret = unsafe {
+        libc::bind(
+            raw,
+            &bind_addr as *const _ as *const libc::sockaddr,
+            addr_len as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error()).context("bind() failed");
+    }
+
+    Ok(fd)
+}
 
 fn setsockopt_int(fd: i32, level: i32, name: i32, value: i32) -> Result<()> {
-    // SAFETY: standard setsockopt with int value.
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -148,4 +191,23 @@ fn sockaddr_from(addr: SocketAddr) -> libc::sockaddr_storage {
         }
     }
     storage
+}
+
+/// Convert a `libc::sockaddr_storage` to a `SocketAddr`.
+fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> Result<SocketAddr> {
+    match storage.ss_family as i32 {
+        libc::AF_INET => {
+            let addr: &libc::sockaddr_in = unsafe { &*(storage as *const _ as *const _) };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            let port = u16::from_be(addr.sin_port);
+            Ok(SocketAddr::new(ip.into(), port))
+        }
+        libc::AF_INET6 => {
+            let addr: &libc::sockaddr_in6 = unsafe { &*(storage as *const _ as *const _) };
+            let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            Ok(SocketAddr::new(ip.into(), port))
+        }
+        f => bail!("unexpected address family: {f}"),
+    }
 }

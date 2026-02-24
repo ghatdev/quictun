@@ -124,37 +124,24 @@ fn run_iouring(
         }
     };
 
-    let uring_role = match role {
-        Role::Connector => quictun_uring::event_loop::Role::Connector,
-        Role::Listener => quictun_uring::event_loop::Role::Listener,
-    };
-
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
-    let remote_addr = match role {
-        Role::Connector => peer.endpoint.context("connector requires peer endpoint")?,
-        Role::Listener => {
-            // For listener with connected UDP, we need the remote addr.
-            // In Phase 1 single-peer, we use 0.0.0.0:0 as placeholder — but connected UDP
-            // requires a real address. Listener must wait for the first packet.
-            // Workaround: use unconnected UDP or require endpoint for listener too.
-            // For Phase 1, require the listener to specify the peer endpoint.
-            peer.endpoint.context(
-                "--iouring listener requires peer endpoint (connected UDP, Phase 1 limitation)",
-            )?
+    let setup = match role {
+        Role::Connector => {
+            let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+            quictun_uring::event_loop::EndpointSetup::Connector {
+                remote_addr,
+                client_config: client_config.context("connector requires client_config")?,
+            }
         }
+        Role::Listener => quictun_uring::event_loop::EndpointSetup::Listener {
+            server_config: server_config.context("listener requires server_config")?,
+        },
     };
 
-    // Run the io_uring event loop on the current thread (no tokio).
-    quictun_uring::event_loop::run(
-        tun_fd,
-        local_addr,
-        remote_addr,
-        uring_role,
-        client_config,
-        server_config,
-    )
+    // Run the two-thread io_uring event loop (no tokio).
+    quictun_uring::event_loop::run(tun_fd, local_addr, setup)
 }
 
 async fn run_async(

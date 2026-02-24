@@ -13,6 +13,7 @@ pub const OP_TUN_WRITE: u64 = 1;
 pub const OP_UDP_RECV: u64 = 2;
 pub const OP_UDP_SEND: u64 = 3;
 pub const OP_TIMER: u64 = 4;
+pub const OP_WAKE: u64 = 5;
 
 const OP_SHIFT: u32 = 60;
 const INDEX_MASK: u64 = (1 << OP_SHIFT) - 1;
