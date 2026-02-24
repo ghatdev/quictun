@@ -88,16 +88,24 @@ pub fn run(
                     let drive_result = {
                         let mut state = quic.lock().expect("quic mutex poisoned");
                         if let Some(conn) = state.connection.as_mut() {
-                            let max = conn.datagrams().max_size().unwrap_or(1200);
-                            if packet.len() > max {
-                                debug!(
-                                    packet_size = packet.len(),
-                                    max, "outbound: dropping oversized TUN packet"
-                                );
-                            } else if conn.datagrams().send(packet, true).is_err() {
-                                stats_sends_fail += 1;
+                            if conn.is_handshaking() {
+                                // Can't send datagrams until handshake completes — drop silently.
                             } else {
-                                stats_sends_ok += 1;
+                                let max = conn.datagrams().max_size().unwrap_or(1200);
+                                if packet.len() > max {
+                                    debug!(
+                                        packet_size = packet.len(),
+                                        max, "outbound: dropping oversized TUN packet"
+                                    );
+                                } else {
+                                    match conn.datagrams().send(packet, true) {
+                                        Ok(()) => stats_sends_ok += 1,
+                                        Err(e) => {
+                                            debug!(error = ?e, "outbound: datagrams.send failed");
+                                            stats_sends_fail += 1;
+                                        }
+                                    }
+                                }
                             }
                         }
                         shared::drive(&mut state)
