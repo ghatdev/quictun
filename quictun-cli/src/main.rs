@@ -1,5 +1,7 @@
+mod down;
 mod genkey;
 mod pubkey;
+mod state;
 mod up;
 
 use clap::{Parser, Subcommand};
@@ -46,6 +48,11 @@ enum Command {
         #[arg(long)]
         iouring: bool,
     },
+    /// Bring down a running tunnel by config file
+    Down {
+        /// Path to the TOML config file
+        config: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -66,5 +73,6 @@ fn main() -> anyhow::Result<()> {
         } => up::run(
             &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring,
         ),
+        Command::Down { config } => down::run(&config),
     }
 }

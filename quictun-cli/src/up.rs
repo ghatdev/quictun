@@ -14,6 +14,8 @@ use quictun_tun::{TunDevice, TunOptions};
 use tokio::signal;
 use tokio::sync::watch;
 
+use crate::state;
+
 pub fn run(
     config_path: &str,
     serial: bool,
@@ -103,10 +105,18 @@ fn run_iouring(
         "starting quictun (io_uring)"
     );
 
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
     // Create sync TUN device.
-    let tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+    let mut tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+    tun_opts.name = Some(iface_name.clone());
     let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
     let tun_fd = tun.as_raw_fd();
+
+    // Write PID file (guard removes it on exit/panic).
+    state::write_pid_file(&iface_name)?;
+    let _pid_guard = state::PidFileGuard::new(iface_name);
 
     // Build quinn-proto configs.
     let (client_config, server_config) = match role {
@@ -204,11 +214,15 @@ async fn run_async(
         bail!("--queues > 1 requires Linux (IFF_MULTI_QUEUE)");
     }
 
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
     let use_multi_queue = queues > 1;
 
     let tun_opts = {
         #[allow(unused_mut)]
         let mut opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+        opts.name = Some(iface_name.clone());
         #[cfg(target_os = "linux")]
         {
             opts.multi_queue = use_multi_queue;
@@ -218,6 +232,10 @@ async fn run_async(
 
     let tun = TunDevice::create_with_options(&tun_opts)
         .context("failed to create TUN device")?;
+
+    // Write PID file (guard removes it on exit/panic).
+    state::write_pid_file(&iface_name)?;
+    let _pid_guard = state::PidFileGuard::new(iface_name);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 

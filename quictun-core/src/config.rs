@@ -31,6 +31,9 @@ pub struct InterfaceConfig {
     pub listen_port: Option<u16>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Optional explicit interface name (e.g. "connector"). If omitted,
+    /// `Config::interface_name()` derives it from the config filename.
+    pub name: Option<String>,
 }
 
 fn default_mtu() -> u16 {
@@ -97,6 +100,19 @@ impl Config {
     pub fn mtu(&self) -> u16 {
         self.interface.mtu
     }
+
+    /// Return the interface name: explicit `name` if set, otherwise derived
+    /// from the config filename (e.g. `connector.toml` → `connector`).
+    pub fn interface_name(&self, config_path: &Path) -> String {
+        if let Some(ref name) = self.interface.name {
+            return name.clone();
+        }
+        config_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("quictun")
+            .to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +178,7 @@ allowed_ips = ["10.0.0.2/32"]
                 address: "10.0.0.1/24".into(),
                 listen_port: None,
                 mtu: 1380,
+                name: None,
             },
             peer: vec![],
         };
