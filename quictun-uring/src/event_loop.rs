@@ -18,7 +18,7 @@ use crate::timer::Timer;
 use crate::udp;
 
 /// Number of initial read SQEs to prime for each fd.
-const PREFILL_READS: usize = 8;
+const PREFILL_READS: usize = 32;
 
 /// Ring size (must be power of 2).
 const RING_SIZE: u32 = 256;
@@ -43,6 +43,11 @@ pub fn run(
     client_config: Option<ClientConfig>,
     server_config: Option<Arc<ServerConfig>>,
 ) -> Result<()> {
+    // 0. Set TUN fd to non-blocking.
+    // io_uring handles EAGAIN on non-blocking fds by auto-polling and retrying.
+    // Without this, reads go to io_uring's io-wq worker threads which block.
+    set_nonblocking(tun_fd).context("failed to set TUN fd non-blocking")?;
+
     // 1. Create UDP socket (connected to remote).
     let udp_fd = udp::create_udp(local_addr, remote_addr).context("failed to create UDP socket")?;
     let udp_raw = udp_fd.as_raw_fd();
@@ -118,11 +123,10 @@ pub fn run(
         ring.submit_and_wait(1)
             .context("submit_and_wait failed")?;
 
-        let now = Instant::now();
-
         // Process all available CQEs.
-        // We must collect CQEs before submitting new SQEs (borrow checker).
+        // Collect into a vec to release the borrow on the ring.
         let cqes: Vec<_> = ring.completion().collect();
+        let now = Instant::now();
 
         for cqe in cqes {
             let user_data = cqe.user_data();
@@ -149,7 +153,6 @@ pub fn run(
                         if len > max {
                             warn!(packet_size = len, max, "dropping oversized TUN packet");
                         } else {
-                            debug!(size = len, "TUN → QUIC");
                             if let Err(e) = conn.datagrams().send(data, true) {
                                 debug!(error = ?e, "datagrams.send failed (dropped)");
                             }
@@ -181,7 +184,6 @@ pub fn run(
                     pool.free(idx);
 
                     // Feed to quinn-proto endpoint.
-                    debug!(size = len, "UDP recv");
                     match endpoint.handle(now, remote_addr, None, None, data, &mut response_buf) {
                         Some(DatagramEvent::ConnectionEvent(event_ch, event)) => {
                             if let Some(ref mut conn) = connection {
@@ -210,7 +212,6 @@ pub fn run(
                                     }
                                 }
                             } else {
-                                // Already have a connection, ignore.
                                 endpoint.ignore(incoming);
                             }
                         }
@@ -237,11 +238,9 @@ pub fn run(
                 }
 
                 OP_TIMER => {
-                    // Timer fired. Re-read the timer buf.
                     if let Some(ref mut conn) = connection {
                         conn.handle_timeout(now);
                     }
-                    // Resubmit timer read.
                     submit_timer_read(&mut ring, timer_fd, &mut timer_buf)?;
                 }
 
@@ -249,56 +248,18 @@ pub fn run(
                     warn!(op, "unknown op in CQE");
                 }
             }
+
+            // Drive connection state after EACH CQE — not just at end of batch.
+            // This ensures transmits are produced immediately when datagrams are queued,
+            // and incoming datagrams are delivered to TUN without waiting for the full batch.
+            drive_connection(
+                &mut connection, ch, &mut endpoint, &mut ring, &mut pool,
+                tun_fd, udp_raw, &mut transmit_buf, &timer, &mut _state,
+            )?;
         }
 
-        // Process connection state if we have one.
-        if let (Some(ref mut conn), Some(conn_ch)) = (&mut connection, ch) {
-            // Process endpoint events.
-            while let Some(event) = conn.poll_endpoint_events() {
-                if let Some(conn_event) = endpoint.handle_event(conn_ch, event) {
-                    conn.handle_event(conn_event);
-                }
-            }
-
-            // Process application events.
-            while let Some(event) = conn.poll() {
-                match event {
-                    Event::Connected => {
-                        info!("QUIC connection established");
-                        _state = LoopState::Forwarding;
-                        // Now start reading from TUN.
-                        for _ in 0..PREFILL_READS {
-                            submit_tun_read(&mut ring, &mut pool, tun_fd)?;
-                        }
-                    }
-                    Event::DatagramReceived => {
-                        // Drain all received datagrams → TUN writes.
-                        while let Some(datagram) = conn.datagrams().recv() {
-                            debug!(size = datagram.len(), "QUIC → TUN");
-                            submit_tun_write(&mut ring, &mut pool, tun_fd, &datagram)?;
-                        }
-                    }
-                    Event::DatagramsUnblocked => {
-                        // Send buffer space freed — could retry blocked sends.
-                        // For now, no-op (we use drop=true).
-                    }
-                    Event::ConnectionLost { reason } => {
-                        info!(reason = %reason, "connection lost");
-                        return Ok(());
-                    }
-                    Event::HandshakeDataReady | Event::Stream(_) => {}
-                }
-            }
-
-            // Drain transmit queue.
-            drain_transmits(conn, &mut ring, &mut pool, udp_raw, &mut transmit_buf)?;
-
-            // Update timer.
-            match conn.poll_timeout() {
-                Some(deadline) => timer.arm(deadline),
-                None => timer.disarm(),
-            }
-        }
+        // Flush all pending SQEs to the kernel immediately.
+        ring.submit().context("submit flush failed")?;
     }
 }
 
@@ -308,6 +269,68 @@ enum LoopState {
     WaitingForConnection,
     Handshaking,
     Forwarding,
+}
+
+/// Drive connection state: process endpoint events, app events, drain transmits, update timer.
+/// Called after each CQE to minimize latency between queueing a datagram and sending it.
+#[allow(clippy::too_many_arguments)]
+fn drive_connection(
+    connection: &mut Option<quinn_proto::Connection>,
+    ch: Option<ConnectionHandle>,
+    endpoint: &mut Endpoint,
+    ring: &mut IoUring,
+    pool: &mut BufferPool,
+    tun_fd: RawFd,
+    udp_fd: RawFd,
+    transmit_buf: &mut Vec<u8>,
+    timer: &Timer,
+    state: &mut LoopState,
+) -> Result<()> {
+    let (Some(conn), Some(conn_ch)) = (connection.as_mut(), ch) else {
+        return Ok(());
+    };
+
+    // Process endpoint events.
+    while let Some(event) = conn.poll_endpoint_events() {
+        if let Some(conn_event) = endpoint.handle_event(conn_ch, event) {
+            conn.handle_event(conn_event);
+        }
+    }
+
+    // Process application events.
+    while let Some(event) = conn.poll() {
+        match event {
+            Event::Connected => {
+                info!("QUIC connection established");
+                *state = LoopState::Forwarding;
+                for _ in 0..PREFILL_READS {
+                    submit_tun_read(ring, pool, tun_fd)?;
+                }
+            }
+            Event::DatagramReceived => {
+                while let Some(datagram) = conn.datagrams().recv() {
+                    submit_tun_write(ring, pool, tun_fd, &datagram)?;
+                }
+            }
+            Event::DatagramsUnblocked => {}
+            Event::ConnectionLost { reason } => {
+                info!(reason = %reason, "connection lost");
+                std::process::exit(0);
+            }
+            Event::HandshakeDataReady | Event::Stream(_) => {}
+        }
+    }
+
+    // Drain transmit queue.
+    drain_transmits(conn, ring, pool, udp_fd, transmit_buf)?;
+
+    // Update timer.
+    match conn.poll_timeout() {
+        Some(deadline) => timer.arm(deadline),
+        None => timer.disarm(),
+    }
+
+    Ok(())
 }
 
 /// Submit a TUN read SQE.
@@ -441,4 +464,17 @@ fn send_transmit_immediate(
     buf: &[u8],
 ) -> Result<()> {
     submit_udp_send(ring, pool, udp_fd, &buf[..transmit.size])
+}
+
+/// Set a file descriptor to non-blocking mode.
+fn set_nonblocking(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl F_GETFL");
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl F_SETFL O_NONBLOCK");
+    }
+    Ok(())
 }
