@@ -5,21 +5,18 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::Receiver;
-use io_uring::{IoUring, opcode, types};
+use io_uring::{IoUring, cqueue, opcode, squeue::Flags, types};
 use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
 
 use crate::bufpool::{
-    self, BUF_SIZE, BufferPool, OP_SHUTDOWN, OP_TIMER, OP_TUN_WRITE, OP_UDP_RECV, OP_UDP_SEND,
-    OP_WAKE,
+    self, BUF_GROUP_UDP, BUF_SIZE, BufferPool, OP_PROVIDE_BUF, OP_SHUTDOWN, OP_TIMER,
+    OP_TUN_WRITE, OP_UDP_RECV, OP_UDP_SEND, OP_WAKE, ProvidedPool,
 };
 use crate::event_loop::{set_blocking, set_nonblocking};
 use crate::shared::{self, QuicState};
 use crate::timer::Timer;
 use crate::udp;
-
-/// Number of UDP recv SQEs to keep in flight.
-const PREFILL_READS: usize = 32;
 
 /// io_uring ring size for the engine thread.
 const RING_SIZE: u32 = 256;
@@ -96,7 +93,11 @@ pub fn run(
         IoUring::new(RING_SIZE).context("engine: failed to create io_uring")?
     };
 
+    // Registered buffer pool for sends + TUN writes (WriteFixed).
     let mut pool = BufferPool::new(pool_size);
+
+    // Provided buffer pool for multishot UDP recv (kernel-managed).
+    let recv_pool = ProvidedPool::new(pool_size, BUF_GROUP_UDP);
 
     let timer_fd = timer.raw_fd();
     let mut timer_buf = [0u8; 8];
@@ -108,15 +109,17 @@ pub fn run(
         .register_files(&fds)
         .context("engine: failed to register files")?;
 
-    // Register buffer pool for zero-copy I/O.
+    // Register send/TUN buffer pool for zero-copy I/O (WriteFixed/ReadFixed).
     pool.register(&ring)?;
 
     info!(sqpoll, "engine: io_uring initialized (registered fds + buffers)");
 
-    // Prime UDP recv SQEs.
-    for _ in 0..PREFILL_READS {
-        submit_udp_recv(&mut ring, &mut pool)?;
-    }
+    // Provide all recv buffers to kernel (single SQE).
+    provide_all_buffers(&mut ring, &recv_pool)?;
+
+    // Submit one multishot recv (replaces 32× ReadFixed).
+    submit_multishot_recv(&mut ring, &recv_pool)?;
+    let mut multishot_active = true;
 
     // Submit timer read SQE.
     submit_timer_read(&mut ring, &mut timer_buf)?;
@@ -187,16 +190,21 @@ pub fn run(
             match op {
                 OP_UDP_RECV => {
                     if result < 0 {
+                        // Multishot cancelled (e.g., -ENOBUFS) or error.
                         let err = std::io::Error::from_raw_os_error(-result);
-                        warn!(error = %err, "engine: UDP recv error");
-                        pool.free(idx);
-                        submit_udp_recv(&mut ring, &mut pool)?;
+                        warn!(error = %err, "engine: multishot recv error");
+                        multishot_active = false;
                         continue;
                     }
                     stats_udp_recvs += 1;
+                    let flags = cqe.flags();
+                    let bid = cqueue::buffer_select(flags)
+                        .expect("RecvMulti CQE must have BUFFER_SELECT flag");
                     let len = result as usize;
-                    let data = bytes::BytesMut::from(pool.slice(idx, len));
-                    pool.free(idx);
+                    let data = BytesMut::from(recv_pool.slice(bid, len));
+
+                    // Re-provide consumed buffer (SKIP_SUCCESS suppresses CQE).
+                    reprovide_buffer(&mut ring, &recv_pool, bid)?;
 
                     // Feed packet into quinn state machine (no drive yet).
                     let now = Instant::now();
@@ -215,8 +223,9 @@ pub fn run(
                     }
                     response_buf.clear();
 
-                    // Resubmit UDP recv (pushed to SQ, submitted by next submit_and_wait).
-                    submit_udp_recv(&mut ring, &mut pool)?;
+                    if !cqueue::more(flags) {
+                        multishot_active = false;
+                    }
                     had_udp = true;
                 }
 
@@ -283,6 +292,14 @@ pub fn run(
                     pool.free(idx);
                 }
 
+                OP_PROVIDE_BUF => {
+                    if result < 0 {
+                        let err = std::io::Error::from_raw_os_error(-result);
+                        warn!(error = %err, "engine: provide buffer failed");
+                    }
+                    // Success CQEs suppressed by SKIP_SUCCESS flag.
+                }
+
                 OP_SHUTDOWN => {
                     debug!("engine: shutdown signal received");
                     return Ok(());
@@ -292,6 +309,12 @@ pub fn run(
                     warn!(op, "engine: unknown op in CQE");
                 }
             }
+        }
+
+        // Resubmit multishot recv if it was cancelled.
+        if !multishot_active {
+            submit_multishot_recv(&mut ring, &recv_pool)?;
+            multishot_active = true;
         }
 
         // Phase 2: Single process_events + I/O for ALL events in this batch.
@@ -457,19 +480,45 @@ fn update_timer(quic: &mut QuicState, timer: &Timer) {
     }
 }
 
-/// Submit a UDP recv using registered fd + registered buffer.
-fn submit_udp_recv(ring: &mut IoUring, pool: &mut BufferPool) -> Result<()> {
-    let idx = match pool.alloc() {
-        Some(i) => i,
-        None => {
-            debug!("engine: buffer pool exhausted, skipping UDP recv submit");
-            return Ok(());
-        }
-    };
-    let entry =
-        opcode::ReadFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), BUF_SIZE as u32, idx as u16)
-            .build()
-            .user_data(bufpool::encode_user_data(OP_UDP_RECV, idx));
+/// Provide all buffers in the recv pool to the kernel as a buffer group.
+fn provide_all_buffers(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result<()> {
+    let entry = opcode::ProvideBuffers::new(
+        recv_pool.ptr(0),
+        BUF_SIZE as i32,
+        recv_pool.size() as u16,
+        recv_pool.group_id(),
+        0, // starting bid
+    )
+    .build()
+    .user_data(bufpool::encode_user_data(OP_PROVIDE_BUF, 0));
+
+    push_sqe(ring, &entry)?;
+    Ok(())
+}
+
+/// Submit a single multishot recv SQE (replaces 32× ReadFixed).
+fn submit_multishot_recv(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result<()> {
+    let entry = opcode::RecvMulti::new(types::Fixed(FD_UDP), recv_pool.group_id())
+        .build()
+        .user_data(bufpool::encode_user_data(OP_UDP_RECV, 0));
+
+    push_sqe(ring, &entry)?;
+    Ok(())
+}
+
+/// Re-provide a single consumed buffer back to the kernel.
+/// Uses SKIP_SUCCESS to suppress the CQE on success.
+fn reprovide_buffer(ring: &mut IoUring, recv_pool: &ProvidedPool, bid: u16) -> Result<()> {
+    let entry = opcode::ProvideBuffers::new(
+        recv_pool.ptr(bid),
+        BUF_SIZE as i32,
+        1,
+        recv_pool.group_id(),
+        bid,
+    )
+    .build()
+    .flags(Flags::SKIP_SUCCESS)
+    .user_data(bufpool::encode_user_data(OP_PROVIDE_BUF, bid as usize));
 
     push_sqe(ring, &entry)?;
     Ok(())

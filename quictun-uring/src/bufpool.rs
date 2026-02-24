@@ -23,6 +23,10 @@ pub const OP_UDP_SEND: u64 = 3;
 pub const OP_TIMER: u64 = 4;
 pub const OP_WAKE: u64 = 5;
 pub const OP_SHUTDOWN: u64 = 6;
+pub const OP_PROVIDE_BUF: u64 = 7;
+
+/// Buffer group ID for multishot UDP recv.
+pub const BUF_GROUP_UDP: u16 = 0;
 
 const OP_SHIFT: u32 = 60;
 const INDEX_MASK: u64 = (1 << OP_SHIFT) - 1;
@@ -151,5 +155,68 @@ impl BufferPool {
         unsafe { ring.submitter().register_buffers(&iovecs) }
             .context("failed to register buffers with io_uring")?;
         Ok(())
+    }
+}
+
+/// Buffer pool for multishot recv (kernel-managed via provided buffer groups).
+///
+/// Unlike `BufferPool`, this has no free list — the kernel selects buffers
+/// from the provided group and returns the buffer ID in the CQE flags.
+/// After consuming a buffer, userspace re-provides it via `ProvideBuffers` SQE.
+///
+/// # Safety model
+///
+/// Same as `BufferPool`: `base_ptr` is derived from `&mut` access before pinning,
+/// Pin prevents moves, and buffers are only accessed after the kernel returns them
+/// in a CQE (no concurrent access).
+pub struct ProvidedPool {
+    /// Keeps the heap allocation alive and pinned.
+    _storage: Pin<Box<[u8]>>,
+    /// Raw pointer to the base of the allocation, derived from `&mut` access.
+    base_ptr: *mut u8,
+    size: usize,
+    group_id: u16,
+}
+
+// SAFETY: ProvidedPool is used single-threaded (one per engine thread).
+// Same justification as BufferPool.
+unsafe impl Send for ProvidedPool {}
+
+impl ProvidedPool {
+    pub fn new(pool_size: usize, group_id: u16) -> Self {
+        let size = pool_size.min(MAX_POOL_SIZE);
+        let mut storage = vec![0u8; BUF_SIZE * size].into_boxed_slice();
+        let base_ptr = storage.as_mut_ptr();
+        let storage = Pin::new(storage);
+        Self {
+            _storage: storage,
+            base_ptr,
+            size,
+            group_id,
+        }
+    }
+
+    /// Raw pointer to buffer `bid` for SQE construction.
+    pub fn ptr(&self, bid: u16) -> *mut u8 {
+        unsafe { self.base_ptr.add(bid as usize * BUF_SIZE) }
+    }
+
+    /// Read completed data at buffer `bid` with `len` bytes.
+    ///
+    /// # Safety invariant
+    /// Caller must ensure the buffer was returned by the kernel (CQE reaped)
+    /// and is not currently provided to the kernel.
+    pub fn slice(&self, bid: u16, len: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.base_ptr.add(bid as usize * BUF_SIZE), len) }
+    }
+
+    /// Number of buffers in the pool.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Buffer group ID for io_uring provided buffer operations.
+    pub fn group_id(&self) -> u16 {
+        self.group_id
     }
 }
