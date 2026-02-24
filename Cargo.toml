@@ -5,6 +5,7 @@ members = [
     "quictun-core",
     "quictun-tun",
     "quictun-uring",
+    "quictun-compio",
     "quictun-cli",
 ]
 
@@ -19,6 +20,7 @@ quictun-crypto = { path = "quictun-crypto" }
 quictun-core = { path = "quictun-core" }
 quictun-tun = { path = "quictun-tun" }
 quictun-uring = { path = "quictun-uring" }
+quictun-compio = { path = "quictun-compio" }
 
 # QUIC + TLS
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
@@ -59,3 +61,7 @@ tun-rs = { version = "2", features = ["async"] }
 # io_uring (Linux only)
 io-uring = "0.7"
 libc = "0.2"
+
+# compio (completion-based async I/O)
+compio = { version = "0.18", features = ["runtime", "io", "time", "fs", "net", "bytes"] }
+futures-util = "0.3"

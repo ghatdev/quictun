@@ -25,9 +25,14 @@ pub fn run(
     send_window: u64,
     queues: usize,
     iouring: bool,
+    compio: bool,
 ) -> Result<()> {
     if iouring {
         return run_iouring(config_path, newreno, recv_buf, send_buf, send_window);
+    }
+
+    if compio {
+        return run_compio(config_path, newreno, recv_buf, send_buf, send_window);
     }
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
@@ -152,6 +157,118 @@ fn run_iouring(
 
     // Run the two-thread io_uring event loop (no tokio).
     quictun_uring::event_loop::run(tun_fd, local_addr, setup)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_compio(
+    _config_path: &str,
+    _newreno: bool,
+    _recv_buf: usize,
+    _send_buf: usize,
+    _send_window: u64,
+) -> Result<()> {
+    bail!("--compio requires Linux");
+}
+
+#[cfg(target_os = "linux")]
+fn run_compio(
+    config_path: &str,
+    newreno: bool,
+    recv_buf: usize,
+    send_buf: usize,
+    send_window: u64,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use quictun_core::connection::TransportTuning;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
+    let role = config.role();
+    let addr = config.parse_address()?;
+
+    let private_key = PrivateKey::from_base64(&config.interface.private_key)
+        .context("invalid interface private_key")?;
+
+    let peer = &config.peer[0];
+    let peer_pubkey =
+        PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
+
+    let keepalive = peer.keepalive.map(Duration::from_secs);
+    let bbr = !newreno;
+
+    let tuning = TransportTuning {
+        datagram_recv_buffer: recv_buf,
+        datagram_send_buffer: send_buf,
+        send_window,
+        use_bbr: bbr,
+        ..Default::default()
+    };
+
+    tracing::info!(
+        role = ?role,
+        address = %addr,
+        mtu = config.mtu(),
+        peer_fingerprint = %peer_pubkey.fingerprint(),
+        bbr,
+        recv_buf,
+        send_buf,
+        send_window,
+        "starting quictun (compio)"
+    );
+
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
+    // Create sync TUN device.
+    let mut tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+    tun_opts.name = Some(iface_name.clone());
+    let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
+    let tun_fd = tun.as_raw_fd();
+
+    // Write PID file (guard removes it on exit/panic).
+    state::write_pid_file(&iface_name)?;
+    let _pid_guard = state::PidFileGuard::new(iface_name);
+
+    // Build quinn-proto configs.
+    let (client_config, server_config) = match role {
+        Role::Connector => {
+            let cc = quictun_compio::quic::build_proto_client_config(
+                &private_key, &peer_pubkey, keepalive, &tuning,
+            )?;
+            (Some(cc), None)
+        }
+        Role::Listener => {
+            let sc = quictun_compio::quic::build_proto_server_config(
+                &private_key, &[peer_pubkey], keepalive, &tuning,
+            )?;
+            (None, Some(sc))
+        }
+    };
+
+    let listen_port = config.interface.listen_port.unwrap_or(0);
+    let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
+
+    let setup = match role {
+        Role::Connector => {
+            let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+            quictun_compio::event_loop::EndpointSetup::Connector {
+                remote_addr,
+                client_config: client_config.context("connector requires client_config")?,
+            }
+        }
+        Role::Listener => quictun_compio::event_loop::EndpointSetup::Listener {
+            server_config: server_config.context("listener requires server_config")?,
+        },
+    };
+
+    // Run the single-threaded compio event loop (no tokio).
+    quictun_compio::event_loop::run(tun_fd, local_addr, setup)
 }
 
 async fn run_async(
