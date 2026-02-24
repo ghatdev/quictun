@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 
+use anyhow::{Context, Result};
+use io_uring::IoUring;
+
 /// Buffer size: must be > 1500 MTU to hold any TUN/UDP packet.
 pub const BUF_SIZE: usize = 2048;
 
@@ -82,5 +85,21 @@ impl BufferPool {
     /// Number of free buffers available.
     pub fn available(&self) -> usize {
         self.free.len()
+    }
+
+    /// Register all pool buffers with io_uring for zero-copy I/O.
+    ///
+    /// After registration, use `ReadFixed`/`WriteFixed` opcodes with
+    /// the buffer pool index as the `buf_index` parameter.
+    pub fn register(&self, ring: &IoUring) -> Result<()> {
+        let iovecs: Vec<libc::iovec> = (0..POOL_SIZE)
+            .map(|i| libc::iovec {
+                iov_base: self.ptr(i) as *mut libc::c_void,
+                iov_len: BUF_SIZE,
+            })
+            .collect();
+        unsafe { ring.submitter().register_buffers(&iovecs) }
+            .context("failed to register buffers with io_uring")?;
+        Ok(())
     }
 }

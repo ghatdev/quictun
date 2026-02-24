@@ -47,6 +47,12 @@ enum Command {
         /// Use io_uring data plane (Linux only)
         #[arg(long)]
         iouring: bool,
+        /// Enable SQPOLL for zero-submit syscalls (requires root, Linux only)
+        #[arg(long)]
+        sqpoll: bool,
+        /// Number of io_uring cores (each gets own TUN queue + QUIC connection)
+        #[arg(long, default_value = "1")]
+        iouring_cores: usize,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -70,8 +76,11 @@ fn main() -> anyhow::Result<()> {
             send_window,
             queues,
             iouring,
+            sqpoll,
+            iouring_cores,
         } => up::run(
-            &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring,
+            &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
+            iouring_cores,
         ),
         Command::Down { config } => down::run(&config),
     }

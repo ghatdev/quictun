@@ -16,6 +16,7 @@ use tokio::sync::watch;
 
 use crate::state;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config_path: &str,
     serial: bool,
@@ -25,9 +26,19 @@ pub fn run(
     send_window: u64,
     queues: usize,
     iouring: bool,
+    sqpoll: bool,
+    iouring_cores: usize,
 ) -> Result<()> {
     if iouring {
-        return run_iouring(config_path, newreno, recv_buf, send_buf, send_window);
+        return run_iouring(
+            config_path,
+            newreno,
+            recv_buf,
+            send_buf,
+            send_window,
+            sqpoll,
+            iouring_cores,
+        );
     }
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
@@ -49,6 +60,8 @@ fn run_iouring(
     _recv_buf: usize,
     _send_buf: usize,
     _send_window: u64,
+    _sqpoll: bool,
+    _iouring_cores: usize,
 ) -> Result<()> {
     bail!("--iouring requires Linux");
 }
@@ -60,6 +73,8 @@ fn run_iouring(
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
+    sqpoll: bool,
+    iouring_cores: usize,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
     use quictun_core::connection::TransportTuning;
@@ -93,6 +108,8 @@ fn run_iouring(
         ..Default::default()
     };
 
+    let cores = iouring_cores;
+
     tracing::info!(
         role = ?role,
         address = %addr,
@@ -102,17 +119,36 @@ fn run_iouring(
         recv_buf,
         send_buf,
         send_window,
+        sqpoll,
+        cores,
         "starting quictun (io_uring)"
     );
 
     // Resolve interface name from config.
     let iface_name = config.interface_name(Path::new(config_path));
 
-    // Create sync TUN device.
+    // Create sync TUN device(s).
+    // Multi-core requires multi-queue TUN (kernel distributes by flow hash).
     let mut tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
     tun_opts.name = Some(iface_name.clone());
-    let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
-    let tun_fd = tun.as_raw_fd();
+    tun_opts.multi_queue = cores > 1;
+
+    let tun_primary =
+        quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
+
+    // Build TUN fd list: primary + (N-1) clones for multi-queue.
+    let mut tun_devices = vec![tun_primary];
+    for i in 1..cores {
+        let clone = tun_devices[0]
+            .try_clone()
+            .with_context(|| format!("failed to clone TUN queue {i}"))?;
+        tun_devices.push(clone);
+    }
+    let tun_fds: Vec<RawFd> = tun_devices.iter().map(|d| d.as_raw_fd()).collect();
+
+    if cores > 1 {
+        tracing::info!(cores, "multi-queue TUN ready ({} queues)", tun_fds.len());
+    }
 
     // Write PID file (guard removes it on exit/panic).
     state::write_pid_file(&iface_name)?;
@@ -150,8 +186,9 @@ fn run_iouring(
         },
     };
 
-    // Run the two-thread io_uring event loop (no tokio).
-    quictun_uring::event_loop::run(tun_fd, local_addr, setup)
+    // Run the io_uring event loop (no tokio).
+    // tun_devices must outlive the event loop (they own the fds).
+    quictun_uring::event_loop::run(tun_fds, local_addr, setup, sqpoll)
 }
 
 async fn run_async(

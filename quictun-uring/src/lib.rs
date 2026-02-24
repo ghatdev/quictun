@@ -7,9 +7,9 @@ mod udp;
 #[cfg(target_os = "linux")]
 mod shared;
 #[cfg(target_os = "linux")]
-mod outbound;
+mod reader;
 #[cfg(target_os = "linux")]
-mod inbound;
+mod engine;
 #[cfg(target_os = "linux")]
 pub mod quic;
 #[cfg(target_os = "linux")]

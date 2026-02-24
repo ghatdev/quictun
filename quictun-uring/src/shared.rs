@@ -8,11 +8,10 @@ use tracing::{info, warn};
 
 use crate::bufpool::BUF_SIZE;
 
-/// Shared QUIC state protected by a Mutex.
+/// QUIC state owned exclusively by the engine thread.
 ///
-/// Both outbound and inbound threads lock this to interact with the
-/// quinn-proto state machine. All I/O happens after releasing the lock,
-/// using the returned `DriveResult`.
+/// The engine thread drives the quinn-proto state machine. All I/O is
+/// performed after `drive()` returns, using the returned `DriveResult`.
 pub struct QuicState {
     pub endpoint: Endpoint,
     pub connection: Option<quinn_proto::Connection>,
@@ -40,8 +39,8 @@ impl QuicState {
 
 /// Result of driving the QUIC connection state machine.
 ///
-/// Collected while holding the lock, consumed after releasing it.
-/// This minimizes lock hold time by deferring all I/O to the caller.
+/// Collected by the engine thread, consumed immediately after.
+/// Defers all I/O to the caller.
 pub struct DriveResult {
     /// UDP packets to send: (length, data buffer).
     pub transmits: Vec<(usize, [u8; BUF_SIZE])>,
@@ -57,8 +56,7 @@ pub struct DriveResult {
 
 /// Drive the QUIC connection: poll endpoint events, app events, drain transmits.
 ///
-/// Must be called while holding the QuicState lock. Returns a DriveResult
-/// containing all data needed for I/O operations after releasing the lock.
+/// Returns a DriveResult containing all data needed for I/O operations.
 pub fn drive(state: &mut QuicState) -> DriveResult {
     let mut result = DriveResult {
         transmits: Vec::new(),
@@ -124,9 +122,8 @@ pub fn drive(state: &mut QuicState) -> DriveResult {
 
 /// Handle a DatagramEvent from endpoint.handle().
 ///
-/// Must be called while holding the QuicState lock. Mutates endpoint/connection
-/// state and collects any response transmits into the returned DriveResult
-/// (via a subsequent `drive()` call by the caller).
+/// Mutates endpoint/connection state and collects any response transmits.
+/// Caller should follow with `drive()` to complete state machine processing.
 pub fn handle_datagram_event(
     state: &mut QuicState,
     event: DatagramEvent,

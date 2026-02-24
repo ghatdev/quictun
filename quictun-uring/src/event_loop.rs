@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -14,6 +14,11 @@ use crate::shared::{self, QuicState};
 use crate::timer::Timer;
 use crate::udp;
 
+/// Channel capacity for TUN packets from reader → engine.
+/// Provides backpressure: reader drops packets when full (same as
+/// tokio parallel behavior when send_datagram fails under congestion).
+const CHANNEL_CAPACITY: usize = 512;
+
 /// How the QUIC endpoint should be set up.
 pub enum EndpointSetup {
     Connector {
@@ -25,136 +30,213 @@ pub enum EndpointSetup {
     },
 }
 
-/// Run the direction-split io_uring data plane.
+/// Run the lock-free io_uring data plane.
 ///
-/// Spawns an outbound thread (TUN→QUIC→UDP) and an inbound thread (UDP→QUIC→TUN),
-/// each with its own io_uring ring. Shared QUIC state protected by a Mutex.
-pub fn run(tun_fd: RawFd, local_addr: SocketAddr, setup: EndpointSetup) -> Result<()> {
-    // 0. Set TUN fd to non-blocking for io_uring.
-    set_nonblocking(tun_fd).context("failed to set TUN fd non-blocking")?;
+/// When `cores` is 1, spawns one reader + engine pair (single connection).
+/// When `cores` > 1, spawns N pairs — each with its own TUN queue, UDP socket,
+/// QUIC connection, and io_uring rings. Listener uses ports listen_port through
+/// listen_port+N-1; connector connects to each.
+///
+/// When `sqpoll` is true, all rings use IORING_SETUP_SQPOLL (requires root).
+pub fn run(
+    tun_fds: Vec<RawFd>,
+    local_addr: SocketAddr,
+    setup: EndpointSetup,
+    sqpoll: bool,
+) -> Result<()> {
+    let cores = tun_fds.len();
 
-    // 1. Create UDP socket.
-    let (udp_fd, remote_addr, first_packet, first_packet_len) = match &setup {
-        EndpointSetup::Connector { remote_addr, .. } => {
-            let fd = udp::create_udp(local_addr, *remote_addr)
-                .context("failed to create connected UDP socket")?;
-            let bind = udp::local_addr(&fd)?;
-            info!(bind = %bind, remote = %remote_addr, "UDP socket ready (connector)");
-            (fd, *remote_addr, Vec::new(), 0)
-        }
-        EndpointSetup::Listener { .. } => {
-            let fd = udp::create_udp_unbound(local_addr)
-                .context("failed to create unbound UDP socket")?;
-            let bind = udp::local_addr(&fd)?;
-            info!(bind = %bind, "UDP socket bound, waiting for first packet (listener)");
-
-            // Temporarily set blocking for recvfrom.
-            set_blocking(fd.as_raw_fd()).context("failed to set UDP fd blocking")?;
-
-            let mut buf = vec![0u8; BUF_SIZE];
-            let (n, peer) =
-                udp::recvfrom_first(&fd, &mut buf).context("recvfrom_first failed")?;
-            info!(peer = %peer, bytes = n, "received first packet, connecting to peer");
-
-            // Connect to the learned peer address.
-            udp::connect_to_peer(&fd, peer).context("failed to connect to learned peer")?;
-
-            // Set back to non-blocking for io_uring.
-            set_nonblocking(fd.as_raw_fd()).context("failed to set UDP fd non-blocking")?;
-
-            (fd, peer, buf, n)
-        }
-    };
-
-    let udp_raw = udp_fd.as_raw_fd();
-
-    // 2. Build QuicState.
-    let server_config = match &setup {
-        EndpointSetup::Listener { server_config } => Some(server_config.clone()),
-        EndpointSetup::Connector { .. } => None,
-    };
-
-    let mut quic_state = QuicState::new(remote_addr, server_config);
-
-    // Connector: initiate connection.
-    if let EndpointSetup::Connector {
-        remote_addr,
-        client_config,
-    } = setup
-    {
-        let (handle, conn) = quic_state
-            .endpoint
-            .connect(Instant::now(), client_config, remote_addr, "quictun")
-            .map_err(|e| anyhow::anyhow!("connect failed: {e:?}"))?;
-        quic_state.ch = Some(handle);
-        quic_state.connection = Some(conn);
+    // Set all TUN fds to non-blocking for io_uring.
+    for &fd in &tun_fds {
+        set_nonblocking(fd).context("failed to set TUN fd non-blocking")?;
     }
 
-    // Listener: feed the first packet.
-    if first_packet_len > 0 {
-        let data = BytesMut::from(&first_packet[..first_packet_len]);
-        let mut response_buf: Vec<u8> = Vec::new();
-        let now = Instant::now();
+    // Build per-core state: (udp_fd, quic_state) for each core.
+    let mut core_state: Vec<(OwnedFd, QuicState)> = Vec::with_capacity(cores);
 
-        if let Some(event) = quic_state.endpoint.handle(
-            now,
+    match &setup {
+        EndpointSetup::Connector {
             remote_addr,
-            None,
-            None,
-            data,
-            &mut response_buf,
-        ) {
-            // Accept the connection. Response transmits are discarded (pre-thread).
-            // Pending handshake transmits remain in the Connection and will be
-            // drained by the outbound thread's initial drive() call.
-            shared::handle_datagram_event(&mut quic_state, event, &mut response_buf);
+            client_config,
+        } => {
+            // Connector: each core creates its own UDP socket + QUIC connection.
+            // Core i connects to remote_addr port + i.
+            for i in 0..cores {
+                let remote = if cores > 1 {
+                    SocketAddr::new(remote_addr.ip(), remote_addr.port() + i as u16)
+                } else {
+                    *remote_addr
+                };
+
+                let udp_fd = udp::create_udp(local_addr, remote)
+                    .with_context(|| format!("core {i}: failed to create UDP socket"))?;
+                let bind = udp::local_addr(&udp_fd)?;
+                info!(core = i, bind = %bind, remote = %remote, "UDP socket ready (connector)");
+
+                let mut quic = QuicState::new(remote, None);
+                let (handle, conn) = quic
+                    .endpoint
+                    .connect(Instant::now(), client_config.clone(), remote, "quictun")
+                    .map_err(|e| anyhow::anyhow!("core {i}: connect failed: {e:?}"))?;
+                quic.ch = Some(handle);
+                quic.connection = Some(conn);
+
+                core_state.push((udp_fd, quic));
+            }
+        }
+        EndpointSetup::Listener { server_config } => {
+            // Listener: each core binds to listen_port + i, waits for first packet.
+            for i in 0..cores {
+                let listen_addr = if cores > 1 {
+                    SocketAddr::new(local_addr.ip(), local_addr.port() + i as u16)
+                } else {
+                    local_addr
+                };
+
+                let udp_fd = udp::create_udp_unbound(listen_addr)
+                    .with_context(|| format!("core {i}: failed to create UDP socket"))?;
+                let bind = udp::local_addr(&udp_fd)?;
+                info!(core = i, bind = %bind, "UDP socket bound, waiting for first packet (listener)");
+
+                // Blocking recvfrom to learn peer address.
+                set_blocking(udp_fd.as_raw_fd())
+                    .with_context(|| format!("core {i}: failed to set blocking"))?;
+
+                let mut buf = vec![0u8; BUF_SIZE];
+                let (n, peer) = udp::recvfrom_first(&udp_fd, &mut buf)
+                    .with_context(|| format!("core {i}: recvfrom_first failed"))?;
+                info!(core = i, peer = %peer, bytes = n, "received first packet");
+
+                udp::connect_to_peer(&udp_fd, peer)
+                    .with_context(|| format!("core {i}: connect failed"))?;
+                set_nonblocking(udp_fd.as_raw_fd())
+                    .with_context(|| format!("core {i}: failed to set non-blocking"))?;
+
+                // Feed the first packet to the QUIC endpoint.
+                let mut quic = QuicState::new(peer, Some(server_config.clone()));
+                let data = BytesMut::from(&buf[..n]);
+                let mut response_buf: Vec<u8> = Vec::new();
+                if let Some(event) = quic.endpoint.handle(
+                    Instant::now(),
+                    peer,
+                    None,
+                    None,
+                    data,
+                    &mut response_buf,
+                ) {
+                    shared::handle_datagram_event(&mut quic, event, &mut response_buf);
+                }
+
+                core_state.push((udp_fd, quic));
+            }
         }
     }
 
-    let quic = Mutex::new(quic_state);
-
-    // 3. Create shared timer (inbound thread owns it, outbound can arm it).
-    let timer = Timer::new().context("failed to create timerfd")?;
-
-    // 4. Create shutdown eventfd.
-    let shutdown_fd = create_eventfd().context("failed to create shutdown eventfd")?;
-    let shutdown_raw = shutdown_fd.as_raw_fd();
-
-    // 5. Spawn threads.
+    // Create per-core resources and spawn threads.
     thread::scope(|s| {
-        let quic_ref = &quic;
-        let timer_ref = &timer;
+        let mut engine_handles = Vec::with_capacity(cores);
+        let mut reader_handles = Vec::with_capacity(cores);
+        let mut shutdown_fds: Vec<OwnedFd> = Vec::with_capacity(cores);
 
-        let outbound_handle = s.spawn(move || {
-            crate::outbound::run(tun_fd, udp_raw, quic_ref, timer_ref, shutdown_raw)
-        });
+        for (i, ((udp_fd, quic_state), &tun_fd)) in
+            core_state.into_iter().zip(tun_fds.iter()).enumerate()
+        {
+            let udp_raw = udp_fd.as_raw_fd();
 
-        let inbound_handle = s.spawn(move || {
-            crate::inbound::run(tun_fd, udp_raw, quic_ref, timer_ref, shutdown_raw)
-        });
+            let timer = Timer::new()
+                .with_context(|| format!("core {i}: failed to create timerfd"))?;
+            let shutdown_fd = create_eventfd()
+                .with_context(|| format!("core {i}: failed to create shutdown eventfd"))?;
+            let shutdown_raw = shutdown_fd.as_raw_fd();
+            let notify_fd = create_eventfd()
+                .with_context(|| format!("core {i}: failed to create notify eventfd"))?;
+            let notify_raw = notify_fd.as_raw_fd();
 
-        // Wait for inbound thread first (it owns connection lifecycle via timer/handle_timeout).
-        let inbound_result = inbound_handle.join();
+            let (tx, rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
 
-        // Signal outbound thread to stop via eventfd.
-        write_eventfd(&shutdown_fd);
+            let core_id = i;
+            let sqp = sqpoll;
 
-        let outbound_result = outbound_handle.join();
+            let reader_h = s.spawn(move || {
+                pin_to_core(core_id);
+                crate::reader::run(tun_fd, tx, notify_raw, shutdown_raw, sqp)
+            });
 
-        // Propagate errors.
-        match inbound_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e).context("inbound thread error"),
-            Err(_) => return Err(anyhow::anyhow!("inbound thread panicked")),
+            let engine_h = s.spawn(move || {
+                pin_to_core(core_id);
+                crate::engine::run(
+                    tun_fd, udp_raw, quic_state, timer, rx, notify_raw, shutdown_raw, sqp,
+                )
+            });
+
+            reader_handles.push(reader_h);
+            engine_handles.push(engine_h);
+            shutdown_fds.push(shutdown_fd);
         }
-        match outbound_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e).context("outbound thread error"),
-            Err(_) => return Err(anyhow::anyhow!("outbound thread panicked")),
+
+        // Wait for all engine threads (they own connection lifecycle).
+        let mut first_error: Option<anyhow::Error> = None;
+        for (i, handle) in engine_handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(e.context(format!("engine thread {i} error")));
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(anyhow::anyhow!("engine thread {i} panicked"));
+                    }
+                }
+            }
         }
 
-        Ok(())
+        // Signal all reader threads to stop.
+        for fd in &shutdown_fds {
+            write_eventfd(fd);
+        }
+
+        for (i, handle) in reader_handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(e.context(format!("reader thread {i} error")));
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(anyhow::anyhow!("reader thread {i} panicked"));
+                    }
+                }
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     })
+}
+
+/// Pin the calling thread to a specific CPU core.
+fn pin_to_core(core_id: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core_id, &mut set);
+        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if ret == 0 {
+            tracing::debug!(core = core_id, "pinned thread to core");
+        } else {
+            tracing::warn!(core = core_id, "failed to pin thread to core (non-fatal)");
+        }
+    }
 }
 
 /// Set a file descriptor to non-blocking mode.
@@ -183,7 +265,7 @@ fn set_blocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Create a non-blocking eventfd for shutdown signaling.
+/// Create a non-blocking eventfd.
 fn create_eventfd() -> Result<OwnedFd> {
     let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if raw < 0 {
