@@ -42,6 +42,7 @@ pub fn run(
     setup: EndpointSetup,
     sqpoll: bool,
     pool_size: usize,
+    zero_copy: bool,
 ) -> Result<()> {
     let cores = tun_fds.len();
 
@@ -151,11 +152,13 @@ pub fn run(
             });
 
             let ps = pool_size;
+            let zc = zero_copy;
             let sc = server_config.clone();
             let engine_h = s.spawn(move || {
                 pin_to_core(core_id);
                 crate::engine::run(
                     tun_fd, udp_raw, quic_state, sc, timer, rx, notify_raw, shutdown_raw, sqp, ps,
+                    zc,
                 )
             });
 

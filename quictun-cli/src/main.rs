@@ -56,6 +56,9 @@ enum Command {
         /// Buffer pool size per thread (max 1024, io_uring only)
         #[arg(long, default_value = "1024")]
         pool_size: usize,
+        /// Use SendZc for zero-copy UDP sends (kernel 6.0+, io_uring only)
+        #[arg(long)]
+        zero_copy: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -82,9 +85,10 @@ fn main() -> anyhow::Result<()> {
             sqpoll,
             iouring_cores,
             pool_size,
+            zero_copy,
         } => up::run(
             &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
-            iouring_cores, pool_size,
+            iouring_cores, pool_size, zero_copy,
         ),
         Command::Down { config } => down::run(&config),
     }

@@ -51,6 +51,7 @@ pub fn run(
     shutdown_fd: RawFd,
     sqpoll: bool,
     pool_size: usize,
+    zero_copy: bool,
 ) -> Result<()> {
     // Resolve QuicState: connector has it ready, listener must wait for first packet.
     let mut quic = if let Some(qs) = quic {
@@ -109,7 +110,7 @@ pub fn run(
         .register_files(&fds)
         .context("engine: failed to register files")?;
 
-    // Register send/TUN buffer pool for zero-copy I/O (SendZc/WriteFixed).
+    // Register send/TUN buffer pool (SendZc when --zero-copy, WriteFixed otherwise).
     pool.register(&ring)?;
 
     info!(sqpoll, "engine: io_uring initialized (registered fds + buffers)");
@@ -143,7 +144,7 @@ pub fn run(
         for dg in &drive_result.datagrams {
             submit_tun_write(&mut ring, &mut pool, dg)?;
         }
-        drain_transmits(&mut quic, &mut ring, &mut pool, &mut transmit_buf)?;
+        drain_transmits(&mut quic, &mut ring, &mut pool, &mut transmit_buf, zero_copy)?;
         update_timer(&mut quic, &timer);
     }
 
@@ -277,16 +278,23 @@ pub fn run(
                 }
 
                 OP_UDP_SEND => {
-                    let flags = cqe.flags();
-                    if cqueue::notif(flags) {
-                        // Notification: kernel is done with the buffer, safe to reuse.
-                        pool.free(idx);
+                    if zero_copy {
+                        // SendZc produces 2 CQEs: completion + notification.
+                        // Buffer can only be freed on the notification CQE.
+                        let flags = cqe.flags();
+                        if cqueue::notif(flags) {
+                            pool.free(idx);
+                        } else if result < 0 {
+                            let err = std::io::Error::from_raw_os_error(-result);
+                            debug!(error = %err, "engine: UDP send error");
+                        }
                     } else {
-                        // Completion: check result, but don't free buffer yet.
+                        // WriteFixed: single CQE, free immediately.
                         if result < 0 {
                             let err = std::io::Error::from_raw_os_error(-result);
                             debug!(error = %err, "engine: UDP send error");
                         }
+                        pool.free(idx);
                     }
                 }
 
@@ -343,7 +351,7 @@ pub fn run(
 
             // Send response transmits (handshake: version negotiation, etc.).
             for (len, data) in &resp_transmits {
-                submit_udp_send(&mut ring, &mut pool, &data[..*len])?;
+                submit_udp_send(&mut ring, &mut pool, &data[..*len], zero_copy)?;
             }
 
             // Drain quinn transmits directly to buffer pool → io_uring.
@@ -353,6 +361,7 @@ pub fn run(
                 &mut ring,
                 &mut pool,
                 &mut transmit_buf,
+                zero_copy,
             )?;
             stats_transmits += n as u64;
             if stalled {
@@ -397,8 +406,8 @@ const RESERVED_BUFS: usize = 64;
 
 /// Drain quinn-proto transmit queue directly into buffer pool + io_uring SQEs.
 ///
-/// Path: poll_transmit → transmit_buf (Vec) → pool slot → SendZc SQE.
-/// This is 1 copy (Vec → pool); SendZc avoids the kernel-side copy to socket buffer.
+/// Path: poll_transmit → transmit_buf (Vec) → pool slot → SendZc/WriteFixed SQE.
+/// SendZc (--zero-copy) avoids the kernel-side copy to socket buffer.
 ///
 /// Back-pressure: stops draining when pool is low (≤ RESERVED_BUFS free).
 /// Quinn-proto holds remaining transmits internally until the next iteration,
@@ -411,6 +420,7 @@ fn drain_transmits(
     ring: &mut IoUring,
     pool: &mut BufferPool,
     transmit_buf: &mut Vec<u8>,
+    zero_copy: bool,
 ) -> Result<(usize, bool)> {
     let conn = match quic.connection.as_mut() {
         Some(c) => c,
@@ -434,7 +444,7 @@ fn drain_transmits(
         match conn.poll_transmit(now, 1, transmit_buf) {
             Some(transmit) => {
                 let len = transmit.size;
-                submit_udp_send_direct(ring, pool, transmit_buf, len)?;
+                submit_udp_send_direct(ring, pool, transmit_buf, len, zero_copy)?;
                 count += 1;
             }
             None => break,
@@ -444,10 +454,10 @@ fn drain_transmits(
     Ok((count, stalled))
 }
 
-/// Submit a zero-copy UDP send by copying data into a pool slot, then using SendZc.
+/// Submit a UDP send by copying data into a pool slot.
 ///
-/// SendZc skips the kernel-side copy from registered buffer to socket buffer.
-/// Produces 2 CQEs: completion (check result) + notification (free buffer).
+/// When `zero_copy` is true, uses SendZc (skips kernel-side memcpy, 2 CQEs per send).
+/// When false, uses WriteFixed (kernel copies from registered buffer, 1 CQE per send).
 ///
 /// Called by `drain_transmits` which already checks pool availability
 /// via back-pressure (RESERVED_BUFS). Should not fail under normal operation.
@@ -456,6 +466,7 @@ fn submit_udp_send_direct(
     pool: &mut BufferPool,
     src: &[u8],
     len: usize,
+    zero_copy: bool,
 ) -> Result<()> {
     let idx = match pool.alloc() {
         Some(i) => i,
@@ -470,10 +481,16 @@ fn submit_udp_send_direct(
     let len = len.min(BUF_SIZE);
     dst[..len].copy_from_slice(&src[..len]);
 
-    let entry = opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
-        .buf_index(Some(idx as u16))
-        .build()
-        .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
+    let entry = if zero_copy {
+        opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
+            .buf_index(Some(idx as u16))
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
+    } else {
+        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
+    };
 
     push_sqe(ring, &entry)?;
     Ok(())
@@ -533,10 +550,15 @@ fn reprovide_buffer(ring: &mut IoUring, recv_pool: &ProvidedPool, bid: u16) -> R
     Ok(())
 }
 
-/// Submit a zero-copy UDP send using registered fd + registered buffer.
+/// Submit a UDP send using registered fd + registered buffer.
 ///
-/// SendZc produces 2 CQEs: completion (check result) + notification (free buffer).
-fn submit_udp_send(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> Result<()> {
+/// When `zero_copy` is true, uses SendZc (2 CQEs). Otherwise uses WriteFixed (1 CQE).
+fn submit_udp_send(
+    ring: &mut IoUring,
+    pool: &mut BufferPool,
+    data: &[u8],
+    zero_copy: bool,
+) -> Result<()> {
     let idx = match pool.alloc() {
         Some(i) => i,
         None => {
@@ -547,10 +569,16 @@ fn submit_udp_send(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> Re
     let len = data.len().min(BUF_SIZE);
     pool.slice_mut(idx)[..len].copy_from_slice(&data[..len]);
 
-    let entry = opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
-        .buf_index(Some(idx as u16))
-        .build()
-        .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx));
+    let entry = if zero_copy {
+        opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
+            .buf_index(Some(idx as u16))
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
+    } else {
+        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
+    };
 
     push_sqe(ring, &entry)?;
     Ok(())
