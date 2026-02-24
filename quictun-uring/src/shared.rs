@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::bufpool::BUF_SIZE;
 

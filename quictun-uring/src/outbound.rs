@@ -6,7 +6,9 @@ use bytes::Bytes;
 use io_uring::{IoUring, opcode, types};
 use tracing::{debug, info, warn};
 
-use crate::bufpool::{self, BUF_SIZE, BufferPool, OP_SHUTDOWN, OP_TUN_READ, OP_UDP_SEND};
+use crate::bufpool::{
+    self, BUF_SIZE, BufferPool, OP_SHUTDOWN, OP_TUN_READ, OP_TUN_WRITE, OP_UDP_SEND,
+};
 use crate::shared::{self, QuicState};
 use crate::timer::Timer;
 
@@ -18,7 +20,8 @@ const RING_SIZE: u32 = 128;
 
 /// Run the outbound thread: TUN Read → QUIC encrypt → UDP Write.
 ///
-/// Owns its own io_uring ring and buffer pool. Shares QuicState via Mutex.
+/// Also handles datagrams received from drive() (inbound data that
+/// got dequeued while holding the lock) by writing them to TUN.
 pub fn run(
     tun_fd: RawFd,
     udp_fd: RawFd,
@@ -44,11 +47,17 @@ pub fn run(
         if state.connection.is_some() {
             let result = shared::drive(&mut state);
             drop(state);
-            do_io(&mut ring, &mut pool, udp_fd, timer, &result)?;
+            do_io(&mut ring, &mut pool, tun_fd, udp_fd, timer, &result)?;
         }
     }
 
     info!("outbound: entering io_uring event loop");
+    let mut stats_tun_reads: u64 = 0;
+    let mut stats_sends_ok: u64 = 0;
+    let mut stats_sends_fail: u64 = 0;
+    let mut stats_transmits: u64 = 0;
+    let mut stats_last = std::time::Instant::now();
+
     loop {
         ring.submit_and_wait(1)
             .context("outbound: submit_and_wait failed")?;
@@ -70,6 +79,7 @@ pub fn run(
                         submit_tun_read(&mut ring, &mut pool, tun_fd)?;
                         continue;
                     }
+                    stats_tun_reads += 1;
                     let len = result as usize;
                     let packet = Bytes::copy_from_slice(pool.slice(idx, len));
                     pool.free(idx);
@@ -84,12 +94,15 @@ pub fn run(
                                     packet_size = packet.len(),
                                     max, "outbound: dropping oversized TUN packet"
                                 );
-                            } else if let Err(e) = conn.datagrams().send(packet, true) {
-                                debug!(error = ?e, "outbound: datagrams.send failed");
+                            } else if conn.datagrams().send(packet, true).is_err() {
+                                stats_sends_fail += 1;
+                            } else {
+                                stats_sends_ok += 1;
                             }
                         }
                         shared::drive(&mut state)
                     };
+                    stats_transmits += drive_result.transmits.len() as u64;
 
                     // Resubmit TUN read.
                     submit_tun_read(&mut ring, &mut pool, tun_fd)?;
@@ -100,13 +113,21 @@ pub fn run(
                         signal_shutdown(shutdown_fd);
                         return Ok(());
                     }
-                    do_io(&mut ring, &mut pool, udp_fd, timer, &drive_result)?;
+                    do_io(&mut ring, &mut pool, tun_fd, udp_fd, timer, &drive_result)?;
                 }
 
                 OP_UDP_SEND => {
                     if result < 0 {
                         let err = std::io::Error::from_raw_os_error(-result);
                         debug!(error = %err, "outbound: UDP send error");
+                    }
+                    pool.free(idx);
+                }
+
+                OP_TUN_WRITE => {
+                    if result < 0 {
+                        let err = std::io::Error::from_raw_os_error(-result);
+                        warn!(error = %err, "outbound: TUN write error");
                     }
                     pool.free(idx);
                 }
@@ -122,6 +143,22 @@ pub fn run(
             }
         }
 
+        if stats_last.elapsed() >= std::time::Duration::from_secs(2) {
+            info!(
+                tun_reads = stats_tun_reads,
+                sends_ok = stats_sends_ok,
+                sends_fail = stats_sends_fail,
+                transmits = stats_transmits,
+                free_bufs = pool.available(),
+                "outbound: stats"
+            );
+            stats_tun_reads = 0;
+            stats_sends_ok = 0;
+            stats_sends_fail = 0;
+            stats_transmits = 0;
+            stats_last = std::time::Instant::now();
+        }
+
         ring.submit().context("outbound: submit flush failed")?;
     }
 }
@@ -130,10 +167,16 @@ pub fn run(
 fn do_io(
     ring: &mut IoUring,
     pool: &mut BufferPool,
+    tun_fd: RawFd,
     udp_fd: RawFd,
     timer: &Timer,
     result: &shared::DriveResult,
 ) -> Result<()> {
+    // Write any received datagrams to TUN (drive() may dequeue them from either thread).
+    for datagram in &result.datagrams {
+        submit_tun_write(ring, pool, tun_fd, datagram)?;
+    }
+
     // Send UDP packets.
     for (len, data) in &result.transmits {
         submit_udp_send(ring, pool, udp_fd, &data[..*len])?;
@@ -162,6 +205,32 @@ fn submit_tun_read(ring: &mut IoUring, pool: &mut BufferPool, tun_fd: RawFd) -> 
 
     unsafe { ring.submission().push(&entry) }
         .map_err(|_| anyhow::anyhow!("outbound: SQ full (tun read)"))?;
+    Ok(())
+}
+
+fn submit_tun_write(
+    ring: &mut IoUring,
+    pool: &mut BufferPool,
+    tun_fd: RawFd,
+    data: &[u8],
+) -> Result<()> {
+    let idx = match pool.alloc() {
+        Some(i) => i,
+        None => {
+            warn!("outbound: buffer pool exhausted, dropping TUN write");
+            return Ok(());
+        }
+    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(pool.ptr(idx), BUF_SIZE) };
+    let len = data.len().min(BUF_SIZE);
+    dst[..len].copy_from_slice(&data[..len]);
+
+    let entry = opcode::Write::new(types::Fd(tun_fd), pool.ptr(idx), len as u32)
+        .build()
+        .user_data(bufpool::encode_user_data(OP_TUN_WRITE, idx));
+
+    unsafe { ring.submission().push(&entry) }
+        .map_err(|_| anyhow::anyhow!("outbound: SQ full (tun write)"))?;
     Ok(())
 }
 

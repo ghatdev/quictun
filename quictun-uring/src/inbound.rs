@@ -50,8 +50,8 @@ pub fn run(
 
     // Arm timer from initial connection state (connector may have a pending timeout).
     {
-        let state = quic.lock().expect("quic mutex poisoned");
-        if let Some(conn) = &state.connection {
+        let mut state = quic.lock().expect("quic mutex poisoned");
+        if let Some(conn) = state.connection.as_mut() {
             if let Some(deadline) = conn.poll_timeout() {
                 timer.arm(deadline);
             }
@@ -59,6 +59,12 @@ pub fn run(
     }
 
     info!("inbound: entering io_uring event loop");
+    let mut stats_udp_recvs: u64 = 0;
+    let mut stats_datagrams: u64 = 0;
+    let mut stats_transmits: u64 = 0;
+    let mut stats_timers: u64 = 0;
+    let mut stats_last = std::time::Instant::now();
+
     loop {
         ring.submit_and_wait(1)
             .context("inbound: submit_and_wait failed")?;
@@ -80,6 +86,7 @@ pub fn run(
                         submit_udp_recv(&mut ring, &mut pool, udp_fd)?;
                         continue;
                     }
+                    stats_udp_recvs += 1;
                     let len = result as usize;
                     let data = BytesMut::from(pool.slice(idx, len));
                     pool.free(idx);
@@ -88,11 +95,12 @@ pub fn run(
                     let (drive_result, response_transmits) = {
                         let mut state = quic.lock().expect("quic mutex poisoned");
                         let now = Instant::now();
+                        let remote_addr = state.remote_addr;
 
                         let mut resp_tx = Vec::new();
                         if let Some(event) = state.endpoint.handle(
                             now,
-                            state.remote_addr,
+                            remote_addr,
                             None,
                             None,
                             data,
@@ -106,6 +114,8 @@ pub fn run(
                         let dr = shared::drive(&mut state);
                         (dr, resp_tx)
                     };
+                    stats_datagrams += drive_result.datagrams.len() as u64;
+                    stats_transmits += drive_result.transmits.len() as u64;
 
                     // Resubmit UDP recv.
                     submit_udp_recv(&mut ring, &mut pool, udp_fd)?;
@@ -128,6 +138,7 @@ pub fn run(
                 }
 
                 OP_TIMER => {
+                    stats_timers += 1;
                     // Lock, handle timeout, drive, unlock.
                     let drive_result = {
                         let mut state = quic.lock().expect("quic mutex poisoned");
@@ -137,6 +148,7 @@ pub fn run(
                         }
                         shared::drive(&mut state)
                     };
+                    stats_transmits += drive_result.transmits.len() as u64;
 
                     // Resubmit timer read.
                     submit_timer_read(&mut ring, timer_fd, &mut timer_buf)?;
@@ -183,6 +195,22 @@ pub fn run(
                     warn!(op, "inbound: unknown op in CQE");
                 }
             }
+        }
+
+        if stats_last.elapsed() >= std::time::Duration::from_secs(2) {
+            info!(
+                udp_recvs = stats_udp_recvs,
+                datagrams = stats_datagrams,
+                transmits = stats_transmits,
+                timers = stats_timers,
+                free_bufs = pool.available(),
+                "inbound: stats"
+            );
+            stats_udp_recvs = 0;
+            stats_datagrams = 0;
+            stats_transmits = 0;
+            stats_timers = 0;
+            stats_last = std::time::Instant::now();
         }
 
         ring.submit().context("inbound: submit flush failed")?;
