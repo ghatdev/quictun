@@ -47,9 +47,12 @@ enum Command {
         /// Use io_uring data plane (Linux only)
         #[arg(long)]
         iouring: bool,
-        /// Enable SQPOLL for zero-submit syscalls (requires root, Linux only)
+        /// Enable SQPOLL for kernel-side SQ polling (kernel 5.13+ supports unprivileged)
         #[arg(long)]
         sqpoll: bool,
+        /// Starting CPU for SQPOLL kernel threads (core i → CPU sqpoll_cpu+i; default: iouring_cores)
+        #[arg(long)]
+        sqpoll_cpu: Option<u32>,
         /// Number of io_uring cores (each gets own TUN queue + QUIC connection)
         #[arg(long, default_value = "1")]
         iouring_cores: usize,
@@ -83,12 +86,13 @@ fn main() -> anyhow::Result<()> {
             queues,
             iouring,
             sqpoll,
+            sqpoll_cpu,
             iouring_cores,
             pool_size,
             zero_copy,
         } => up::run(
             &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
-            iouring_cores, pool_size, zero_copy,
+            sqpoll_cpu, iouring_cores, pool_size, zero_copy,
         ),
         Command::Down { config } => down::run(&config),
     }

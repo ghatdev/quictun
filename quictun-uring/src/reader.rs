@@ -1,7 +1,7 @@
 use std::os::fd::RawFd;
 
 use anyhow::{Context, Result};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use io_uring::{IoUring, opcode, types};
 use tracing::{debug, info, warn};
 
@@ -29,11 +29,18 @@ pub fn run(
     shutdown_fd: RawFd,
     sqpoll: bool,
     pool_size: usize,
+    ring_fd_rx: Option<Receiver<RawFd>>,
 ) -> Result<()> {
     let mut ring = if sqpoll {
-        IoUring::builder()
-            .setup_sqpoll(1000)
-            .build(RING_SIZE)
+        let mut builder = IoUring::builder();
+        builder.setup_sqpoll(1000);
+        if let Some(rx) = ring_fd_rx {
+            let engine_ring_fd = rx.recv().map_err(|_| {
+                anyhow::anyhow!("reader: engine failed before sending ring fd for attach_wq")
+            })?;
+            builder.setup_attach_wq(engine_ring_fd);
+        }
+        builder.build(RING_SIZE)
             .context("reader: failed to create io_uring with SQPOLL")?
     } else {
         IoUring::new(RING_SIZE).context("reader: failed to create io_uring")?

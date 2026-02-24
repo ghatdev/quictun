@@ -1,10 +1,10 @@
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use io_uring::{IoUring, cqueue, opcode, squeue::Flags, types};
 use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
@@ -50,8 +50,10 @@ pub fn run(
     notify_fd: RawFd,
     shutdown_fd: RawFd,
     sqpoll: bool,
+    sqpoll_cpu: Option<u32>,
     pool_size: usize,
     zero_copy: bool,
+    ring_fd_tx: Option<Sender<RawFd>>,
 ) -> Result<()> {
     // Resolve QuicState: connector has it ready, listener must wait for first packet.
     let mut quic = if let Some(qs) = quic {
@@ -86,13 +88,21 @@ pub fn run(
     };
 
     let mut ring = if sqpoll {
-        IoUring::builder()
-            .setup_sqpoll(1000)
-            .build(RING_SIZE)
+        let mut builder = IoUring::builder();
+        builder.setup_sqpoll(1000);
+        if let Some(cpu) = sqpoll_cpu {
+            builder.setup_sqpoll_cpu(cpu);
+        }
+        builder.build(RING_SIZE)
             .context("engine: failed to create io_uring with SQPOLL")?
     } else {
         IoUring::new(RING_SIZE).context("engine: failed to create io_uring")?
     };
+
+    // Signal ring fd to reader so it can attach_wq to our SQPOLL thread.
+    if let Some(tx) = ring_fd_tx {
+        let _ = tx.send(ring.as_raw_fd());
+    }
 
     // Registered buffer pool for sends + TUN writes (WriteFixed).
     let mut pool = BufferPool::new(pool_size);

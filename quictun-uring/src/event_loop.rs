@@ -46,10 +46,19 @@ pub fn run(
     local_addr: SocketAddr,
     setup: EndpointSetup,
     sqpoll: bool,
+    sqpoll_cpu: Option<u32>,
     pool_size: usize,
     zero_copy: bool,
 ) -> Result<()> {
     let cores = tun_fds.len();
+
+    // Compute SQPOLL CPU base: each core i gets SQPOLL thread on CPU (base + i).
+    // Default: cores N..2N-1 (user threads on 0..N-1, SQPOLL on N..2N-1).
+    let sqpoll_cpu_base: Option<u32> = if sqpoll {
+        Some(sqpoll_cpu.unwrap_or(cores as u32))
+    } else {
+        None
+    };
 
     // Set all TUN fds to non-blocking for io_uring.
     for &fd in &tun_fds {
@@ -153,13 +162,22 @@ pub fn run(
 
             let (tx, rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
 
+            // Per-core channel for engine → reader ring fd handoff (SQPOLL attach_wq).
+            let (ring_fd_tx, ring_fd_rx) = if sqpoll {
+                let (ftx, frx) = crossbeam_channel::bounded::<RawFd>(1);
+                (Some(ftx), Some(frx))
+            } else {
+                (None, None)
+            };
+
             let core_id = i;
             let sqp = sqpoll;
+            let sqp_cpu = sqpoll_cpu_base.map(|b| b + i as u32);
 
             let ps = pool_size;
             let reader_h = s.spawn(move || {
                 pin_to_core(core_id);
-                crate::reader::run(tun_fd, tx, notify_raw, shutdown_raw, sqp, ps)
+                crate::reader::run(tun_fd, tx, notify_raw, shutdown_raw, sqp, ps, ring_fd_rx)
             });
 
             let ps = pool_size;
@@ -168,8 +186,8 @@ pub fn run(
             let engine_h = s.spawn(move || {
                 pin_to_core(core_id);
                 crate::engine::run(
-                    tun_fd, udp_raw, quic_state, sc, timer, rx, notify_raw, shutdown_raw, sqp, ps,
-                    zc,
+                    tun_fd, udp_raw, quic_state, sc, timer, rx, notify_raw, shutdown_raw, sqp,
+                    sqp_cpu, ps, zc, ring_fd_tx,
                 )
             });
 

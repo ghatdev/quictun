@@ -27,6 +27,7 @@ pub fn run(
     queues: usize,
     iouring: bool,
     sqpoll: bool,
+    sqpoll_cpu: Option<u32>,
     iouring_cores: usize,
     pool_size: usize,
     zero_copy: bool,
@@ -39,6 +40,7 @@ pub fn run(
             send_buf,
             send_window,
             sqpoll,
+            sqpoll_cpu,
             iouring_cores,
             pool_size,
             zero_copy,
@@ -58,6 +60,7 @@ pub fn run(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn run_iouring(
     _config_path: &str,
     _newreno: bool,
@@ -65,6 +68,7 @@ fn run_iouring(
     _send_buf: usize,
     _send_window: u64,
     _sqpoll: bool,
+    _sqpoll_cpu: Option<u32>,
     _iouring_cores: usize,
     _pool_size: usize,
     _zero_copy: bool,
@@ -80,6 +84,7 @@ fn run_iouring(
     send_buf: usize,
     send_window: u64,
     sqpoll: bool,
+    sqpoll_cpu: Option<u32>,
     iouring_cores: usize,
     pool_size: usize,
     zero_copy: bool,
@@ -197,7 +202,7 @@ fn run_iouring(
 
     // Run the io_uring event loop (no tokio).
     // tun_devices must outlive the event loop (they own the fds).
-    quictun_uring::event_loop::run(tun_fds, local_addr, setup, sqpoll, pool_size, zero_copy)
+    quictun_uring::event_loop::run(tun_fds, local_addr, setup, sqpoll, sqpoll_cpu, pool_size, zero_copy)
 }
 
 async fn run_async(
