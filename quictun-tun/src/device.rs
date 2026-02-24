@@ -141,3 +141,33 @@ impl TunDevice {
         &self.name
     }
 }
+
+/// Create a synchronous TUN device (Linux only, for io_uring data plane).
+///
+/// Returns the `SyncDevice` which implements `AsRawFd` for use with io_uring.
+#[cfg(target_os = "linux")]
+pub fn create_sync(opts: &TunOptions) -> Result<tun_rs::SyncDevice, TunError> {
+    let mut builder = tun_rs::DeviceBuilder::new();
+
+    if let Some(ref n) = opts.name {
+        builder = builder.name(n);
+    }
+
+    let device = builder
+        .ipv4(opts.address, opts.prefix_len, None)
+        .mtu(opts.mtu)
+        .build_sync()?;
+
+    let actual_name = device
+        .name()
+        .unwrap_or_else(|_| opts.name.as_deref().unwrap_or("tun?").to_string());
+    tracing::info!(
+        name = %actual_name,
+        address = %opts.address,
+        prefix_len = opts.prefix_len,
+        mtu = opts.mtu,
+        "sync TUN device created (io_uring)"
+    );
+
+    Ok(device)
+}

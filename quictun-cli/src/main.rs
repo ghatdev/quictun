@@ -42,6 +42,9 @@ enum Command {
         /// Number of TUN queues (Linux multi-queue; requires --queues > 1)
         #[arg(long, default_value = "1")]
         queues: usize,
+        /// Use io_uring data plane (Linux only)
+        #[arg(long)]
+        iouring: bool,
     },
 }
 
@@ -59,6 +62,9 @@ fn main() -> anyhow::Result<()> {
             send_buf,
             send_window,
             queues,
-        } => up::run(&config, serial, newreno, recv_buf, send_buf, send_window, queues),
+            iouring,
+        } => up::run(
+            &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring,
+        ),
     }
 }

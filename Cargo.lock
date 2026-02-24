@@ -521,6 +521,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd7bddefd0a8833b88a4b68f90dae22c7450d11b354198baee3874fd811b344"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,6 +583,16 @@ checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -627,6 +648,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -854,9 +884,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "mimalloc",
  "quictun-core",
  "quictun-crypto",
  "quictun-tun",
+ "quictun-uring",
  "quinn",
  "tokio",
  "tracing",
@@ -903,6 +935,21 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tun-rs",
+]
+
+[[package]]
+name = "quictun-uring"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "io-uring",
+ "libc",
+ "quictun-core",
+ "quictun-crypto",
+ "quinn-proto",
+ "rustls",
+ "tracing",
 ]
 
 [[package]]

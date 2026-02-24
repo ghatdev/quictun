@@ -4,6 +4,7 @@ members = [
     "quictun-crypto",
     "quictun-core",
     "quictun-tun",
+    "quictun-uring",
     "quictun-cli",
 ]
 
@@ -17,9 +18,11 @@ license = "Apache-2.0"
 quictun-crypto = { path = "quictun-crypto" }
 quictun-core = { path = "quictun-core" }
 quictun-tun = { path = "quictun-tun" }
+quictun-uring = { path = "quictun-uring" }
 
 # QUIC + TLS
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs"] }
 rustls = { version = "0.23.20", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
 aws-lc-rs = "1"
 
@@ -52,3 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # TUN device
 tun-rs = { version = "2", features = ["async"] }
+
+# io_uring (Linux only)
+io-uring = "0.7"
+libc = "0.2"

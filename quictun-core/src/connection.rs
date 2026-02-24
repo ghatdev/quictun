@@ -6,13 +6,13 @@ use quictun_crypto::{PinnedRpkClientVerifier, PinnedRpkServerVerifier, PrivateKe
 
 use crate::ALPN_QUICTUN_V1;
 
-/// Build a quinn `ServerConfig` with RPK authentication pinned to the given peer keys.
-pub fn build_server_config(
+/// Build a rustls `ServerConfig` with RPK authentication pinned to the given peer keys.
+///
+/// Shared by both the quinn (async) and quinn-proto (io_uring) code paths.
+pub fn build_rustls_server_tls_config(
     private_key: &PrivateKey,
     allowed_peers: &[PublicKey],
-    keepalive: Option<Duration>,
-    tuning: &TransportTuning,
-) -> Result<quinn::ServerConfig> {
+) -> Result<Arc<rustls::ServerConfig>> {
     let certified_key = private_key
         .to_certified_key()
         .context("failed to build server certified key")?;
@@ -30,22 +30,16 @@ pub fn build_server_config(
 
     tls_config.alpn_protocols = vec![ALPN_QUICTUN_V1.to_vec()];
 
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls_config))
-        .context("failed to create QUIC server crypto config")?;
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    server_config.transport_config(Arc::new(make_transport_config(keepalive, tuning)));
-
-    Ok(server_config)
+    Ok(Arc::new(tls_config))
 }
 
-/// Build a quinn `ClientConfig` with RPK authentication pinned to the given server key.
-pub fn build_client_config(
+/// Build a rustls `ClientConfig` with RPK authentication pinned to the given server key.
+///
+/// Shared by both the quinn (async) and quinn-proto (io_uring) code paths.
+pub fn build_rustls_client_tls_config(
     private_key: &PrivateKey,
     server_pubkey: &PublicKey,
-    keepalive: Option<Duration>,
-    tuning: &TransportTuning,
-) -> Result<quinn::ClientConfig> {
+) -> Result<Arc<rustls::ClientConfig>> {
     let certified_key = private_key
         .to_certified_key()
         .context("failed to build client certified key")?;
@@ -64,7 +58,37 @@ pub fn build_client_config(
 
     tls_config.alpn_protocols = vec![ALPN_QUICTUN_V1.to_vec()];
 
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_config))
+    Ok(Arc::new(tls_config))
+}
+
+/// Build a quinn `ServerConfig` with RPK authentication pinned to the given peer keys.
+pub fn build_server_config(
+    private_key: &PrivateKey,
+    allowed_peers: &[PublicKey],
+    keepalive: Option<Duration>,
+    tuning: &TransportTuning,
+) -> Result<quinn::ServerConfig> {
+    let tls_config = build_rustls_server_tls_config(private_key, allowed_peers)?;
+
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+        .context("failed to create QUIC server crypto config")?;
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(Arc::new(make_transport_config(keepalive, tuning)));
+
+    Ok(server_config)
+}
+
+/// Build a quinn `ClientConfig` with RPK authentication pinned to the given server key.
+pub fn build_client_config(
+    private_key: &PrivateKey,
+    server_pubkey: &PublicKey,
+    keepalive: Option<Duration>,
+    tuning: &TransportTuning,
+) -> Result<quinn::ClientConfig> {
+    let tls_config = build_rustls_client_tls_config(private_key, server_pubkey)?;
+
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
         .context("failed to create QUIC client crypto config")?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
