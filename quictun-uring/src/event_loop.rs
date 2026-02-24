@@ -136,12 +136,17 @@ pub fn run(
     thread::scope(|s| {
         let mut engine_handles = Vec::with_capacity(cores);
         let mut reader_handles = Vec::with_capacity(cores);
+        // Keep OwnedFds alive for the duration of all threads.
+        // Threads use raw fd values; the OwnedFds here own the lifecycle.
         let mut shutdown_fds: Vec<OwnedFd> = Vec::with_capacity(cores);
+        let mut udp_fds: Vec<OwnedFd> = Vec::with_capacity(cores);
+        let mut notify_fds: Vec<OwnedFd> = Vec::with_capacity(cores);
 
         for (i, ((udp_fd, quic_state), &tun_fd)) in
             core_state.into_iter().zip(tun_fds.iter()).enumerate()
         {
             let udp_raw = udp_fd.as_raw_fd();
+            udp_fds.push(udp_fd);
 
             let timer = Timer::new()
                 .with_context(|| format!("core {i}: failed to create timerfd"))?;
@@ -151,6 +156,9 @@ pub fn run(
             let notify_fd = create_eventfd()
                 .with_context(|| format!("core {i}: failed to create notify eventfd"))?;
             let notify_raw = notify_fd.as_raw_fd();
+
+            shutdown_fds.push(shutdown_fd);
+            notify_fds.push(notify_fd);
 
             let (tx, rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
 
@@ -171,7 +179,6 @@ pub fn run(
 
             reader_handles.push(reader_h);
             engine_handles.push(engine_h);
-            shutdown_fds.push(shutdown_fd);
         }
 
         // Wait for all engine threads (they own connection lifecycle).

@@ -76,7 +76,7 @@ fn run_iouring(
     sqpoll: bool,
     iouring_cores: usize,
 ) -> Result<()> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use quictun_core::connection::TransportTuning;
 
     tracing_subscriber::fmt()
