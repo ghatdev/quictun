@@ -28,6 +28,7 @@ pub fn run(
     iouring: bool,
     sqpoll: bool,
     iouring_cores: usize,
+    pool_size: usize,
 ) -> Result<()> {
     if iouring {
         return run_iouring(
@@ -38,6 +39,7 @@ pub fn run(
             send_window,
             sqpoll,
             iouring_cores,
+            pool_size,
         );
     }
 
@@ -62,6 +64,7 @@ fn run_iouring(
     _send_window: u64,
     _sqpoll: bool,
     _iouring_cores: usize,
+    _pool_size: usize,
 ) -> Result<()> {
     bail!("--iouring requires Linux");
 }
@@ -75,6 +78,7 @@ fn run_iouring(
     send_window: u64,
     sqpoll: bool,
     iouring_cores: usize,
+    pool_size: usize,
 ) -> Result<()> {
     use std::os::fd::{AsRawFd, RawFd};
     use quictun_core::connection::TransportTuning;
@@ -188,7 +192,7 @@ fn run_iouring(
 
     // Run the io_uring event loop (no tokio).
     // tun_devices must outlive the event loop (they own the fds).
-    quictun_uring::event_loop::run(tun_fds, local_addr, setup, sqpoll)
+    quictun_uring::event_loop::run(tun_fds, local_addr, setup, sqpoll, pool_size)
 }
 
 async fn run_async(

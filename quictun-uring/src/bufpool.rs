@@ -7,10 +7,13 @@ use io_uring::IoUring;
 /// Buffer size: must be > 1500 MTU to hold any TUN/UDP packet.
 pub const BUF_SIZE: usize = 2048;
 
-/// Number of buffers in the pool.
+/// Default number of buffers in the pool.
 /// Must be ≤ 1024 (kernel UIO_MAXIOV limit for register_buffers).
 /// 1024 × 2048 = 2 MB per pool (each reader/engine thread has its own pool).
-const POOL_SIZE: usize = 1024;
+pub const DEFAULT_POOL_SIZE: usize = 1024;
+
+/// Maximum pool size (kernel UIO_MAXIOV limit for register_buffers).
+pub const MAX_POOL_SIZE: usize = 1024;
 
 // Operation type tags packed into the upper 4 bits of user_data.
 pub const OP_TUN_READ: u64 = 0;
@@ -49,14 +52,16 @@ pub fn decode_index(user_data: u64) -> usize {
 pub struct BufferPool {
     storage: Pin<Box<[u8]>>,
     free: VecDeque<usize>,
+    size: usize,
 }
 
 impl BufferPool {
-    pub fn new() -> Self {
-        let storage = vec![0u8; BUF_SIZE * POOL_SIZE].into_boxed_slice();
+    pub fn new(pool_size: usize) -> Self {
+        let size = pool_size.min(MAX_POOL_SIZE);
+        let storage = vec![0u8; BUF_SIZE * size].into_boxed_slice();
         let storage = Pin::new(storage);
-        let free: VecDeque<usize> = (0..POOL_SIZE).collect();
-        Self { storage, free }
+        let free: VecDeque<usize> = (0..size).collect();
+        Self { storage, free, size }
     }
 
     /// Allocate a buffer, returning its index. Returns `None` if exhausted.
@@ -66,7 +71,7 @@ impl BufferPool {
 
     /// Return a buffer to the free list.
     pub fn free(&mut self, idx: usize) {
-        debug_assert!(idx < POOL_SIZE);
+        debug_assert!(idx < self.size);
         self.free.push_back(idx);
     }
 
@@ -103,7 +108,7 @@ impl BufferPool {
     /// After registration, use `ReadFixed`/`WriteFixed` opcodes with
     /// the buffer pool index as the `buf_index` parameter.
     pub fn register(&self, ring: &IoUring) -> Result<()> {
-        let iovecs: Vec<libc::iovec> = (0..POOL_SIZE)
+        let iovecs: Vec<libc::iovec> = (0..self.size)
             .map(|i| libc::iovec {
                 iov_base: self.ptr(i) as *mut libc::c_void,
                 iov_len: BUF_SIZE,

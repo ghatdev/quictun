@@ -53,6 +53,9 @@ enum Command {
         /// Number of io_uring cores (each gets own TUN queue + QUIC connection)
         #[arg(long, default_value = "1")]
         iouring_cores: usize,
+        /// Buffer pool size per thread (max 1024, io_uring only)
+        #[arg(long, default_value = "1024")]
+        pool_size: usize,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -78,9 +81,10 @@ fn main() -> anyhow::Result<()> {
             iouring,
             sqpoll,
             iouring_cores,
+            pool_size,
         } => up::run(
             &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
-            iouring_cores,
+            iouring_cores, pool_size,
         ),
         Command::Down { config } => down::run(&config),
     }

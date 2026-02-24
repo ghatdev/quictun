@@ -48,6 +48,7 @@ pub fn run(
     notify_fd: RawFd,
     shutdown_fd: RawFd,
     sqpoll: bool,
+    pool_size: usize,
 ) -> Result<()> {
     let mut ring = if sqpoll {
         IoUring::builder()
@@ -58,7 +59,7 @@ pub fn run(
         IoUring::new(RING_SIZE).context("engine: failed to create io_uring")?
     };
 
-    let mut pool = BufferPool::new();
+    let mut pool = BufferPool::new(pool_size);
 
     let timer_fd = timer.raw_fd();
     let mut timer_buf = [0u8; 8];

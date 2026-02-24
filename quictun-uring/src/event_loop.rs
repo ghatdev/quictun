@@ -43,6 +43,7 @@ pub fn run(
     local_addr: SocketAddr,
     setup: EndpointSetup,
     sqpoll: bool,
+    pool_size: usize,
 ) -> Result<()> {
     let cores = tun_fds.len();
 
@@ -165,15 +166,17 @@ pub fn run(
             let core_id = i;
             let sqp = sqpoll;
 
+            let ps = pool_size;
             let reader_h = s.spawn(move || {
                 pin_to_core(core_id);
-                crate::reader::run(tun_fd, tx, notify_raw, shutdown_raw, sqp)
+                crate::reader::run(tun_fd, tx, notify_raw, shutdown_raw, sqp, ps)
             });
 
+            let ps = pool_size;
             let engine_h = s.spawn(move || {
                 pin_to_core(core_id);
                 crate::engine::run(
-                    tun_fd, udp_raw, quic_state, timer, rx, notify_raw, shutdown_raw, sqp,
+                    tun_fd, udp_raw, quic_state, timer, rx, notify_raw, shutdown_raw, sqp, ps,
                 )
             });
 
