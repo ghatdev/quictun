@@ -5,12 +5,10 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bytes::BytesMut;
 use quinn_proto::{ClientConfig, ServerConfig};
 use tracing::info;
 
-use crate::bufpool::BUF_SIZE;
-use crate::shared::{self, QuicState};
+use crate::shared::QuicState;
 use crate::timer::Timer;
 use crate::udp;
 
@@ -52,8 +50,15 @@ pub fn run(
         set_nonblocking(fd).context("failed to set TUN fd non-blocking")?;
     }
 
-    // Build per-core state: (udp_fd, quic_state) for each core.
-    let mut core_state: Vec<(OwnedFd, QuicState)> = Vec::with_capacity(cores);
+    // Build per-core state: (udp_fd, quic_state, server_config) for each core.
+    // Connector: QuicState is Some (connection already initiated).
+    // Listener: QuicState is None (first-packet handling moved to engine thread
+    //           so all cores block in parallel instead of sequentially).
+    let mut core_state: Vec<(OwnedFd, Option<QuicState>)> = Vec::with_capacity(cores);
+    let server_config: Option<Arc<ServerConfig>> = match &setup {
+        EndpointSetup::Listener { server_config } => Some(server_config.clone()),
+        _ => None,
+    };
 
     match &setup {
         EndpointSetup::Connector {
@@ -82,11 +87,13 @@ pub fn run(
                 quic.ch = Some(handle);
                 quic.connection = Some(conn);
 
-                core_state.push((udp_fd, quic));
+                core_state.push((udp_fd, Some(quic)));
             }
         }
-        EndpointSetup::Listener { server_config } => {
-            // Listener: each core binds to listen_port + i, waits for first packet.
+        EndpointSetup::Listener { .. } => {
+            // Listener: each core binds to listen_port + i.
+            // First-packet handling is deferred to each engine thread so all
+            // cores block in parallel (fixes sequential 7s+ startup delay).
             for i in 0..cores {
                 let listen_addr = if cores > 1 {
                     SocketAddr::new(local_addr.ip(), local_addr.port() + i as u16)
@@ -97,38 +104,9 @@ pub fn run(
                 let udp_fd = udp::create_udp_unbound(listen_addr)
                     .with_context(|| format!("core {i}: failed to create UDP socket"))?;
                 let bind = udp::local_addr(&udp_fd)?;
-                info!(core = i, bind = %bind, "UDP socket bound, waiting for first packet (listener)");
+                info!(core = i, bind = %bind, "UDP socket bound (listener, waiting deferred to engine)");
 
-                // Blocking recvfrom to learn peer address.
-                set_blocking(udp_fd.as_raw_fd())
-                    .with_context(|| format!("core {i}: failed to set blocking"))?;
-
-                let mut buf = vec![0u8; BUF_SIZE];
-                let (n, peer) = udp::recvfrom_first(&udp_fd, &mut buf)
-                    .with_context(|| format!("core {i}: recvfrom_first failed"))?;
-                info!(core = i, peer = %peer, bytes = n, "received first packet");
-
-                udp::connect_to_peer(&udp_fd, peer)
-                    .with_context(|| format!("core {i}: connect failed"))?;
-                set_nonblocking(udp_fd.as_raw_fd())
-                    .with_context(|| format!("core {i}: failed to set non-blocking"))?;
-
-                // Feed the first packet to the QUIC endpoint.
-                let mut quic = QuicState::new(peer, Some(server_config.clone()));
-                let data = BytesMut::from(&buf[..n]);
-                let mut response_buf: Vec<u8> = Vec::new();
-                if let Some(event) = quic.endpoint.handle(
-                    Instant::now(),
-                    peer,
-                    None,
-                    None,
-                    data,
-                    &mut response_buf,
-                ) {
-                    shared::handle_datagram_event(&mut quic, event, &mut response_buf);
-                }
-
-                core_state.push((udp_fd, quic));
+                core_state.push((udp_fd, None));
             }
         }
     }
@@ -173,10 +151,11 @@ pub fn run(
             });
 
             let ps = pool_size;
+            let sc = server_config.clone();
             let engine_h = s.spawn(move || {
                 pin_to_core(core_id);
                 crate::engine::run(
-                    tun_fd, udp_raw, quic_state, timer, rx, notify_raw, shutdown_raw, sqp, ps,
+                    tun_fd, udp_raw, quic_state, sc, timer, rx, notify_raw, shutdown_raw, sqp, ps,
                 )
             });
 
@@ -250,7 +229,7 @@ fn pin_to_core(core_id: usize) {
 }
 
 /// Set a file descriptor to non-blocking mode.
-fn set_nonblocking(fd: RawFd) -> Result<()> {
+pub(crate) fn set_nonblocking(fd: RawFd) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error()).context("fcntl F_GETFL");
@@ -263,7 +242,7 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 }
 
 /// Set a file descriptor to blocking mode.
-fn set_blocking(fd: RawFd) -> Result<()> {
+pub(crate) fn set_blocking(fd: RawFd) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error()).context("fcntl F_GETFL");

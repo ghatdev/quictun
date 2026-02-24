@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use anyhow::{Context, Result, bail};
 
@@ -17,8 +17,8 @@ pub fn create_udp(local: SocketAddr, remote: SocketAddr) -> Result<OwnedFd> {
 
 /// Create a bound-only (unconnected) UDP socket suitable for listener startup.
 ///
-/// The socket is bound to `local` but NOT connected — use `recvfrom_first()` to
-/// learn the peer address, then `connect_to_peer()` to enter connected mode.
+/// The socket is bound to `local` but NOT connected — use `recvfrom_first_raw()` to
+/// learn the peer address, then `connect_to_peer_raw()` to enter connected mode.
 pub fn create_udp_unbound(local: SocketAddr) -> Result<OwnedFd> {
     create_udp_socket(local).context("create_udp_unbound")
 }
@@ -27,15 +27,14 @@ pub fn create_udp_unbound(local: SocketAddr) -> Result<OwnedFd> {
 /// (bytes_read, peer_address). Used once at listener startup to learn the
 /// peer address before entering the io_uring loop.
 ///
-/// The socket MUST be in blocking mode when this is called (the default from
-/// `create_udp_unbound`).
-pub fn recvfrom_first(fd: &OwnedFd, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+/// The socket MUST be in blocking mode when this is called.
+pub fn recvfrom_first_raw(fd: RawFd, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
     let n = unsafe {
         libc::recvfrom(
-            fd.as_raw_fd(),
+            fd,
             buf.as_mut_ptr() as *mut libc::c_void,
             buf.len(),
             0,
@@ -53,6 +52,12 @@ pub fn recvfrom_first(fd: &OwnedFd, buf: &mut [u8]) -> Result<(usize, SocketAddr
 
 /// Connect a previously unbound socket to `remote`, enabling Read/Write ops.
 pub fn connect_to_peer(fd: &OwnedFd, remote: SocketAddr) -> Result<()> {
+    connect_to_peer_raw(fd.as_raw_fd(), remote)
+}
+
+/// Raw fd variant of [`connect_to_peer`] for use from engine threads that only
+/// have a `RawFd`.
+pub fn connect_to_peer_raw(fd: RawFd, remote: SocketAddr) -> Result<()> {
     let remote_addr = sockaddr_from(remote);
     let remote_len = match remote {
         SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
@@ -60,7 +65,7 @@ pub fn connect_to_peer(fd: &OwnedFd, remote: SocketAddr) -> Result<()> {
     };
     let ret = unsafe {
         libc::connect(
-            fd.as_raw_fd(),
+            fd,
             &remote_addr as *const _ as *const libc::sockaddr,
             remote_len as libc::socklen_t,
         )

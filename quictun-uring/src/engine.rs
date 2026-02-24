@@ -1,18 +1,22 @@
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::Receiver;
 use io_uring::{IoUring, opcode, types};
+use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
 
 use crate::bufpool::{
     self, BUF_SIZE, BufferPool, OP_SHUTDOWN, OP_TIMER, OP_TUN_WRITE, OP_UDP_RECV, OP_UDP_SEND,
     OP_WAKE,
 };
+use crate::event_loop::{set_blocking, set_nonblocking};
 use crate::shared::{self, QuicState};
 use crate::timer::Timer;
+use crate::udp;
 
 /// Number of UDP recv SQEs to keep in flight.
 const PREFILL_READS: usize = 32;
@@ -42,7 +46,8 @@ const FD_SHUTDOWN: u32 = 4;
 pub fn run(
     tun_fd: RawFd,
     udp_fd: RawFd,
-    mut quic: QuicState,
+    quic: Option<QuicState>,
+    server_config: Option<Arc<ServerConfig>>,
     timer: Timer,
     rx: Receiver<Vec<u8>>,
     notify_fd: RawFd,
@@ -50,6 +55,38 @@ pub fn run(
     sqpoll: bool,
     pool_size: usize,
 ) -> Result<()> {
+    // Resolve QuicState: connector has it ready, listener must wait for first packet.
+    let mut quic = if let Some(qs) = quic {
+        qs
+    } else {
+        // Listener: blocking wait for first packet (runs in parallel across cores).
+        let server_config =
+            server_config.expect("listener engine requires server_config");
+        set_blocking(udp_fd).context("engine: failed to set blocking for first-packet recv")?;
+
+        let mut buf = vec![0u8; BUF_SIZE];
+        let (n, peer) = udp::recvfrom_first_raw(udp_fd, &mut buf)
+            .context("engine: recvfrom_first failed")?;
+        info!(peer = %peer, bytes = n, "engine: received first packet");
+
+        udp::connect_to_peer_raw(udp_fd, peer)
+            .context("engine: connect_to_peer failed")?;
+        set_nonblocking(udp_fd)
+            .context("engine: failed to set non-blocking after first-packet recv")?;
+
+        // Feed the first packet to the QUIC endpoint.
+        let mut qs = QuicState::new(peer, Some(server_config));
+        let data = BytesMut::from(&buf[..n]);
+        let mut response_buf: Vec<u8> = Vec::new();
+        if let Some(event) =
+            qs.endpoint
+                .handle(Instant::now(), peer, None, None, data, &mut response_buf)
+        {
+            shared::handle_datagram_event(&mut qs, event, &mut response_buf);
+        }
+        qs
+    };
+
     let mut ring = if sqpoll {
         IoUring::builder()
             .setup_sqpoll(1000)
