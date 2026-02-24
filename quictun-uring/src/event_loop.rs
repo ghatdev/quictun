@@ -1,20 +1,18 @@
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use bytes::BytesMut;
 use quinn_proto::{ClientConfig, ServerConfig};
 use tracing::info;
 
 use crate::bufpool::BUF_SIZE;
-use crate::quic_loop;
+use crate::shared::{self, QuicState};
+use crate::timer::Timer;
 use crate::udp;
-use crate::wakeup::EventFd;
-
-/// Channel capacity for cross-thread packet queues.
-const CHANNEL_CAP: usize = 256;
 
 /// How the QUIC endpoint should be set up.
 pub enum EndpointSetup {
@@ -27,10 +25,10 @@ pub enum EndpointSetup {
     },
 }
 
-/// Run the two-thread io_uring data plane.
+/// Run the direction-split io_uring data plane.
 ///
-/// Spawns a TUN thread and a QUIC thread, each with its own io_uring ring.
-/// Cross-thread communication via bounded crossbeam channels + eventfd wakeups.
+/// Spawns an outbound thread (TUN→QUIC→UDP) and an inbound thread (UDP→QUIC→TUN),
+/// each with its own io_uring ring. Shared QUIC state protected by a Mutex.
 pub fn run(tun_fd: RawFd, local_addr: SocketAddr, setup: EndpointSetup) -> Result<()> {
     // 0. Set TUN fd to non-blocking for io_uring.
     set_nonblocking(tun_fd).context("failed to set TUN fd non-blocking")?;
@@ -45,7 +43,6 @@ pub fn run(tun_fd: RawFd, local_addr: SocketAddr, setup: EndpointSetup) -> Resul
             (fd, *remote_addr, Vec::new(), 0)
         }
         EndpointSetup::Listener { .. } => {
-            // Bind-only socket, then blocking recvfrom to learn peer address.
             let fd = udp::create_udp_unbound(local_addr)
                 .context("failed to create unbound UDP socket")?;
             let bind = udp::local_addr(&fd)?;
@@ -71,86 +68,89 @@ pub fn run(tun_fd: RawFd, local_addr: SocketAddr, setup: EndpointSetup) -> Resul
 
     let udp_raw = udp_fd.as_raw_fd();
 
-    // 2. Create cross-thread channels + eventfds.
-    let (to_quic_tx, to_quic_rx) = crossbeam_channel::bounded(CHANNEL_CAP);
-    let (to_tun_tx, to_tun_rx) = crossbeam_channel::bounded(CHANNEL_CAP);
-
-    let tun_wake = EventFd::new().context("failed to create TUN eventfd")?;
-    let quic_wake = EventFd::new().context("failed to create QUIC eventfd")?;
-
-    // 3. Build QUIC thread setup.
-    let quic_setup = match setup {
-        EndpointSetup::Connector {
-            remote_addr,
-            client_config,
-        } => quic_loop::Setup::Connector(quic_loop::ConnectorSetup {
-            remote_addr,
-            client_config,
-        }),
-        EndpointSetup::Listener { server_config } => {
-            quic_loop::Setup::Listener(quic_loop::ListenerSetup {
-                server_config,
-                remote_addr,
-                first_packet,
-                first_packet_len,
-            })
-        }
+    // 2. Build QuicState.
+    let server_config = match &setup {
+        EndpointSetup::Listener { server_config } => Some(server_config.clone()),
+        EndpointSetup::Connector { .. } => None,
     };
 
-    // 4. Shared shutdown flag.
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_tun = shutdown.clone();
+    let mut quic_state = QuicState::new(remote_addr, server_config);
+
+    // Connector: initiate connection.
+    if let EndpointSetup::Connector {
+        remote_addr,
+        client_config,
+    } = setup
+    {
+        let (handle, conn) = quic_state
+            .endpoint
+            .connect(Instant::now(), client_config, remote_addr, "quictun")
+            .map_err(|e| anyhow::anyhow!("connect failed: {e:?}"))?;
+        quic_state.ch = Some(handle);
+        quic_state.connection = Some(conn);
+    }
+
+    // Listener: feed the first packet.
+    if first_packet_len > 0 {
+        let data = BytesMut::from(&first_packet[..first_packet_len]);
+        let mut response_buf: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        if let Some(event) = quic_state.endpoint.handle(
+            now,
+            remote_addr,
+            None,
+            None,
+            data,
+            &mut response_buf,
+        ) {
+            // Accept the connection. Response transmits are discarded (pre-thread).
+            // Pending handshake transmits remain in the Connection and will be
+            // drained by the outbound thread's initial drive() call.
+            shared::handle_datagram_event(&mut quic_state, event, &mut response_buf);
+        }
+    }
+
+    let quic = Mutex::new(quic_state);
+
+    // 3. Create shared timer (inbound thread owns it, outbound can arm it).
+    let timer = Timer::new().context("failed to create timerfd")?;
+
+    // 4. Create shutdown eventfd.
+    let shutdown_fd = create_eventfd().context("failed to create shutdown eventfd")?;
+    let shutdown_raw = shutdown_fd.as_raw_fd();
 
     // 5. Spawn threads.
-    // Both threads need references to both eventfds. Create explicit references
-    // so the move closures copy the references (which are Copy) rather than
-    // trying to move the EventFds themselves.
-    let tun_wake_ref = &tun_wake;
-    let quic_wake_ref = &quic_wake;
-
     thread::scope(|s| {
-        let tun_handle = s.spawn(move || {
-            crate::tun_loop::run(
-                tun_fd,
-                to_quic_tx,
-                to_tun_rx,
-                tun_wake_ref,
-                quic_wake_ref,
-                shutdown_tun,
-            )
+        let quic_ref = &quic;
+        let timer_ref = &timer;
+
+        let outbound_handle = s.spawn(move || {
+            crate::outbound::run(tun_fd, udp_raw, quic_ref, timer_ref, shutdown_raw)
         });
 
-        let quic_handle = s.spawn(move || {
-            quic_loop::run(
-                udp_raw,
-                quic_setup,
-                to_quic_rx,
-                to_tun_tx,
-                quic_wake_ref,
-                tun_wake_ref,
-            )
+        let inbound_handle = s.spawn(move || {
+            crate::inbound::run(tun_fd, udp_raw, quic_ref, timer_ref, shutdown_raw)
         });
 
-        // Wait for QUIC thread first (it owns the connection lifecycle).
-        // When it exits (connection lost / error), signal TUN thread to stop.
-        let quic_result = quic_handle.join();
-        shutdown.store(true, Ordering::Relaxed);
+        // Wait for inbound thread first (it owns connection lifecycle via timer/handle_timeout).
+        let inbound_result = inbound_handle.join();
 
-        // Wake TUN thread so it exits submit_and_wait.
-        tun_wake.wake();
+        // Signal outbound thread to stop via eventfd.
+        write_eventfd(&shutdown_fd);
 
-        let tun_result = tun_handle.join();
+        let outbound_result = outbound_handle.join();
 
         // Propagate errors.
-        match quic_result {
+        match inbound_result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e).context("QUIC thread error"),
-            Err(_) => return Err(anyhow::anyhow!("QUIC thread panicked")),
+            Ok(Err(e)) => return Err(e).context("inbound thread error"),
+            Err(_) => return Err(anyhow::anyhow!("inbound thread panicked")),
         }
-        match tun_result {
+        match outbound_result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e).context("TUN thread error"),
-            Err(_) => return Err(anyhow::anyhow!("TUN thread panicked")),
+            Ok(Err(e)) => return Err(e).context("outbound thread error"),
+            Err(_) => return Err(anyhow::anyhow!("outbound thread panicked")),
         }
 
         Ok(())
@@ -181,4 +181,25 @@ fn set_blocking(fd: RawFd) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("fcntl F_SETFL blocking");
     }
     Ok(())
+}
+
+/// Create a non-blocking eventfd for shutdown signaling.
+fn create_eventfd() -> Result<OwnedFd> {
+    let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("eventfd() failed");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Write to an eventfd to signal shutdown.
+fn write_eventfd(fd: &OwnedFd) {
+    let val: u64 = 1;
+    unsafe {
+        libc::write(
+            fd.as_raw_fd(),
+            &val as *const u64 as *const libc::c_void,
+            8,
+        );
+    }
 }

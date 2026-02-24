@@ -14,4 +14,3 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 io-uring = { workspace = true }
 libc = { workspace = true }
-crossbeam-channel = { workspace = true }

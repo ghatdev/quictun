@@ -5,11 +5,11 @@ mod timer;
 #[cfg(target_os = "linux")]
 mod udp;
 #[cfg(target_os = "linux")]
-mod wakeup;
+mod shared;
 #[cfg(target_os = "linux")]
-mod tun_loop;
+mod outbound;
 #[cfg(target_os = "linux")]
-mod quic_loop;
+mod inbound;
 #[cfg(target_os = "linux")]
 pub mod quic;
 #[cfg(target_os = "linux")]

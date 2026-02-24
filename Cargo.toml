@@ -59,4 +59,3 @@ tun-rs = { version = "2", features = ["async"] }
 # io_uring (Linux only)
 io-uring = "0.7"
 libc = "0.2"
-crossbeam-channel = "0.5"
