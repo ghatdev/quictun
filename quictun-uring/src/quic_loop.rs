@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -142,15 +142,13 @@ pub fn run(
 
     // Main event loop.
     info!("quic: entering io_uring event loop");
-    let mut sent_to_tun = false;
-
     loop {
         ring.submit_and_wait(1)
             .context("quic: submit_and_wait failed")?;
 
         let cqes: Vec<_> = ring.completion().collect();
         let now = Instant::now();
-        sent_to_tun = false;
+        let mut sent_to_tun = false;
 
         for cqe in cqes {
             let user_data = cqe.user_data();
@@ -333,7 +331,7 @@ fn handle_datagram_event(
 ) -> Result<()> {
     match event {
         DatagramEvent::ConnectionEvent(event_ch, event) => {
-            if let Some(ref mut conn) = connection {
+            if let Some(conn) = connection.as_mut() {
                 if *ch == Some(event_ch) {
                     conn.handle_event(event);
                 }
