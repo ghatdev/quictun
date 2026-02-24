@@ -45,23 +45,47 @@ pub fn decode_index(user_data: u64) -> usize {
     (user_data & INDEX_MASK) as usize
 }
 
-/// Pre-allocated slab of fixed-size buffers.
+/// Pre-allocated slab of fixed-size buffers for io_uring I/O.
 ///
-/// Pointers are stable (pinned) so io_uring can safely borrow them
-/// between submit and completion.
+/// # Safety model
+///
+/// `base_ptr` is derived from `&mut` access during construction (before pinning),
+/// so it carries write provenance. Pin ensures the heap allocation never moves,
+/// keeping the pointer valid for the pool's lifetime.
+///
+/// Buffer lifecycle: alloc → pass ptr to io_uring SQE → kernel reads/writes →
+/// CQE arrives → we access via slice/slice_mut → free. No Rust references exist
+/// while the kernel has the buffer.
 pub struct BufferPool {
-    storage: Pin<Box<[u8]>>,
+    /// Keeps the heap allocation alive and pinned. Not accessed after construction.
+    _storage: Pin<Box<[u8]>>,
+    /// Raw pointer to the base of the allocation, derived from `&mut` access.
+    /// Valid for the lifetime of `_storage` because Pin prevents moves.
+    base_ptr: *mut u8,
     free: VecDeque<usize>,
     size: usize,
 }
 
+// SAFETY: BufferPool is used single-threaded (one per engine/reader thread).
+// The raw pointer is derived from an owned Box and is only accessed by the
+// owning thread. No cross-thread sharing occurs.
+unsafe impl Send for BufferPool {}
+
 impl BufferPool {
     pub fn new(pool_size: usize) -> Self {
         let size = pool_size.min(MAX_POOL_SIZE);
-        let storage = vec![0u8; BUF_SIZE * size].into_boxed_slice();
+        let mut storage = vec![0u8; BUF_SIZE * size].into_boxed_slice();
+        // Derive the raw pointer from &mut access BEFORE pinning.
+        // This gives the pointer write provenance under Stacked Borrows.
+        let base_ptr = storage.as_mut_ptr();
         let storage = Pin::new(storage);
         let free: VecDeque<usize> = (0..size).collect();
-        Self { storage, free, size }
+        Self {
+            _storage: storage,
+            base_ptr,
+            free,
+            size,
+        }
     }
 
     /// Allocate a buffer, returning its index. Returns `None` if exhausted.
@@ -76,26 +100,35 @@ impl BufferPool {
     }
 
     /// Get a read-only slice of completed data at `idx` with `len` bytes.
+    ///
+    /// # Safety invariant
+    /// Caller must ensure the buffer is not in-flight with io_uring
+    /// (i.e., the CQE for this buffer has been reaped).
     pub fn slice(&self, idx: usize, len: usize) -> &[u8] {
-        let start = idx * BUF_SIZE;
-        &self.storage[start..start + len]
+        // SAFETY: base_ptr is valid for size * BUF_SIZE bytes, idx < size (from alloc),
+        // len ≤ BUF_SIZE (from io_uring result), and no mutable reference exists.
+        unsafe { std::slice::from_raw_parts(self.base_ptr.add(idx * BUF_SIZE), len) }
     }
 
     /// Get a mutable slice of buffer at `idx` (full BUF_SIZE).
     ///
-    /// Used by `drain_transmits` to let quinn-proto write directly into pool buffers,
-    /// eliminating intermediate copies.
+    /// # Safety invariant
+    /// Caller must ensure the buffer is not in-flight with io_uring
+    /// and no other references to this buffer index exist.
     pub fn slice_mut(&mut self, idx: usize) -> &mut [u8] {
-        // SAFETY: storage is pinned, idx is within POOL_SIZE, and we have &mut self.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr(idx), BUF_SIZE) }
+        // SAFETY: base_ptr has write provenance, idx < size (from alloc),
+        // &mut self ensures no other references exist.
+        unsafe { std::slice::from_raw_parts_mut(self.base_ptr.add(idx * BUF_SIZE), BUF_SIZE) }
     }
 
     /// Get the raw pointer for SQE construction.
+    ///
+    /// The returned pointer is valid for BUF_SIZE bytes and remains stable
+    /// (pinned) for the lifetime of the pool.
     pub fn ptr(&self, idx: usize) -> *mut u8 {
-        let start = idx * BUF_SIZE;
-        // SAFETY: storage is pinned and the pointer is stable for the lifetime of the pool.
-        // io_uring writes into this buffer between submit and completion.
-        unsafe { (self.storage.as_ptr() as *mut u8).add(start) }
+        // No unsafe needed — just pointer arithmetic on a stored raw pointer.
+        // base_ptr was derived from &mut access and has write provenance.
+        unsafe { self.base_ptr.add(idx * BUF_SIZE) }
     }
 
     /// Number of free buffers available.
@@ -114,6 +147,7 @@ impl BufferPool {
                 iov_len: BUF_SIZE,
             })
             .collect();
+        // SAFETY: iovecs point to valid, pinned memory that outlives the registration.
         unsafe { ring.submitter().register_buffers(&iovecs) }
             .context("failed to register buffers with io_uring")?;
         Ok(())

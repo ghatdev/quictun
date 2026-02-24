@@ -447,9 +447,8 @@ fn submit_udp_send(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> Re
             return Ok(());
         }
     };
-    let dst = unsafe { std::slice::from_raw_parts_mut(pool.ptr(idx), BUF_SIZE) };
     let len = data.len().min(BUF_SIZE);
-    dst[..len].copy_from_slice(&data[..len]);
+    pool.slice_mut(idx)[..len].copy_from_slice(&data[..len]);
 
     let entry =
         opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
@@ -469,9 +468,8 @@ fn submit_tun_write(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> R
             return Ok(());
         }
     };
-    let dst = unsafe { std::slice::from_raw_parts_mut(pool.ptr(idx), BUF_SIZE) };
     let len = data.len().min(BUF_SIZE);
-    dst[..len].copy_from_slice(&data[..len]);
+    pool.slice_mut(idx)[..len].copy_from_slice(&data[..len]);
 
     let entry =
         opcode::WriteFixed::new(types::Fixed(FD_TUN), pool.ptr(idx), len as u32, idx as u16)
