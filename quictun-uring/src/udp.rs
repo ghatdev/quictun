@@ -117,6 +117,11 @@ fn create_udp_socket(local: SocketAddr) -> Result<OwnedFd> {
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let raw = fd.as_raw_fd();
 
+    // Allow rebinding the port immediately after a previous instance exits.
+    // Without this, io_uring's register_files() keeps a kernel reference to the
+    // socket FD that outlives the process on hard kill (Ctrl+C), causing EADDRINUSE.
+    setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).context("SO_REUSEADDR")?;
+
     // Set buffer sizes.
     setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_RCVBUF, BUF_SIZE).context("SO_RCVBUF")?;
     setsockopt_int(raw, libc::SOL_SOCKET, libc::SO_SNDBUF, BUF_SIZE).context("SO_SNDBUF")?;

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -11,6 +12,10 @@ use tracing::info;
 use crate::shared::QuicState;
 use crate::timer::Timer;
 use crate::udp;
+
+/// Pipe write-end for the async-signal-safe signal handler.
+/// Set before installing the handler, cleared after restoring defaults.
+static SIGNAL_PIPE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// Channel capacity for TUN packets from reader → engine.
 /// Provides backpressure: reader drops packets when full (same as
@@ -112,8 +117,14 @@ pub fn run(
         }
     }
 
+    // Install signal handler for graceful Ctrl+C / SIGTERM shutdown.
+    // Uses the self-pipe trick: signal handler writes to pipe, watcher thread
+    // reads it and signals all shutdown eventfds.
+    let (sig_read, sig_write) = create_pipe().context("failed to create signal pipe")?;
+    install_signal_handler(sig_write.as_raw_fd());
+
     // Create per-core resources and spawn threads.
-    thread::scope(|s| {
+    let result = thread::scope(|s| {
         let mut engine_handles = Vec::with_capacity(cores);
         let mut reader_handles = Vec::with_capacity(cores);
         // Keep OwnedFds alive for the duration of all threads.
@@ -166,6 +177,21 @@ pub fn run(
             engine_handles.push(engine_h);
         }
 
+        // Signal watcher thread: blocks on the signal pipe, then signals all
+        // shutdown eventfds so engines and readers exit gracefully.
+        let shutdown_fd_raws: Vec<RawFd> =
+            shutdown_fds.iter().map(|f| f.as_raw_fd()).collect();
+        let sig_r = sig_read.as_raw_fd();
+        let signal_h = s.spawn(move || {
+            let mut buf = [0u8; 1];
+            // Blocks until the signal handler writes to the pipe.
+            let _ = unsafe { libc::read(sig_r, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+            info!("received signal, shutting down");
+            for &fd in &shutdown_fd_raws {
+                write_eventfd_raw(fd);
+            }
+        });
+
         // Wait for all engine threads (they own connection lifecycle).
         let mut first_error: Option<anyhow::Error> = None;
         for (i, handle) in engine_handles.into_iter().enumerate() {
@@ -186,10 +212,19 @@ pub fn run(
             }
         }
 
-        // Signal all reader threads to stop.
+        // Signal all reader threads to stop (redundant if signal watcher already
+        // did this, but needed for normal connection-loss shutdown path).
         for fd in &shutdown_fds {
             write_eventfd(fd);
         }
+
+        // Wake the signal watcher thread so it can exit (it may still be blocked
+        // on the pipe read if shutdown was triggered by connection loss, not Ctrl+C).
+        // Closing the write end unblocks read() with 0 bytes.
+        drop(sig_write);
+
+        // Join signal watcher.
+        let _ = signal_h.join();
 
         for (i, handle) in reader_handles.into_iter().enumerate() {
             match handle.join() {
@@ -213,7 +248,10 @@ pub fn run(
             Some(e) => Err(e),
             None => Ok(()),
         }
-    })
+    });
+
+    restore_signal_handlers();
+    result
 }
 
 /// Pin the calling thread to a specific CPU core.
@@ -275,5 +313,56 @@ fn write_eventfd(fd: &OwnedFd) {
             &val as *const u64 as *const libc::c_void,
             8,
         );
+    }
+}
+
+/// Write a u64(1) to a raw eventfd to signal shutdown.
+fn write_eventfd_raw(fd: RawFd) {
+    let val: u64 = 1;
+    unsafe {
+        libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
+    }
+}
+
+/// Create a pipe for the self-pipe signal trick. Returns `(read_end, write_end)`.
+fn create_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0i32; 2];
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error()).context("pipe2() failed");
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Async-signal-safe handler: writes 1 byte to the signal pipe.
+extern "C" fn signal_handler(_sig: libc::c_int) {
+    let fd = SIGNAL_PIPE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let val: u8 = 1;
+        unsafe {
+            libc::write(fd, &val as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
+
+/// Install our signal handler for SIGINT and SIGTERM.
+fn install_signal_handler(pipe_write_fd: RawFd) {
+    SIGNAL_PIPE_FD.store(pipe_write_fd, Ordering::Relaxed);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = signal_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Restore default handlers for SIGINT and SIGTERM.
+fn restore_signal_handlers() {
+    SIGNAL_PIPE_FD.store(-1, Ordering::Relaxed);
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
 }
