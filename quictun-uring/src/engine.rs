@@ -19,7 +19,9 @@ use crate::timer::Timer;
 use crate::udp;
 
 /// io_uring ring size for the engine thread.
-const RING_SIZE: u32 = 256;
+/// 1024 handles burst SQE pushes where a single CQE batch can generate
+/// reprovide + TUN write + drain_transmits SQEs exceeding smaller ring sizes.
+const RING_SIZE: u32 = 1024;
 
 // Registered fd indices for the engine thread.
 const FD_UDP: u32 = 0;
@@ -647,19 +649,34 @@ fn submit_shutdown_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
 
 /// Push an SQE to the submission queue, flushing if full.
 ///
-/// If the SQ is full, submits all pending entries to the kernel and retries.
-/// This handles bursts where drain_transmits + recv resubmits + TUN writes
-/// exceed the ring size (256) in a single iteration.
+/// Without SQPOLL: `submit()` synchronously flushes all pending SQEs, freeing
+/// SQ slots immediately. One retry always suffices.
+///
+/// With SQPOLL: the kernel thread consumes SQ entries asynchronously.
+/// We submit to wake the SQPOLL thread, then yield to let it run.
+/// The large ring size (1024) makes this path rare in practice.
 fn push_sqe(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> Result<()> {
-    // Each submission() call borrows ring mutably; must drop before calling submit().
     if unsafe { ring.submission().push(entry) }.is_ok() {
         return Ok(());
     }
-    // SQ full — flush pending SQEs to kernel, then retry.
+    // SQ full — flush pending SQEs to kernel.
     ring.submit().context("engine: SQ flush failed")?;
-    unsafe { ring.submission().push(entry) }
-        .map_err(|_| anyhow::anyhow!("engine: SQ still full after flush"))?;
-    Ok(())
+    // Retry with yields: SQPOLL thread reads from shared memory asynchronously.
+    for _ in 0..100 {
+        std::thread::yield_now();
+        if unsafe { ring.submission().push(entry) }.is_ok() {
+            return Ok(());
+        }
+    }
+    // Last resort: wait for at least one completion (guarantees SQ consumption).
+    ring.submit_and_wait(1).context("engine: SQ submit_and_wait failed")?;
+    for _ in 0..100 {
+        std::thread::yield_now();
+        if unsafe { ring.submission().push(entry) }.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(anyhow::anyhow!("engine: SQ still full after wait"))
 }
 
 /// Write to the shutdown eventfd to wake the reader thread.
