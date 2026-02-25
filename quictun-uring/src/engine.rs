@@ -181,7 +181,10 @@ pub fn run(
 
     loop {
         // submit_and_wait submits all accumulated SQEs AND waits for ≥1 CQE.
-        // No separate ring.submit() needed — one syscall per iteration.
+        // With SQPOLL: SQE submission is free (kernel polls shared memory),
+        // but we still need io_uring_enter(GETEVENTS) to block-wait for CQEs.
+        // Busy-polling the CQ would eliminate this syscall but requires a
+        // dedicated core — not possible when reader shares the same core.
         ring.submit_and_wait(1)
             .context("engine: submit_and_wait failed")?;
 
@@ -649,34 +652,28 @@ fn submit_shutdown_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
 
 /// Push an SQE to the submission queue, flushing if full.
 ///
-/// Without SQPOLL: `submit()` synchronously flushes all pending SQEs, freeing
-/// SQ slots immediately. One retry always suffices.
+/// Without SQPOLL: `submit()` synchronously flushes all pending SQEs via
+/// `io_uring_enter()`. The SQ is empty after the call, so one retry suffices.
 ///
-/// With SQPOLL: the kernel thread consumes SQ entries asynchronously.
-/// We submit to wake the SQPOLL thread, then yield to let it run.
-/// The large ring size (1024) makes this path rare in practice.
+/// With SQPOLL: `submit()` wakes the kernel thread (no-op if already running).
+/// The kernel thread on its dedicated core processes SQEs asynchronously,
+/// freeing SQ slots as it goes. We spin until a slot opens. Each SQE takes
+/// ~100-500ns for the kernel to consume, so even a full ring (1024 entries)
+/// drains in <1ms.
 fn push_sqe(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> Result<()> {
     if unsafe { ring.submission().push(entry) }.is_ok() {
         return Ok(());
     }
-    // SQ full — flush pending SQEs to kernel.
-    ring.submit().context("engine: SQ flush failed")?;
-    // Retry with yields: SQPOLL thread reads from shared memory asynchronously.
-    for _ in 0..100 {
-        std::thread::yield_now();
+    // SQ full — wake SQPOLL thread (if idle) and spin until it frees a slot.
+    // Non-SQPOLL: submit() synchronously flushes, first spin succeeds.
+    // SQPOLL: kernel thread on a dedicated core processes SQEs concurrently.
+    ring.submit().context("engine: SQ flush")?;
+    loop {
+        std::hint::spin_loop();
         if unsafe { ring.submission().push(entry) }.is_ok() {
             return Ok(());
         }
     }
-    // Last resort: wait for at least one completion (guarantees SQ consumption).
-    ring.submit_and_wait(1).context("engine: SQ submit_and_wait failed")?;
-    for _ in 0..100 {
-        std::thread::yield_now();
-        if unsafe { ring.submission().push(entry) }.is_ok() {
-            return Ok(());
-        }
-    }
-    Err(anyhow::anyhow!("engine: SQ still full after wait"))
 }
 
 /// Write to the shutdown eventfd to wake the reader thread.
