@@ -1,12 +1,10 @@
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use crossbeam_channel::Receiver;
 
 use crate::ffi;
 use crate::mbuf::Mbuf;
@@ -43,18 +41,12 @@ impl InnerEthHeader {
     }
 }
 
-/// Inner interface abstraction — engine branches on this per-iteration.
-pub enum InnerInterface {
-    /// v1: TUN device with reader thread + crossbeam channel.
-    Tun {
-        tun_fd: RawFd,
-        tun_rx: Receiver<Vec<u8>>,
-    },
-    /// L2 DPDK inner port (AF_XDP veth or TAP PMD) — rx_burst/tx_burst.
-    DpdkPort {
-        inner_port_id: u16,
-        inner_eth_hdr: InnerEthHeader,
-    },
+/// Inner interface configuration for the L2 DPDK inner port.
+///
+/// Used by both AF_XDP (veth pair) and TAP PMD modes.
+pub struct InnerPort {
+    pub port_id: u16,
+    pub eth_hdr: InnerEthHeader,
 }
 
 /// Run the DPDK polling engine.
@@ -67,7 +59,7 @@ pub fn run(
     state: &mut QuicState,
     identity: &mut NetIdentity,
     arp_table: &mut ArpTable,
-    inner: InnerInterface,
+    inner: InnerPort,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
@@ -100,13 +92,9 @@ pub fn run(
         &mut tx_pkts,
     )?;
 
-    let mode_label = match &inner {
-        InnerInterface::Tun { .. } => "tun",
-        InnerInterface::DpdkPort { .. } => "dpdk_port",
-    };
-    tracing::info!(mode = mode_label, "DPDK engine started (polling loop)");
+    tracing::info!("DPDK engine started (polling loop)");
 
-    // Scratch buffer for AF_XDP inner TX (Ethernet header + IP packet).
+    // Scratch buffer for inner TX (Ethernet header + IP packet).
     let mut inner_tx_buf = [0u8; ETH_HLEN + 2048];
 
     loop {
@@ -214,76 +202,60 @@ pub fn run(
             // mbuf freed on drop
         }
 
-        // ── Phase 1b: Read from inner interface → send_datagram ──
+        // ── Phase 1b: Read from inner port → send_datagram ──
         //
-        // For AF_XDP: rx_burst first (handles ARP regardless of connection state),
+        // rx_burst handles ARP regardless of connection state,
         // then send IP packets via QUIC if connection exists.
 
-        // Collect IP packets from AF_XDP inner port (before connection check).
-        let mut inner_ip_pkts: Vec<Bytes> = Vec::new();
+        let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+            [std::ptr::null_mut(); BURST_SIZE];
+        let nb = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
 
-        if let InnerInterface::DpdkPort { inner_port_id, inner_eth_hdr } = &inner {
-            let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-                [std::ptr::null_mut(); BURST_SIZE];
-            let nb = port::rx_burst(*inner_port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
-            for i in 0..nb as usize {
-                let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
-                let data = mbuf.data();
-                if data.len() < ETH_HLEN {
-                    continue;
-                }
-                let ethertype = u16::from_be_bytes([data[12], data[13]]);
-                match ethertype {
-                    0x0800 => {
-                        // IPv4: strip Ethernet header, buffer for QUIC send.
-                        inner_ip_pkts.push(Bytes::copy_from_slice(&data[ETH_HLEN..]));
+        let mut inner_ip_count: usize = 0;
+
+        for i in 0..nb as usize {
+            let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
+            let data = mbuf.data();
+            if data.len() < ETH_HLEN {
+                continue;
+            }
+            let ethertype = u16::from_be_bytes([data[12], data[13]]);
+            match ethertype {
+                0x0800 => {
+                    // IPv4: strip Ethernet header, send via QUIC.
+                    if let Some(conn) = state.connection.as_mut() {
+                        inner_rx += 1;
+                        let pkt = Bytes::copy_from_slice(&data[ETH_HLEN..]);
+                        if let Err(e) = conn.datagrams().send(pkt, true) {
+                            tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
+                        }
+                        inner_ip_count += 1;
                     }
-                    0x0806 => {
-                        // ARP: reply to requests with our inner port MAC.
-                        // The kernel ARPs for remote tunnel IPs on the veth.
-                        if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
-                            if arp.is_request {
-                                let inner_mac: [u8; 6] = inner_eth_hdr.bytes[6..12].try_into().unwrap();
-                                let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
-                                if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
-                                    if reply_mbuf.write_packet(&reply).is_ok() {
-                                        let raw = reply_mbuf.into_raw();
-                                        let mut tx = [raw];
-                                        let sent = port::tx_burst(*inner_port_id, 0, &mut tx, 1);
-                                        if sent == 0 {
-                                            unsafe { ffi::shim_rte_pktmbuf_free(raw) };
-                                        }
+                }
+                0x0806 => {
+                    // ARP: reply to requests with our inner port MAC.
+                    if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
+                        if arp.is_request {
+                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
+                            let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
+                            if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
+                                if reply_mbuf.write_packet(&reply).is_ok() {
+                                    let raw = reply_mbuf.into_raw();
+                                    let mut tx = [raw];
+                                    let sent = port::tx_burst(inner.port_id, 0, &mut tx, 1);
+                                    if sent == 0 {
+                                        unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                                     }
                                 }
                             }
                         }
                     }
-                    _ => {}
                 }
-                // mbuf freed on drop
+                _ => {}
             }
+            // mbuf freed on drop
         }
-
-        if let Some(conn) = state.connection.as_mut() {
-            match &inner {
-                InnerInterface::Tun { tun_rx, .. } => {
-                    while let Ok(pkt) = tun_rx.try_recv() {
-                        inner_rx += 1;
-                        if let Err(e) = conn.datagrams().send(Bytes::from(pkt), true) {
-                            tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
-                        }
-                    }
-                }
-                InnerInterface::DpdkPort { .. } => {
-                    for pkt in inner_ip_pkts.drain(..) {
-                        inner_rx += 1;
-                        if let Err(e) = conn.datagrams().send(pkt, true) {
-                            tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
-                        }
-                    }
-                }
-            }
-        }
+        let _ = inner_ip_count;
 
         // ── Phase 1c: Timer check ───────────────────────────────────
 
@@ -293,43 +265,31 @@ pub fn run(
             }
         }
 
-        // ── Phase 2: Process QUIC events → write to inner interface ──
+        // ── Phase 2: Process QUIC events → write to inner port ──
 
         shared::process_events(state, &mut drive_result);
 
-        match &inner {
-            InnerInterface::Tun { tun_fd, .. } => {
-                for datagram in &drive_result.datagrams {
-                    let ret = unsafe {
-                        libc::write(*tun_fd, datagram.as_ptr() as *const libc::c_void, datagram.len())
-                    };
-                    if ret > 0 {
-                        inner_tx += 1;
-                    }
-                }
-            }
-            InnerInterface::DpdkPort { inner_port_id, inner_eth_hdr } => {
-                let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
-                for datagram in &drive_result.datagrams {
-                    // Build Ethernet frame: pre-computed header + IP packet.
-                    let frame_len = ETH_HLEN + datagram.len();
-                    if frame_len <= inner_tx_buf.len() {
-                        inner_tx_buf[..ETH_HLEN].copy_from_slice(&inner_eth_hdr.bytes);
-                        inner_tx_buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
-                        if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
-                            if mbuf.write_packet(&inner_tx_buf[..frame_len]).is_ok() {
-                                tx_mbufs.push(mbuf.into_raw());
-                                inner_tx += 1;
-                            }
+        {
+            let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
+            for datagram in &drive_result.datagrams {
+                // Build Ethernet frame: pre-computed header + IP packet.
+                let frame_len = ETH_HLEN + datagram.len();
+                if frame_len <= inner_tx_buf.len() {
+                    inner_tx_buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                    inner_tx_buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
+                    if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                        if mbuf.write_packet(&inner_tx_buf[..frame_len]).is_ok() {
+                            tx_mbufs.push(mbuf.into_raw());
+                            inner_tx += 1;
                         }
                     }
                 }
-                if !tx_mbufs.is_empty() {
-                    let nb = tx_mbufs.len() as u16;
-                    let sent = port::tx_burst(*inner_port_id, 0, &mut tx_mbufs, nb);
-                    for raw in &tx_mbufs[sent as usize..] {
-                        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
-                    }
+            }
+            if !tx_mbufs.is_empty() {
+                let nb = tx_mbufs.len() as u16;
+                let sent = port::tx_burst(inner.port_id, 0, &mut tx_mbufs, nb);
+                for raw in &tx_mbufs[sent as usize..] {
+                    unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
                 }
             }
         }

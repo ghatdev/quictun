@@ -126,11 +126,9 @@ fn run_dpdk(
     dpdk_eal_args: String,
     dpdk_port: u16,
 ) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
     // Validate mode.
-    if dpdk_mode != "tun" && dpdk_mode != "xdp" && dpdk_mode != "tap" {
-        anyhow::bail!("--dpdk mode must be 'tun', 'xdp', or 'tap', got '{dpdk_mode}'");
+    if dpdk_mode != "tap" && dpdk_mode != "xdp" {
+        anyhow::bail!("--dpdk mode must be 'tap' or 'xdp', got '{dpdk_mode}'");
     }
 
     tracing_subscriber::fmt()
@@ -195,22 +193,9 @@ fn run_dpdk(
         "starting quictun (DPDK)"
     );
 
-    // Build tunnel network config (used by both modes, cheap).
     let tunnel_ip = addr.addr();
     let tunnel_prefix = addr.prefix_len();
     let tunnel_mtu = config.mtu();
-
-    // TUN mode: create TUN device. XDP/TAP modes: skip TUN, use DPDK inner port.
-    let tun_device = if dpdk_mode == "tun" {
-        let mut tun_opts = TunOptions::new(tunnel_ip, tunnel_prefix, tunnel_mtu);
-        tun_opts.name = Some(iface_name.clone());
-        let dev = quictun_tun::create_sync(&tun_opts)
-            .context("failed to create sync TUN device")?;
-        Some(dev)
-    } else {
-        None
-    };
-    let tun_fd = tun_device.as_ref().map(|d| d.as_raw_fd());
 
     // Write PID file.
     state::write_pid_file(&iface_name)?;
@@ -257,11 +242,7 @@ fn run_dpdk(
         tunnel_iface: iface_name,
     };
 
-    // tun_device must outlive the event loop (owns the fd).
-    let result = quictun_dpdk::event_loop::run(tun_fd, local_addr, setup, dpdk_config);
-
-    drop(tun_device);
-    result
+    quictun_dpdk::event_loop::run(local_addr, setup, dpdk_config)
 }
 
 /// Parse a MAC address string like "bc:24:11:ab:cd:ef" into [u8; 6].

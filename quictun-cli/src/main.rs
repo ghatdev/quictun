@@ -68,8 +68,8 @@ enum Command {
         /// Pin min_mtu = initial_mtu and disable DPLPMTUD (use when path MTU is known)
         #[arg(long)]
         pin_mtu: bool,
-        /// Use DPDK kernel-bypass data plane. MODE: tun (default), xdp, or tap
-        #[arg(long, value_name = "MODE", default_missing_value = "tun", num_args = 0..=1)]
+        /// Use DPDK kernel-bypass data plane. MODE: tap (default) or xdp
+        #[arg(long, value_name = "MODE", default_missing_value = "tap", num_args = 0..=1)]
         dpdk: Option<String>,
         /// IP address for the DPDK port (e.g., 192.168.100.10)
         #[arg(long)]

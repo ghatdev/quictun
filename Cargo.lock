@@ -1116,7 +1116,6 @@ dependencies = [
  "bindgen 0.71.1",
  "bytes",
  "cc",
- "crossbeam-channel",
  "libc",
  "pkg-config",
  "quictun-core",

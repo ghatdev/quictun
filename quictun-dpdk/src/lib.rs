@@ -13,8 +13,6 @@ mod shared;
 #[cfg(target_os = "linux")]
 mod engine;
 #[cfg(target_os = "linux")]
-mod reader;
-#[cfg(target_os = "linux")]
 mod veth;
 #[cfg(target_os = "linux")]
 pub mod quic;
