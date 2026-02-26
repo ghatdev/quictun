@@ -1,19 +1,32 @@
 # quictun-dpdk: DPDK Kernel-Bypass Data Plane
 
-DPDK-based data plane for quictun that bypasses the kernel network stack entirely for network I/O using DPDK PMD (Poll Mode Driver).
+DPDK-based data plane for quictun that bypasses the kernel network stack using DPDK PMD (Poll Mode Driver).
 
-## Architecture
+## Current Architecture (v1 — TUN + DPDK)
+
+The initial implementation bypasses the kernel on the network (outer) side only.
+The application (inner) side still uses a kernel TUN device.
 
 ```
-TUN (kernel) <--> reader thread <--> [channel] <--> DPDK engine thread
-                                                       |
-                                                   quinn-proto
-                                                       |
-                                                 Eth/IP/UDP headers
-                                                       |
-                                                 DPDK PMD (virtio-net)
-                                                       |
-                                                      NIC
+App (iperf3)
+    | kernel routing
+    v
+TUN device (kernel)          <-- still 2 syscalls + 2 kernel copies per packet
+    | read() syscall
+    v
+reader thread (userspace)
+    | crossbeam channel
+    v
+DPDK engine thread
+    | quinn-proto
+    v
+Eth/IP/UDP headers (net.rs)
+    |
+    v
+DPDK PMD (virtio-net)        <-- kernel-bypass
+    |
+    v
+NIC
 ```
 
 - **Network side**: DPDK PMD replaces kernel UDP socket (zero kernel involvement)
@@ -21,12 +34,122 @@ TUN (kernel) <--> reader thread <--> [channel] <--> DPDK engine thread
 - **QUIC**: quinn-proto state machine driven directly (same as quictun-uring)
 - **Userland stack**: Manual Eth/IPv4/UDP header parsing and building, ARP
 
-## Benchmark Results
+### v1 Bottleneck
+
+The TUN device is now the primary bottleneck. Each packet crosses the user/kernel
+boundary twice (read + write). Kernel WireGuard doesn't pay this cost because it
+runs entirely in kernel space.
+
+## Target Architecture (v2 — Full Kernel Bypass)
+
+Inspired by [Demikernel](https://github.com/microsoft/demikernel)'s LibOS architecture:
+a thin, purpose-built userspace data plane with **zero kernel involvement** in the
+packet path. Both inner and outer interfaces managed by DPDK.
+
+```
+                        Single DPDK polling loop
+                        +-----------------------+
+ Apps (iperf3, etc.)    |                       |    Network
+         |              |    quinn-proto        |        |
+         v              |    +-----------+      |        v
+   +-----------+        |    | encrypt   |      |   +----------+
+   | virtio-   |<------>|    | decrypt   |      |<->| DPDK PMD |
+   | user      |        |    +-----------+      |   | (NIC)    |
+   | (tap0)    |        |                       |   +----------+
+   +-----------+        |    net.rs             |    same mempool
+    shared mempool      |    (Eth/IP/UDP)       |    rx/tx_burst
+    rx/tx_burst         +-----------------------+
+```
+
+### How It Works
+
+- **Inner (app-facing)**: DPDK `virtio-user` device with `vhost-kernel` backend
+  (`/dev/vhost-net`). Creates a kernel-visible TAP interface (`tap0`) for routing,
+  but data transfer uses **vhost virtio rings in shared memory** — the kernel's
+  vhost-net kthread exchanges packets with DPDK via ring buffers, not syscalls.
+- **Outer (network-facing)**: DPDK PMD on the physical NIC (unchanged from v1).
+- **Shared mempool**: Both ports use the same mbuf pool — packets move between
+  inner and outer as pointer exchanges, not copies.
+- **Single polling loop**: One thread polls both ports. No reader thread, no
+  channels, no syscalls in the data path.
+
+### Why Not Demikernel Directly?
+
+[Demikernel](https://irenezhang.net/papers/demikernel-sosp21.pdf) (Microsoft Research)
+implements the same idea — a userspace LibOS with full TCP/IP/UDP stack on DPDK,
+no kernel networking at all. Its Catnip backend provides socket-like API directly
+on DPDK with zero kernel involvement.
+
+But Demikernel is too general-purpose for our needs:
+- Fixed API (`demi_socket`, `demi_pushto`) — requires apps to use its API or LD_PRELOAD
+- Full TCP/IP stack we don't need (we only need raw IP in/out + QUIC)
+- Large dependency with opinions about memory management, coroutines, etc.
+
+Instead, we build a **thin, purpose-built layer** with only what a VPN tunnel needs:
+- `virtio-user` for app-facing interface (standard routing, shared memory data path)
+- `net.rs` for outer-side Eth/IP/UDP (minimal, ~300 lines)
+- `quinn-proto` for QUIC (unchanged)
+- Single polling loop over both DPDK ports
+
+### v2 Engine Loop
+
+```
+loop {
+    // -- Inner: apps -> tunnel --
+    nb_tap = rx_burst(tap_port, inner_mbufs, 32)
+    for mbuf in inner_mbufs:
+        conn.datagrams().send(mbuf.data())          // raw IP -> QUIC datagram
+
+    // -- Outer: network -> tunnel --
+    nb_nic = rx_burst(nic_port, outer_mbufs, 32)
+    for mbuf in outer_mbufs:
+        parse_udp(mbuf) -> endpoint.handle()         // QUIC packet in
+        handle_arp(mbuf)                              // outer-side ARP
+
+    // -- QUIC state machine --
+    handle_timeout(now)
+    process_events()
+
+    // -- Inner TX: decrypted -> apps --
+    for datagram in datagrams:
+        write_into_mbuf(datagram) -> tx_burst(tap_port)
+
+    // -- Outer TX: encrypted -> network --
+    for transmit in drain_transmits():
+        build_udp_into_mbuf(transmit) -> tx_burst(nic_port)
+}
+```
+
+### What v2 Eliminates vs v1
+
+| Component | v1 (current) | v2 (target) |
+|-----------|-------------|-------------|
+| Reader thread | Yes (blocking TUN read) | No (rx_burst polling) |
+| Crossbeam channel | Yes (thread boundary) | No (single thread) |
+| TUN read() syscall | Yes (per packet) | No (shared memory rings) |
+| TUN write() syscall | Yes (per packet) | No (tx_burst to virtio-user) |
+| Kernel copies | 2 per packet (TUN r/w) | 0 (shared mempool) |
+| to_vec() allocation | Yes (reader thread) | No (mbufs stay in pool) |
+| pkt_buf intermediate | Yes (build then copy) | No (build directly in mbuf) |
+| Context switches | Per TUN read/write | None in data path |
+
+### v2 Copy Analysis (projected)
+
+| Direction | Path | Copies |
+|-----------|------|--------|
+| Incoming (NIC->app) | DMA -> mbuf -> BytesMut (QUIC) -> mbuf -> shared mem | 1 memcpy (BytesMut) |
+| Outgoing (app->NIC) | shared mem -> mbuf -> Bytes (QUIC) -> mbuf -> DMA | 1 memcpy (into mbuf) |
+| **Round-trip** | | **2 memcpies, 0 kernel copies** |
+
+Down from 4 memcpies + 2 kernel copies in v1. The remaining copies are
+in quinn-proto's API boundaries (BytesMut for input, Vec<u8> for output).
+
+## Benchmark Results (v1)
 
 | Backend | Throughput | vs Kernel WG | vs Raw Link |
 |---------|-----------|-------------|-------------|
-| Raw virtio-net (iperf) | 29.7 Gbps | — | 100% |
-| **DPDK tunnel** | **1.75 Gbps** | **101.7%** | 5.9% |
+| Raw virtio-net (iperf) | 29.7 Gbps | -- | 100% |
+| **DPDK tunnel (v1)** | **1.75 Gbps** | **101.7%** | 5.9% |
 | Kernel WireGuard | 1.72 Gbps | 100% (baseline) | 5.8% |
 | tokio parallel | 1.32 Gbps | 76.7% | 4.4% |
 | io_uring (1-core) | 820 Mbps | 47.7% | 2.8% |
@@ -51,24 +174,11 @@ quictun-dpdk/
     shared.rs       # QuicState, DriveResult, process_events
     quic.rs         # quinn-proto config builders
     engine.rs       # Main DPDK polling loop (3-phase)
-    reader.rs       # TUN reader thread (blocking read)
+    reader.rs       # TUN reader thread (blocking read)     [v1 only, removed in v2]
     event_loop.rs   # Thread spawning, ARP resolution, signal handling
   build.rs          # bindgen + cc + pkg-config
   Cargo.toml
 ```
-
-## Engine Loop (3-phase)
-
-```
-Phase 1a: rx_burst -> parse Eth/IP/UDP -> endpoint.handle() (batch)
-          Handle ARP requests -> learn peer MAC -> queue reply
-Phase 1b: drain TUN channel -> conn.datagrams().send() (batch)
-Phase 1c: check timer (Instant::now() vs deadline)
-Phase 2:  process_events() -> drain datagrams -> write to TUN
-Phase 3:  drain_transmits() -> build_udp_packet() into mbufs -> tx_burst
-```
-
-No io_uring, no eventfd, no timerfd -- pure polling.
 
 ## CLI Usage
 
@@ -90,9 +200,9 @@ sudo quictun up tunnel.toml \
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--dpdk` | Enable DPDK data plane | — |
-| `--dpdk-local-ip` | IP for DPDK port (required) | — |
-| `--dpdk-remote-ip` | Peer IP (required) | — |
+| `--dpdk` | Enable DPDK data plane | -- |
+| `--dpdk-local-ip` | IP for DPDK port (required) | -- |
+| `--dpdk-remote-ip` | Peer IP (required) | -- |
 | `--dpdk-local-port` | Override local UDP port | listen_port or 40000 |
 | `--dpdk-gateway-mac` | Static peer MAC (skip ARP) | ARP resolution |
 | `--dpdk-eal-args` | EAL args, semicolon-separated | `-l;0;-n;4` |
@@ -128,7 +238,7 @@ dpdk-devbind.py --status  # verify
 - `rte_eth_link` is a bindgen union: access via `link.__bindgen_anon_1.__bindgen_anon_1.link_speed`
 - quinn-proto 0.11 API: `endpoint.handle()` takes `local_ip: Option<IpAddr>` (pass None), `datagrams().send()` takes `drop: bool` (pass true)
 
-## Per-Packet Copy Analysis
+## Per-Packet Copy Analysis (v1)
 
 ### Incoming: NIC -> QUIC -> TUN
 
@@ -160,94 +270,73 @@ dpdk-devbind.py --status  # verify
 
 ## Optimization Roadmap
 
-### Tier 1 -- High Impact (2-4x improvement potential)
+### Priority 0 -- Full Kernel Bypass (v2 architecture)
+
+Replace TUN with DPDK virtio-user. This is the defining change — everything
+else is incremental optimization on top of this architecture.
+
+- **virtio-user with vhost-kernel**: `--vdev virtio_user0,path=/dev/vhost-net,queue_size=1024`
+- Creates kernel-visible TAP interface for routing
+- Data path uses shared memory virtio rings (no syscalls)
+- Eliminates reader thread, channel, TUN syscalls, kernel copies
+- Both inner and outer become rx_burst/tx_burst in one loop
+
+### Priority 1 -- High Impact (2-4x improvement potential)
 
 #### 1. Multi-Core DPDK Engine
-- Currently single-threaded: 1 core doing QUIC + rx/tx + TUN writes
+- Currently single-threaded: 1 core doing QUIC + rx/tx
 - Add multi-queue RSS + N engine threads (same pattern as quictun-uring multi-core)
 - io_uring already proved multi-core works (616 -> 1.32 Gbps at 4 cores)
 - Virtio-net supports multi-queue on Proxmox
 
-#### 2. Eliminate Outgoing Copies (3 -> 1)
-- **reader.rs**: Replace `to_vec()` with buffer pool (pre-allocated Vec slabs)
-- **build_udp_packet + write_packet**: Build headers directly into mbuf memory
-  - New `build_udp_into_mbuf()` that writes Eth/IP/UDP headers + payload in one pass
-  - Eliminates intermediate `pkt_buf` entirely
-- Cuts 2 memcpies per outgoing packet
+#### 2. Eliminate Remaining Copies
+- **Outgoing**: build Eth/IP/UDP headers directly into mbuf (skip pkt_buf)
+- **Incoming**: custom `Bytes` impl referencing mbuf data (skip BytesMut copy)
+- **Header template**: pre-compute 42-byte template, only update length + checksum
 
-#### 3. Batch TUN Operations
-- `writev()` for TUN writes (multiple datagrams in one syscall)
-- `readv()` or batched reads for TUN reader
-- Kernel TUN syscall overhead is now the dominant per-packet cost
+### Priority 2 -- Medium Impact (10-30% improvement)
 
-### Tier 2 -- Medium Impact (10-30% improvement)
-
-#### 4. Header Template Pre-computation
-- Src/dst MAC, src/dst IP, protocol fields never change per-connection
-- Pre-build a 42-byte template, only update per-packet: IP total_length, UDP length, IP checksum
-- Saves ~30 byte writes per packet
-
-#### 5. Adaptive Polling / Hybrid Interrupt Mode
+#### 3. Adaptive Polling / Hybrid Interrupt Mode
 - Pure busy-poll burns 100% CPU even when idle
-- Hybrid: poll N iterations -> if no packets, `usleep(1)` -> back to polling on wakeup
+- Hybrid: poll N iterations -> if no packets, brief pause -> back to polling
 - No throughput improvement at peak, but critical for production deployment
 - Options: `rte_power` API, manual yield, rx interrupt mode
 
-#### 6. Zero-Copy Incoming Path
-- `BytesMut::from(udp.payload)` copies QUIC data from mbuf
-- Keep mbuf alive and create custom `Bytes` referencing mbuf data directly
-- Tricky with quinn-proto ownership model but saves 1 copy per incoming packet
-
-### Tier 3 -- Correctness & Production Readiness
-
-#### 7. Unsafe Code Audit
-- Signal handler stores raw pointer (intentional leak, needs review)
-- Mbuf `from_raw()` / `into_raw()` ownership transfers
-- FFI boundary: null checks, return value checks
-- `libc::write/read` on TUN fd (unchecked return values in hot path)
-- Mbuf `Send` impl safety justification
-
-#### 8. UDP Stack Improvements
-- UDP checksum verification (currently trusting NIC offload; virtio-net may not do it)
-- ICMP port unreachable for unknown ports (nice-to-have)
-- IP identification field (currently 0, fine for DF-bit packets)
-- ECN passthrough from IP TOS field to quinn-proto
-- Note: current stack is sufficient for tunnel operation
-
-#### 9. Statistics & Monitoring
-- `rte_eth_stats_get()` for DPDK port stats
-- Per-second packet/byte/drop counters
-- Structured log output or prometheus-style metrics
-- Connection state reporting
-
-### Tier 4 -- Advanced / Experimental
-
-#### 10. DPDK Crypto PMD
-- Hardware AES-GCM acceleration via DPDK crypto device
-- Would require hooking into rustls/quinn-proto crypto layer
-- Very complex integration but could unlock wire-speed crypto
-
-#### 11. TUN Bypass (Full Userland)
-- Replace kernel TUN with TAP device managed by DPDK
-- Or use XDP/AF_XDP on the TUN side
-- Eliminates all kernel copies but requires routing changes
-
-#### 12. GSO/GRO Support
+#### 4. GSO/GRO Support
 - Generic Segmentation Offload: send large buffers, NIC segments
 - Would require quinn-proto `max_datagrams > 1` in `poll_transmit()`
 - Build multiple QUIC packets into one large Ethernet frame with segmentation
 
-## Implementation Priority
+### Priority 3 -- Correctness & Production Readiness
 
-Recommended order for maximum impact:
+#### 5. Unsafe Code Audit
+- Signal handler stores raw pointer (intentional leak, needs review)
+- Mbuf `from_raw()` / `into_raw()` ownership transfers
+- FFI boundary: null checks, return value checks
+- Mbuf `Send` impl safety justification
 
-```
-1. Multi-core DPDK engine        -- biggest single win, pattern exists in quictun-uring
-2. Eliminate outgoing copies      -- build directly into mbuf, remove pkt_buf
-3. Batch TUN operations           -- writev/readv, reduce syscall count
-4. Header template                -- quick win, ~30 fewer writes per packet
-5. Unsafe audit                   -- correctness before more features
-6. Adaptive polling               -- production readiness
-7. Zero-copy incoming             -- harder, custom Bytes impl needed
-8. Statistics                     -- observability
-```
+#### 6. UDP Stack Improvements
+- UDP checksum verification (currently trusting NIC offload; virtio-net may not do it)
+- ECN passthrough from IP TOS field to quinn-proto
+- ICMP port unreachable for unknown ports (nice-to-have)
+- Note: current stack is sufficient for tunnel operation
+
+#### 7. Statistics & Monitoring
+- `rte_eth_stats_get()` for DPDK port stats
+- Per-second packet/byte/drop counters
+- Structured log output or prometheus-style metrics
+
+### Priority 4 -- Advanced / Experimental
+
+#### 8. DPDK Crypto PMD
+- Hardware AES-GCM acceleration via DPDK crypto device
+- Would require hooking into rustls/quinn-proto crypto layer
+- Very complex integration but could unlock wire-speed crypto
+
+## References
+
+- [DPDK virtio-user as exception path](https://doc.dpdk.org/guides/howto/virtio_user_as_exception_path.html) -- TAP via shared memory
+- [DPDK vhost library](https://doc.dpdk.org/guides/prog_guide/vhost_lib.html) -- shared memory ring mechanism
+- [Demikernel: LibOS for Kernel-Bypass (SOSP'21)](https://irenezhang.net/papers/demikernel-sosp21.pdf) -- architectural inspiration
+- [microsoft/demikernel](https://github.com/microsoft/demikernel) -- Catnip (DPDK), Catnap (sockets), Catpowder (XDP)
+- [VIRTIO-USER: Versatile Channel for Kernel-Bypass](https://dl.acm.org/doi/10.1145/3098583.3098586) -- virtio-user design paper
