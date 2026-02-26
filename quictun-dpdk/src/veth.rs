@@ -53,6 +53,17 @@ impl VethPair {
         run_cmd("ip", &["addr", "add", &addr, "dev", &app_iface])
             .context("failed to assign IP to app_iface")?;
 
+        // Disable checksum offloading on both ends.
+        // AF_XDP passes raw Ethernet frames between user-space and the veth pair.
+        // With TX checksum offloading enabled, the kernel writes partial checksums
+        // that expect hardware completion — but AF_XDP delivers frames raw, so the
+        // remote kernel sees invalid checksums and silently drops TCP/UDP packets.
+        for iface in [&app_iface, &xdp_iface] {
+            let _ = Command::new("ethtool")
+                .args(["-K", iface, "tx", "off", "rx", "off", "gso", "off", "gro", "off"])
+                .output();
+        }
+
         // Bring both ends up.
         run_cmd("ip", &["link", "set", &app_iface, "up"])
             .context("failed to bring app_iface up")?;

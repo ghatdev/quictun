@@ -215,6 +215,54 @@ pub fn run(
         }
 
         // ── Phase 1b: Read from inner interface → send_datagram ──
+        //
+        // For AF_XDP: rx_burst first (handles ARP regardless of connection state),
+        // then send IP packets via QUIC if connection exists.
+
+        // Collect IP packets from AF_XDP inner port (before connection check).
+        let mut inner_ip_pkts: Vec<Bytes> = Vec::new();
+
+        if let InnerInterface::AfXdp { inner_port_id, inner_eth_hdr } = &inner {
+            let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+                [std::ptr::null_mut(); BURST_SIZE];
+            let nb = port::rx_burst(*inner_port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
+            for i in 0..nb as usize {
+                let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
+                let data = mbuf.data();
+                if data.len() < ETH_HLEN {
+                    continue;
+                }
+                let ethertype = u16::from_be_bytes([data[12], data[13]]);
+                match ethertype {
+                    0x0800 => {
+                        // IPv4: strip Ethernet header, buffer for QUIC send.
+                        inner_ip_pkts.push(Bytes::copy_from_slice(&data[ETH_HLEN..]));
+                    }
+                    0x0806 => {
+                        // ARP: reply to requests with our inner port MAC.
+                        // The kernel ARPs for remote tunnel IPs on the veth.
+                        if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
+                            if arp.is_request {
+                                let inner_mac: [u8; 6] = inner_eth_hdr.bytes[6..12].try_into().unwrap();
+                                let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
+                                if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
+                                    if reply_mbuf.write_packet(&reply).is_ok() {
+                                        let raw = reply_mbuf.into_raw();
+                                        let mut tx = [raw];
+                                        let sent = port::tx_burst(*inner_port_id, 0, &mut tx, 1);
+                                        if sent == 0 {
+                                            unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // mbuf freed on drop
+            }
+        }
 
         if let Some(conn) = state.connection.as_mut() {
             match &inner {
@@ -226,22 +274,12 @@ pub fn run(
                         }
                     }
                 }
-                InnerInterface::AfXdp { inner_port_id, .. } => {
-                    let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-                        [std::ptr::null_mut(); BURST_SIZE];
-                    let nb = port::rx_burst(*inner_port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
-                    for i in 0..nb as usize {
-                        let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
-                        let data = mbuf.data();
-                        // Strip Ethernet header to get raw IP packet.
-                        if data.len() > ETH_HLEN {
-                            inner_rx += 1;
-                            let ip_pkt = &data[ETH_HLEN..];
-                            if let Err(e) = conn.datagrams().send(Bytes::copy_from_slice(ip_pkt), true) {
-                                tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
-                            }
+                InnerInterface::AfXdp { .. } => {
+                    for pkt in inner_ip_pkts.drain(..) {
+                        inner_rx += 1;
+                        if let Err(e) = conn.datagrams().send(pkt, true) {
+                            tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
                         }
-                        // mbuf freed on drop
                     }
                 }
             }

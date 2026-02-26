@@ -63,6 +63,12 @@ fn dpdk_build() {
         cc_build.include(path);
     }
     cc_build.compile("dpdk_shim");
+
+    // librte_bus_vdev is not included in pkg-config --libs libdpdk by default,
+    // but we need it for rte_vdev_init/uninit (AF_XDP PMD creation).
+    println!("cargo:rustc-link-lib=rte_bus_vdev");
+    // librte_net_af_xdp must be linked so the PMD is registered at EAL init.
+    println!("cargo:rustc-link-lib=rte_net_af_xdp");
 }
 
 fn main() {
