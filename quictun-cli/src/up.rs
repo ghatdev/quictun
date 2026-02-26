@@ -40,6 +40,8 @@ pub fn run(
     dpdk_gateway_mac: Option<String>,
     dpdk_eal_args: String,
     dpdk_port: u16,
+    no_adaptive_poll: bool,
+    dpdk_cores: usize,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -59,6 +61,8 @@ pub fn run(
             dpdk_gateway_mac,
             dpdk_eal_args,
             dpdk_port,
+            no_adaptive_poll,
+            dpdk_cores,
         );
     }
 
@@ -106,6 +110,8 @@ fn run_dpdk(
     _dpdk_gateway_mac: Option<String>,
     _dpdk_eal_args: String,
     _dpdk_port: u16,
+    _no_adaptive_poll: bool,
+    _dpdk_cores: usize,
 ) -> Result<()> {
     bail!("--dpdk requires Linux");
 }
@@ -125,6 +131,8 @@ fn run_dpdk(
     dpdk_gateway_mac: Option<String>,
     dpdk_eal_args: String,
     dpdk_port: u16,
+    no_adaptive_poll: bool,
+    dpdk_cores: usize,
 ) -> Result<()> {
     // Validate mode.
     if dpdk_mode != "tap" && dpdk_mode != "xdp" {
@@ -240,6 +248,8 @@ fn run_dpdk(
         tunnel_prefix,
         tunnel_mtu,
         tunnel_iface: iface_name,
+        adaptive_poll: !no_adaptive_poll,
+        n_cores: dpdk_cores,
     };
 
     quictun_dpdk::event_loop::run(local_addr, setup, dpdk_config)

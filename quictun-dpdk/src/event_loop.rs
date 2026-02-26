@@ -50,6 +50,11 @@ pub struct DpdkConfig {
     pub tunnel_mtu: u16,
     /// Tunnel interface name (e.g., "quictun0").
     pub tunnel_iface: String,
+    /// Enable adaptive polling (exponential backoff on empty polls).
+    /// Default: true. Disable with --no-adaptive-poll for benchmarking.
+    pub adaptive_poll: bool,
+    /// Number of engine cores (1 = single-threaded, N = multi-queue RSS).
+    pub n_cores: usize,
 }
 
 /// Run the DPDK data plane.
@@ -66,13 +71,19 @@ pub fn run(
 ) -> Result<()> {
     // ── 1. Initialize DPDK EAL ───────────────────────────────────
 
-    // For TAP mode, inject the TAP vdev into EAL args before init.
+    // For TAP mode, inject TAP vdev(s) into EAL args before init.
+    // Multi-core: N TAP PMDs (quictun0, quictun1, ...).
+    let n_cores = dpdk_config.n_cores.max(1);
     let mut eal_args = dpdk_config.eal_args.clone();
     if dpdk_config.mode == "tap" {
-        eal_args.push(format!(
-            "--vdev=net_tap0,iface={}",
-            dpdk_config.tunnel_iface
-        ));
+        for i in 0..n_cores {
+            let iface = if n_cores == 1 {
+                dpdk_config.tunnel_iface.clone()
+            } else {
+                format!("{}{i}", dpdk_config.tunnel_iface)
+            };
+            eal_args.push(format!("--vdev=net_tap{i},iface={iface}"));
+        }
     }
 
     let _eal = Eal::init(&eal_args)?;
@@ -82,7 +93,11 @@ pub fn run(
     let mempool =
         mbuf::create_mempool("quictun_dpdk", ffi::DEFAULT_NUM_MBUFS, ffi::MEMPOOL_CACHE_SIZE)?;
 
-    let local_mac = port::configure_port(dpdk_config.port_id, mempool)?;
+    let local_mac = if n_cores > 1 {
+        port::configure_port_multiqueue(dpdk_config.port_id, n_cores as u16, mempool)?
+    } else {
+        port::configure_port(dpdk_config.port_id, mempool)?
+    };
 
     // ── 3. Build network identity ────────────────────────────────
 
@@ -183,42 +198,70 @@ pub fn run(
     // Holds veth pair ownership for AF_XDP mode (dropped on cleanup).
     let mut _veth_pair: Option<VethPair> = None;
 
-    let inner = if dpdk_config.mode == "tap" {
-        // TAP PMD mode: DPDK created the TAP device via --vdev in EAL args.
-        let total_ports = unsafe { ffi::rte_eth_dev_count_avail() };
-        if total_ports < 2 {
-            bail!("TAP vdev not found: only {total_ports} port(s) available (expected ≥ 2)");
-        }
-        let inner_port_id = total_ports as u16 - 1;
+    let mut inner_ports: Vec<InnerPort> = Vec::with_capacity(n_cores);
 
-        let tap_mac = port::configure_port(inner_port_id, mempool)?;
+    if dpdk_config.mode == "tap" {
+        // TAP PMD mode: DPDK created TAP device(s) via --vdev in EAL args.
+        // SAFETY: EAL is initialized; returns the count of available DPDK ports.
+        let total_ports = unsafe { ffi::rte_eth_dev_count_avail() } as u16;
+        let expected = 1 + n_cores as u16; // outer + N TAPs
+        if total_ports < expected {
+            bail!(
+                "TAP vdev not found: only {total_ports} port(s) available (expected ≥ {expected})"
+            );
+        }
 
         // Fabricate a locally-administered peer MAC for ARP replies.
-        // The kernel uses tap_mac for the TAP interface; the engine
-        // presents itself as peer_mac when replying to ARP.
         let peer_mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
-        tracing::info!(
-            inner_port = inner_port_id,
-            tap_mac = %format_mac(&tap_mac),
-            peer_mac = %format_mac(&peer_mac),
-            iface = %dpdk_config.tunnel_iface,
-            "TAP PMD inner port configured"
-        );
+        for i in 0..n_cores {
+            let inner_port_id = (total_ports - n_cores as u16) + i as u16;
+            let tap_mac = port::configure_port(inner_port_id, mempool)?;
 
-        configure_tap_interface(
-            &dpdk_config.tunnel_iface,
-            dpdk_config.tunnel_ip,
-            dpdk_config.tunnel_prefix,
-            dpdk_config.tunnel_mtu,
-        )?;
+            let iface = if n_cores == 1 {
+                dpdk_config.tunnel_iface.clone()
+            } else {
+                format!("{}{i}", dpdk_config.tunnel_iface)
+            };
 
-        let eth_hdr = InnerEthHeader::new(peer_mac, tap_mac);
-        tracing::info!("inner interface: TAP PMD");
+            tracing::info!(
+                inner_port = inner_port_id,
+                tap_mac = %format_mac(&tap_mac),
+                iface = %iface,
+                "TAP PMD inner port configured"
+            );
 
-        InnerPort { port_id: inner_port_id, eth_hdr }
+            // Each TAP gets its own tunnel IP for multi-core.
+            // Core 0 gets the base IP; additional cores get base+i.
+            let tunnel_ip = if n_cores == 1 {
+                dpdk_config.tunnel_ip
+            } else {
+                let octets = dpdk_config.tunnel_ip.octets();
+                Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3].wrapping_add(i as u8))
+            };
+
+            configure_tap_interface(
+                &iface,
+                tunnel_ip,
+                dpdk_config.tunnel_prefix,
+                dpdk_config.tunnel_mtu,
+            )?;
+
+            let eth_hdr = InnerEthHeader::new(peer_mac, tap_mac);
+            inner_ports.push(InnerPort {
+                port_id: inner_port_id,
+                eth_hdr,
+            });
+        }
+
+        tracing::info!(n_cores, "inner interface: TAP PMD");
     } else {
         // AF_XDP mode: create veth pair, init DPDK AF_XDP PMD.
+        // Multi-core AF_XDP not supported yet — requires per-queue veth pairs.
+        if n_cores > 1 {
+            bail!("multi-core (--dpdk-cores > 1) is only supported with TAP PMD mode (--dpdk tap)");
+        }
+
         let veth = VethPair::create(
             &dpdk_config.tunnel_iface,
             dpdk_config.tunnel_ip,
@@ -226,24 +269,27 @@ pub fn run(
             dpdk_config.tunnel_mtu,
         )?;
 
-        let vdev_name = CString::new("net_af_xdp0")
-            .expect("CString::new failed");
-        let vdev_args = CString::new(format!("iface={}", veth.xdp_iface))
-            .expect("CString::new failed");
+        let vdev_name = CString::new("net_af_xdp0").expect("CString::new failed");
+        let vdev_args =
+            CString::new(format!("iface={}", veth.xdp_iface)).expect("CString::new failed");
 
-        let ret = unsafe {
-            ffi::rte_vdev_init(vdev_name.as_ptr(), vdev_args.as_ptr())
-        };
+        // SAFETY: vdev_name and vdev_args are valid CStrings; EAL is initialized.
+        let ret = unsafe { ffi::rte_vdev_init(vdev_name.as_ptr(), vdev_args.as_ptr()) };
         if ret != 0 {
-            bail!("rte_vdev_init(net_af_xdp0, iface={}) failed: error {ret}", veth.xdp_iface);
+            bail!(
+                "rte_vdev_init(net_af_xdp0, iface={}) failed: error {ret}",
+                veth.xdp_iface
+            );
         }
 
+        // SAFETY: EAL is initialized and vdev was just created.
         let total_ports = unsafe { ffi::rte_eth_dev_count_avail() };
         if total_ports < 2 {
-            bail!("AF_XDP vdev created but only {total_ports} port(s) available (expected ≥ 2)");
+            bail!(
+                "AF_XDP vdev created but only {total_ports} port(s) available (expected ≥ 2)"
+            );
         }
         let inner_port_id = total_ports as u16 - 1;
-
         let inner_mac = port::configure_port(inner_port_id, mempool)?;
 
         tracing::info!(
@@ -257,32 +303,155 @@ pub fn run(
         _veth_pair = Some(veth);
         tracing::info!("inner interface: AF_XDP (veth pair)");
 
-        InnerPort { port_id: inner_port_id, eth_hdr }
+        inner_ports.push(InnerPort {
+            port_id: inner_port_id,
+            eth_hdr,
+        });
     };
 
     // ── 7. Set up SIGINT handler ─────────────────────────────────
 
     let sig_shutdown = shutdown.clone();
+    // SAFETY: sigint_handler is an extern "C" fn with correct signature for signal().
+    // We intentionally leak the Arc via into_raw to make it accessible from the
+    // async-signal-safe handler. The handler only performs an atomic store, which is
+    // async-signal-safe. The leaked Arc is never freed (acceptable: one-time setup).
     unsafe {
         libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
     }
-    // Store the shutdown flag for the signal handler.
     SHUTDOWN_FLAG.store(
         Arc::into_raw(sig_shutdown) as usize,
         Ordering::Release,
     );
 
-    // ── 8. Run engine ────────────────────────────────────────────
+    // ── 8. Run engine(s) ──────────────────────────────────────────
 
-    let result = engine::run(
-        dpdk_config.port_id,
-        mempool,
-        &mut quic_state,
-        &mut identity,
-        &mut arp_table,
-        inner,
-        shutdown.clone(),
-    );
+    let result = if n_cores == 1 {
+        // Single-core: run directly on this thread.
+        let inner = inner_ports.into_iter().next().expect("exactly 1 inner port");
+        engine::run(
+            dpdk_config.port_id,
+            0, // queue_id
+            mempool,
+            &mut quic_state,
+            &mut identity,
+            &mut arp_table,
+            inner,
+            shutdown.clone(),
+            dpdk_config.adaptive_poll,
+        )
+    } else {
+        // Multi-core: N engine threads, each with own QUIC state + inner port.
+        // Each thread uses outer queue i and its own TAP PMD inner port.
+        // Connector: core i connects to remote port + i.
+        // Listener: core i listens on local_port + i.
+
+        let outer_port_id = dpdk_config.port_id;
+        let adaptive_poll = dpdk_config.adaptive_poll;
+        let base_local_port = local_port;
+
+        // Extract setup info for cloning into threads.
+        let remote_addr_base = quic_remote_addr;
+        let server_config_arc = server_config;
+        let saved_setup_is_connector = is_connector;
+
+        // We need the client config for multi-core connectors.
+        // Unfortunately setup was already consumed above for the single quic_state.
+        // For multi-core, we don't use the pre-built quic_state — each thread builds its own.
+        // The pre-built quic_state/setup was consumed, so for multi-core connector
+        // we need the client_config to have been saved. This requires a small refactor:
+        // we bail if multi-core + connector since we consumed the setup.
+        // Actually, the `setup` was moved into `quic_state` already. For multi-core,
+        // we need to rebuild QUIC state per-thread. The client_config was moved.
+        //
+        // Simplification: for now, multi-core only works for listener mode.
+        // TODO: support multi-core connector by cloning client configs.
+        if saved_setup_is_connector {
+            bail!("multi-core (--dpdk-cores > 1) is currently only supported for listener mode");
+        }
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_cores);
+
+            for (core_idx, inner) in inner_ports.into_iter().enumerate() {
+                let shutdown = shutdown.clone();
+                let server_config = server_config_arc.clone();
+                let core_local_port = base_local_port + core_idx as u16;
+
+                let core_remote_addr = SocketAddr::new(
+                    remote_addr_base.ip(),
+                    remote_addr_base.port() + core_idx as u16,
+                );
+
+                handles.push(s.spawn(move || -> Result<()> {
+                    // Pin thread to CPU core_idx.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                        unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
+                        let ret = unsafe {
+                            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
+                        };
+                        if ret == 0 {
+                            tracing::info!(core = core_idx, "pinned engine thread to CPU");
+                        } else {
+                            tracing::warn!(core = core_idx, "failed to pin thread to CPU");
+                        }
+                    }
+
+                    let mut core_identity = NetIdentity {
+                        local_mac,
+                        remote_mac: identity.remote_mac,
+                        local_ip: dpdk_config.local_ip,
+                        remote_ip: dpdk_config.remote_ip,
+                        local_port: core_local_port,
+                        remote_port: 0, // learned from first packet
+                    };
+
+                    let mut core_arp_table = ArpTable::new();
+                    if let Some(mac) = dpdk_config.gateway_mac {
+                        core_arp_table.insert(dpdk_config.remote_ip, mac);
+                    }
+                    // Copy learned MAC.
+                    if let Some(mac) = identity.remote_mac {
+                        core_arp_table.insert(dpdk_config.remote_ip, mac);
+                    }
+
+                    let mut core_quic_state = QuicState::new(core_remote_addr, server_config);
+
+                    tracing::info!(
+                        core = core_idx,
+                        queue = core_idx,
+                        local_port = core_local_port,
+                        "engine thread starting"
+                    );
+
+                    engine::run(
+                        outer_port_id,
+                        core_idx as u16,
+                        mempool,
+                        &mut core_quic_state,
+                        &mut core_identity,
+                        &mut core_arp_table,
+                        inner,
+                        shutdown,
+                        adaptive_poll,
+                    )
+                }));
+            }
+
+            // Wait for all threads. Return first error if any.
+            let mut result: Result<()> = Ok(());
+            for handle in handles {
+                if let Err(e) = handle.join().expect("engine thread panicked") {
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+            result
+        })
+    };
 
     // ── 9. Cleanup ───────────────────────────────────────────────
 
@@ -362,6 +531,7 @@ fn resolve_arp(
         let mut tx = [raw];
         let sent = port::tx_burst(port_id, 0, &mut tx, 1);
         if sent == 0 {
+            // SAFETY: tx_burst didn't send; we still own this mbuf.
             unsafe { ffi::shim_rte_pktmbuf_free(raw) };
         }
         attempt += 1;
@@ -372,6 +542,7 @@ fn resolve_arp(
             let mut rx_mbufs: [*mut ffi::rte_mbuf; 32] = [std::ptr::null_mut(); 32];
             let nb_rx = port::rx_burst(port_id, 0, &mut rx_mbufs, 32);
             for i in 0..nb_rx as usize {
+                // SAFETY: rx_burst wrote a valid mbuf pointer; exclusive ownership taken.
                 let mbuf = unsafe { crate::mbuf::Mbuf::from_raw(rx_mbufs[i]) };
                 if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(mbuf.data()) {
                     arp_table.learn(arp.sender_ip, arp.sender_mac);
@@ -402,8 +573,9 @@ static SHUTDOWN_FLAG: std::sync::atomic::AtomicUsize =
 extern "C" fn sigint_handler(_sig: libc::c_int) {
     let ptr = SHUTDOWN_FLAG.load(Ordering::Acquire);
     if ptr != 0 {
-        // Safety: we stored an Arc<AtomicBool> raw pointer in `run()`.
-        // We don't free it here (intentional leak to keep signal handler safe).
+        // SAFETY: ptr was stored via Arc::into_raw in run(), so it points to a valid
+        // AtomicBool. We only read/store atomically (async-signal-safe). The Arc is
+        // intentionally leaked so this pointer remains valid for the process lifetime.
         let flag = unsafe { &*(ptr as *const AtomicBool) };
         flag.store(true, Ordering::Release);
     }

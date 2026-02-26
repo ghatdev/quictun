@@ -89,6 +89,12 @@ enum Command {
         /// DPDK port ID (default: 0)
         #[arg(long, default_value = "0")]
         dpdk_port: u16,
+        /// Disable adaptive polling (keep pure busy-poll for benchmarking)
+        #[arg(long)]
+        no_adaptive_poll: bool,
+        /// Number of DPDK engine cores (default: 1, multi-queue RSS for N > 1)
+        #[arg(long, default_value = "1")]
+        dpdk_cores: usize,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -126,11 +132,13 @@ fn main() -> anyhow::Result<()> {
             dpdk_gateway_mac,
             dpdk_eal_args,
             dpdk_port,
+            no_adaptive_poll,
+            dpdk_cores,
         } => up::run(
             &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
             sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
             dpdk, dpdk_local_ip, dpdk_remote_ip, dpdk_local_port, dpdk_gateway_mac,
-            dpdk_eal_args, dpdk_port,
+            dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores,
         ),
         Command::Down { config } => down::run(&config),
     }

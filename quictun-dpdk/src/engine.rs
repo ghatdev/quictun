@@ -15,6 +15,10 @@ use crate::shared::{self, DriveResult, QuicState, BUF_SIZE};
 /// Maximum burst size for rx/tx.
 const BURST_SIZE: usize = 32;
 
+/// Maximum number of GSO segments per poll_transmit call.
+/// quinn-proto will pack up to this many QUIC packets into one transmit buffer.
+const MAX_GSO_SEGMENTS: usize = 10;
+
 /// Ethernet header size (dst MAC + src MAC + EtherType).
 const ETH_HLEN: usize = 14;
 
@@ -49,24 +53,34 @@ pub struct InnerPort {
     pub eth_hdr: InnerEthHeader,
 }
 
+/// Number of consecutive empty polls before entering backoff sleep.
+const EMPTY_POLL_THRESHOLD: u32 = 1024;
+/// Minimum sleep duration in microseconds during adaptive backoff.
+const MIN_DELAY_US: u32 = 1;
+/// Maximum sleep duration in microseconds during adaptive backoff.
+const MAX_DELAY_US: u32 = 100;
+
 /// Run the DPDK polling engine.
 ///
 /// This is the hot loop: RX burst → QUIC → inner write → drain transmits → TX burst.
 /// No syscalls for network I/O (pure DPDK PMD polling).
 pub fn run(
     outer_port_id: u16,
+    queue_id: u16,
     mempool: *mut ffi::rte_mempool,
     state: &mut QuicState,
     identity: &mut NetIdentity,
     arp_table: &mut ArpTable,
     inner: InnerPort,
     shutdown: Arc<AtomicBool>,
+    adaptive_poll: bool,
 ) -> Result<()> {
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut drive_result = DriveResult::new();
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut pkt_buf = [0u8; 2048];
     let mut deadline = Instant::now() + Duration::from_secs(1);
+    let mut ip_id: u16 = 0;
 
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
@@ -80,22 +94,24 @@ pub fn run(
     let mut inner_tx: u64 = 0;
     let mut last_stats = Instant::now();
 
+    // Adaptive polling state.
+    let mut empty_polls: u32 = 0;
+    let mut delay_us: u32 = MIN_DELAY_US;
+
     // If connector, drain initial handshake transmits.
     drain_and_send(
         state,
         outer_port_id,
+        queue_id,
         mempool,
         identity,
         arp_table,
         &mut transmit_buf,
-        &mut pkt_buf,
         &mut tx_pkts,
+        &mut ip_id,
     )?;
 
     tracing::info!("DPDK engine started (polling loop)");
-
-    // Scratch buffer for inner TX (Ethernet header + IP packet).
-    let mut inner_tx_buf = [0u8; ETH_HLEN + 2048];
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -110,9 +126,11 @@ pub fn run(
         let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
 
-        let nb_rx = port::rx_burst(outer_port_id, 0, &mut rx_mbufs, BURST_SIZE as u16);
+        let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
 
         for i in 0..nb_rx as usize {
+            // SAFETY: rx_burst wrote a valid mbuf pointer into rx_mbufs[i]; we take
+            // exclusive ownership. The mbuf is freed on drop at end of this iteration.
             let mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
             let data = mbuf.data();
             rx_pkts += 1;
@@ -150,7 +168,7 @@ pub fn run(
                     if let Some(event) =
                         state
                             .endpoint
-                            .handle(now, remote_addr, None, None, quic_data, &mut response_buf)
+                            .handle(now, remote_addr, None, udp.ecn, quic_data, &mut response_buf)
                     {
                         let responses =
                             shared::handle_datagram_event(state, event, &mut response_buf);
@@ -162,6 +180,7 @@ pub fn run(
                                 .or_else(|| arp_table.lookup(identity.remote_ip))
                                 .unwrap_or([0xff; 6]);
 
+                            ip_id = ip_id.wrapping_add(1);
                             let frame_len = net::build_udp_packet(
                                 &identity.local_mac,
                                 &dst_mac,
@@ -171,6 +190,8 @@ pub fn run(
                                 identity.remote_port,
                                 &buf[..len],
                                 &mut pkt_buf,
+                                0, // no ECN for stateless responses
+                                ip_id,
                             );
                             pending_frames.push(pkt_buf[..frame_len].to_vec());
                         }
@@ -214,6 +235,7 @@ pub fn run(
         let mut inner_ip_count: usize = 0;
 
         for i in 0..nb as usize {
+            // SAFETY: inner rx_burst wrote a valid mbuf pointer; exclusive ownership taken.
             let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
             let data = mbuf.data();
             if data.len() < ETH_HLEN {
@@ -244,6 +266,7 @@ pub fn run(
                                     let mut tx = [raw];
                                     let sent = port::tx_burst(inner.port_id, 0, &mut tx, 1);
                                     if sent == 0 {
+                                        // SAFETY: tx_burst didn't send; we still own this mbuf.
                                         unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                                     }
                                 }
@@ -272,16 +295,14 @@ pub fn run(
         {
             let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
             for datagram in &drive_result.datagrams {
-                // Build Ethernet frame: pre-computed header + IP packet.
+                // Build Ethernet frame directly into mbuf (zero-copy).
                 let frame_len = ETH_HLEN + datagram.len();
-                if frame_len <= inner_tx_buf.len() {
-                    inner_tx_buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                    inner_tx_buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
-                    if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
-                        if mbuf.write_packet(&inner_tx_buf[..frame_len]).is_ok() {
-                            tx_mbufs.push(mbuf.into_raw());
-                            inner_tx += 1;
-                        }
+                if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                    if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                        buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                        buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
+                        tx_mbufs.push(mbuf.into_raw());
+                        inner_tx += 1;
                     }
                 }
             }
@@ -289,6 +310,7 @@ pub fn run(
                 let nb = tx_mbufs.len() as u16;
                 let sent = port::tx_burst(inner.port_id, 0, &mut tx_mbufs, nb);
                 for raw in &tx_mbufs[sent as usize..] {
+                    // SAFETY: unsent mbufs are still owned by us.
                     unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
                 }
             }
@@ -307,16 +329,17 @@ pub fn run(
         drain_and_send(
             state,
             outer_port_id,
+            queue_id,
             mempool,
             identity,
             arp_table,
             &mut transmit_buf,
-            &mut pkt_buf,
             &mut tx_pkts,
+            &mut ip_id,
         )?;
 
         // Send pending raw frames (ARP replies, stateless QUIC responses).
-        send_raw_frames(outer_port_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+        send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
 
         // ── Update timer deadline ────────────────────────────────────
 
@@ -340,6 +363,20 @@ pub fn run(
             );
             last_stats = now;
         }
+
+        // ── Adaptive polling: backoff on empty polls ──────────────────
+        if adaptive_poll {
+            if nb_rx == 0 && nb == 0 {
+                empty_polls += 1;
+                if empty_polls > EMPTY_POLL_THRESHOLD {
+                    std::thread::sleep(Duration::from_micros(delay_us as u64));
+                    delay_us = delay_us.saturating_mul(2).min(MAX_DELAY_US);
+                }
+            } else {
+                empty_polls = 0;
+                delay_us = MIN_DELAY_US;
+            }
+        }
     }
 
     Ok(())
@@ -350,12 +387,13 @@ pub fn run(
 fn drain_and_send(
     state: &mut QuicState,
     outer_port_id: u16,
+    outer_queue_id: u16,
     mempool: *mut ffi::rte_mempool,
     identity: &NetIdentity,
     arp_table: &ArpTable,
     transmit_buf: &mut Vec<u8>,
-    pkt_buf: &mut [u8],
     tx_count: &mut u64,
+    ip_id: &mut u16,
 ) -> Result<()> {
     let Some(conn) = state.connection.as_mut() else {
         return Ok(());
@@ -371,11 +409,11 @@ fn drain_and_send(
 
     loop {
         transmit_buf.clear();
-        let Some(transmit) = conn.poll_transmit(now, 1, transmit_buf) else {
+        let Some(transmit) = conn.poll_transmit(now, MAX_GSO_SEGMENTS, transmit_buf) else {
             break;
         };
 
-        let payload = &transmit_buf[..transmit.size];
+        let data = &transmit_buf[..transmit.size];
 
         // Determine destination from transmit (uses state remote_addr by default).
         let dst_ip = match transmit.destination {
@@ -385,31 +423,45 @@ fn drain_and_send(
         let dst_port = transmit.destination.port();
         let actual_dst_mac = arp_table.lookup(dst_ip).unwrap_or(dst_mac);
 
-        // Build Eth/IP/UDP frame.
-        let frame_len = net::build_udp_packet(
-            &identity.local_mac,
-            &actual_dst_mac,
-            identity.local_ip,
-            dst_ip,
-            identity.local_port,
-            dst_port,
-            payload,
-            pkt_buf,
-        );
+        // Map quinn ECN codepoint to raw TOS bits.
+        let ecn_bits = transmit.ecn.map_or(0u8, |e| e as u8);
 
-        // Allocate mbuf and copy frame into it.
-        let mut mbuf = Mbuf::alloc(mempool)?;
-        mbuf.write_packet(&pkt_buf[..frame_len])?;
-        tx_mbufs.push(mbuf.into_raw());
+        // GSO: when segment_size is set, quinn packed multiple QUIC packets into
+        // one transmit buffer. Split them into individual Eth/IP/UDP frames.
+        let seg_size = transmit.segment_size.unwrap_or(data.len());
+
+        for chunk in data.chunks(seg_size) {
+            *ip_id = ip_id.wrapping_add(1);
+
+            let frame_len = net::HEADER_SIZE + chunk.len();
+
+            // Allocate mbuf and build frame directly into it (zero-copy).
+            let mut mbuf = Mbuf::alloc(mempool)?;
+            let buf = mbuf.alloc_space(frame_len as u16)?;
+            net::build_udp_packet(
+                &identity.local_mac,
+                &actual_dst_mac,
+                identity.local_ip,
+                dst_ip,
+                identity.local_port,
+                dst_port,
+                chunk,
+                buf,
+                ecn_bits,
+                *ip_id,
+            );
+            tx_mbufs.push(mbuf.into_raw());
+        }
     }
 
     if !tx_mbufs.is_empty() {
         let nb = tx_mbufs.len() as u16;
-        let sent = port::tx_burst(outer_port_id, 0, &mut tx_mbufs, nb);
+        let sent = port::tx_burst(outer_port_id, outer_queue_id, &mut tx_mbufs, nb);
         *tx_count += sent as u64;
 
         // Free any mbufs that tx_burst didn't consume.
         for raw in &tx_mbufs[sent as usize..] {
+            // SAFETY: tx_burst returned `sent`; mbufs at indices [sent..] were not consumed.
             unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
         }
     }
@@ -420,6 +472,7 @@ fn drain_and_send(
 /// Send pre-built raw Ethernet frames (ARP replies, stateless QUIC responses).
 fn send_raw_frames(
     outer_port_id: u16,
+    outer_queue_id: u16,
     mempool: *mut ffi::rte_mempool,
     frames: &mut Vec<Vec<u8>>,
     tx_count: &mut u64,
@@ -437,10 +490,11 @@ fn send_raw_frames(
     }
 
     let nb = tx_mbufs.len() as u16;
-    let sent = port::tx_burst(outer_port_id, 0, &mut tx_mbufs, nb);
+    let sent = port::tx_burst(outer_port_id, outer_queue_id, &mut tx_mbufs, nb);
     *tx_count += sent as u64;
 
     for raw in &tx_mbufs[sent as usize..] {
+        // SAFETY: unsent mbufs are still owned by us.
         unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
     }
 

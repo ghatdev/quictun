@@ -14,21 +14,25 @@ const DEFAULT_NB_DESC: u16 = 1024;
 pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u8; 6]> {
     // Get device info for default RX/TX conf.
     let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
+    // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
     let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, dev_info.as_mut_ptr()) };
     if ret != 0 {
         bail!("rte_eth_dev_info_get failed: {}", dpdk_strerror(-ret));
     }
+    // SAFETY: ret == 0 guarantees dev_info was fully initialized by DPDK.
     let dev_info = unsafe { dev_info.assume_init() };
 
     // Minimal port configuration (no RSS, no offloads).
     let port_conf = ffi::rte_eth_conf::default();
 
+    // SAFETY: port_conf is a valid default config; port_id was validated by dev_info_get above.
     let ret = unsafe { ffi::rte_eth_dev_configure(port_id, 1, 1, &port_conf) };
     if ret != 0 {
         bail!("rte_eth_dev_configure failed: {}", dpdk_strerror(-ret));
     }
 
     // Set up RX queue 0.
+    // SAFETY: port is configured; default_rxconf and mempool are valid.
     let ret = unsafe {
         ffi::rte_eth_rx_queue_setup(
             port_id,
@@ -44,6 +48,7 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
     }
 
     // Set up TX queue 0.
+    // SAFETY: port is configured; default_txconf is valid from dev_info.
     let ret = unsafe {
         ffi::rte_eth_tx_queue_setup(port_id, 0, DEFAULT_NB_DESC, 0, &dev_info.default_txconf)
     };
@@ -53,12 +58,14 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
 
     // Enable promiscuous mode (receive all packets, needed since we're not
     // using the kernel stack for MAC filtering).
+    // SAFETY: port is configured and queues are set up.
     let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
     if ret != 0 {
         bail!("rte_eth_promiscuous_enable failed: {}", dpdk_strerror(-ret));
     }
 
     // Start the port.
+    // SAFETY: port is fully configured with RX/TX queues.
     let ret = unsafe { ffi::rte_eth_dev_start(port_id) };
     if ret != 0 {
         bail!("rte_eth_dev_start failed: {}", dpdk_strerror(-ret));
@@ -66,18 +73,26 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
 
     // Read MAC address.
     let mut mac_addr = MaybeUninit::<ffi::rte_ether_addr>::uninit();
+    // SAFETY: port is started; rte_eth_macaddr_get writes into mac_addr.
     let ret = unsafe { ffi::rte_eth_macaddr_get(port_id, mac_addr.as_mut_ptr()) };
     if ret != 0 {
         bail!("rte_eth_macaddr_get failed: {}", dpdk_strerror(-ret));
     }
+    // SAFETY: ret == 0 guarantees mac_addr was fully initialized.
     let mac = unsafe { mac_addr.assume_init() };
 
     // Check link status.
     let mut link = MaybeUninit::<ffi::rte_eth_link>::uninit();
-    unsafe { ffi::rte_eth_link_get_nowait(port_id, link.as_mut_ptr()) };
+    // SAFETY: port is started; rte_eth_link_get_nowait writes into link.
+    let ret = unsafe { ffi::rte_eth_link_get_nowait(port_id, link.as_mut_ptr()) };
+    if ret < 0 {
+        tracing::warn!(port = port_id, ret, "rte_eth_link_get_nowait failed, link status unknown");
+    }
+    // SAFETY: rte_eth_link_get_nowait always initializes the struct (even on error, zeroed).
     let link = unsafe { link.assume_init() };
 
-    // rte_eth_link is a union; access the inner struct for speed/status fields.
+    // SAFETY: rte_eth_link is a bindgen union; accessing the inner bitfield struct
+    // is valid because both union variants share the same underlying memory layout.
     let link_inner = unsafe { &link.__bindgen_anon_1.__bindgen_anon_1 };
     tracing::info!(
         port = port_id,
@@ -90,8 +105,113 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
     Ok(mac.addr_bytes)
 }
 
+/// Configure and start a DPDK Ethernet port with N RX/TX queues and RSS.
+///
+/// Returns the port's MAC address on success.
+pub fn configure_port_multiqueue(
+    port_id: u16,
+    n_queues: u16,
+    mempool: *mut ffi::rte_mempool,
+) -> Result<[u8; 6]> {
+    // Get device info for default RX/TX conf.
+    let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
+    // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
+    let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, dev_info.as_mut_ptr()) };
+    if ret != 0 {
+        bail!("rte_eth_dev_info_get failed: {}", dpdk_strerror(-ret));
+    }
+    // SAFETY: ret == 0 guarantees dev_info was fully initialized by DPDK.
+    let dev_info = unsafe { dev_info.assume_init() };
+
+    // Create port config with RSS enabled (uses C shim for correct struct layout).
+    // SAFETY: shim_rss_ip_udp_flags returns the correct DPDK RSS flag combination.
+    let rss_hf = unsafe { ffi::shim_rss_ip_udp_flags() };
+    // SAFETY: shim_create_rss_port_conf creates a valid rte_eth_conf with RSS mode.
+    let port_conf = unsafe { ffi::shim_create_rss_port_conf(rss_hf) };
+
+    // SAFETY: port_conf is a valid RSS config; port_id was validated by dev_info_get above.
+    let ret =
+        unsafe { ffi::rte_eth_dev_configure(port_id, n_queues, n_queues, &port_conf) };
+    if ret != 0 {
+        bail!(
+            "rte_eth_dev_configure (multiqueue) failed: {}",
+            dpdk_strerror(-ret)
+        );
+    }
+
+    // Set up N RX queues.
+    for qid in 0..n_queues {
+        // SAFETY: port is configured; default_rxconf and mempool are valid.
+        let ret = unsafe {
+            ffi::rte_eth_rx_queue_setup(
+                port_id,
+                qid,
+                DEFAULT_NB_DESC,
+                0,
+                &dev_info.default_rxconf,
+                mempool,
+            )
+        };
+        if ret != 0 {
+            bail!(
+                "rte_eth_rx_queue_setup(q={qid}) failed: {}",
+                dpdk_strerror(-ret)
+            );
+        }
+    }
+
+    // Set up N TX queues.
+    for qid in 0..n_queues {
+        // SAFETY: port is configured; default_txconf is valid from dev_info.
+        let ret = unsafe {
+            ffi::rte_eth_tx_queue_setup(port_id, qid, DEFAULT_NB_DESC, 0, &dev_info.default_txconf)
+        };
+        if ret != 0 {
+            bail!(
+                "rte_eth_tx_queue_setup(q={qid}) failed: {}",
+                dpdk_strerror(-ret)
+            );
+        }
+    }
+
+    // Enable promiscuous mode.
+    // SAFETY: port is configured and queues are set up.
+    let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
+    if ret != 0 {
+        bail!("rte_eth_promiscuous_enable failed: {}", dpdk_strerror(-ret));
+    }
+
+    // Start the port.
+    // SAFETY: port is fully configured with RX/TX queues.
+    let ret = unsafe { ffi::rte_eth_dev_start(port_id) };
+    if ret != 0 {
+        bail!("rte_eth_dev_start failed: {}", dpdk_strerror(-ret));
+    }
+
+    // Read MAC address.
+    let mut mac_addr = MaybeUninit::<ffi::rte_ether_addr>::uninit();
+    // SAFETY: port is started; rte_eth_macaddr_get writes into mac_addr.
+    let ret = unsafe { ffi::rte_eth_macaddr_get(port_id, mac_addr.as_mut_ptr()) };
+    if ret != 0 {
+        bail!("rte_eth_macaddr_get failed: {}", dpdk_strerror(-ret));
+    }
+    // SAFETY: ret == 0 guarantees mac_addr was fully initialized.
+    let mac = unsafe { mac_addr.assume_init() };
+
+    tracing::info!(
+        port = port_id,
+        mac = %format_mac(&mac.addr_bytes),
+        n_queues,
+        "DPDK port configured (multi-queue RSS)"
+    );
+
+    Ok(mac.addr_bytes)
+}
+
 /// Stop and close a DPDK port.
 pub fn close_port(port_id: u16) {
+    // SAFETY: port_id was previously configured and started; stop+close is the
+    // correct shutdown sequence. Called once during cleanup.
     unsafe {
         let _ = ffi::rte_eth_dev_stop(port_id);
         ffi::rte_eth_dev_close(port_id);
@@ -108,6 +228,7 @@ pub fn rx_burst(
     rx_pkts: &mut [*mut ffi::rte_mbuf],
     nb_pkts: u16,
 ) -> u16 {
+    // SAFETY: rx_pkts has at least nb_pkts slots; DPDK writes valid mbuf pointers into it.
     unsafe { ffi::shim_rte_eth_rx_burst(port_id, queue_id, rx_pkts.as_mut_ptr(), nb_pkts) }
 }
 
@@ -121,10 +242,13 @@ pub fn tx_burst(
     tx_pkts: &mut [*mut ffi::rte_mbuf],
     nb_pkts: u16,
 ) -> u16 {
+    // SAFETY: tx_pkts contains nb_pkts valid mbuf pointers. DPDK takes ownership of sent
+    // mbufs (frees them internally); caller must free unsent ones.
     unsafe { ffi::shim_rte_eth_tx_burst(port_id, queue_id, tx_pkts.as_mut_ptr(), nb_pkts) }
 }
 
 fn dpdk_strerror(errnum: i32) -> String {
+    // SAFETY: rte_strerror returns a static string pointer (or null for unknown errors).
     unsafe {
         let ptr = ffi::rte_strerror(errnum);
         if ptr.is_null() {

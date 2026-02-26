@@ -1,4 +1,5 @@
 #include "shim.h"
+#include <string.h>
 
 uint16_t shim_rte_eth_rx_burst(uint16_t port_id, uint16_t queue_id,
                                 struct rte_mbuf **rx_pkts, uint16_t nb_pkts) {
@@ -49,4 +50,17 @@ void shim_rte_pktmbuf_reset(struct rte_mbuf *m) {
 int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *pool,
                                  struct rte_mbuf **mbufs, unsigned count) {
     return rte_pktmbuf_alloc_bulk(pool, mbufs, count);
+}
+
+struct rte_eth_conf shim_create_rss_port_conf(uint64_t rss_hf) {
+    struct rte_eth_conf conf;
+    memset(&conf, 0, sizeof(conf));
+    conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    conf.rx_adv_conf.rss_conf.rss_key = NULL;  /* use default key */
+    conf.rx_adv_conf.rss_conf.rss_hf = rss_hf;
+    return conf;
+}
+
+uint64_t shim_rss_ip_udp_flags(void) {
+    return RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP;
 }

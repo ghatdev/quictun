@@ -27,6 +27,8 @@ impl Eal {
         let mut c_ptrs: Vec<*mut libc::c_char> = c_args.iter().map(|s| s.as_ptr() as *mut _).collect();
         let argc = c_ptrs.len() as libc::c_int;
 
+        // SAFETY: c_ptrs contains valid CString pointers; argc matches the array length.
+        // rte_eal_init parses EAL args and initializes the DPDK subsystem.
         let ret = unsafe { ffi::rte_eal_init(argc, c_ptrs.as_mut_ptr()) };
         if ret < 0 {
             bail!("rte_eal_init failed (ret={ret}): check hugepages and DPDK driver binding");
@@ -39,6 +41,7 @@ impl Eal {
 
 impl Drop for Eal {
     fn drop(&mut self) {
+        // SAFETY: EAL was successfully initialized (checked in init). Called once on drop.
         unsafe {
             ffi::rte_eal_cleanup();
         }

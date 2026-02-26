@@ -42,4 +42,15 @@ void shim_rte_pktmbuf_reset(struct rte_mbuf *m);
 int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *pool,
                                  struct rte_mbuf **mbufs, unsigned count);
 
+/*
+ * Create an rte_eth_conf with RSS enabled for multi-queue.
+ * rss_hf: RSS hash function bitmask (e.g., RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP).
+ */
+struct rte_eth_conf shim_create_rss_port_conf(uint64_t rss_hf);
+
+/*
+ * Return the RSS hash flags for IPv4 + UDP.
+ */
+uint64_t shim_rss_ip_udp_flags(void);
+
 #endif /* QUICTUN_DPDK_SHIM_H */
