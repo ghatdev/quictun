@@ -33,10 +33,33 @@ pub fn run(
     zero_copy: bool,
     initial_rtt: u64,
     pin_mtu: bool,
+    dpdk: bool,
+    dpdk_local_ip: Option<String>,
+    dpdk_remote_ip: Option<String>,
+    dpdk_local_port: Option<u16>,
+    dpdk_gateway_mac: Option<String>,
+    dpdk_eal_args: String,
+    dpdk_port: u16,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
+
+    if dpdk {
+        return run_dpdk(
+            config_path,
+            cc,
+            recv_buf,
+            send_buf,
+            send_window,
+            dpdk_local_ip,
+            dpdk_remote_ip,
+            dpdk_local_port,
+            dpdk_gateway_mac,
+            dpdk_eal_args,
+            dpdk_port,
+        );
+    }
 
     if iouring {
         return run_iouring(
@@ -65,6 +88,171 @@ pub fn run(
         initial_rtt,
         pin_mtu,
     ))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn run_dpdk(
+    _config_path: &str,
+    _cc: CongestionControl,
+    _recv_buf: usize,
+    _send_buf: usize,
+    _send_window: u64,
+    _dpdk_local_ip: Option<String>,
+    _dpdk_remote_ip: Option<String>,
+    _dpdk_local_port: Option<u16>,
+    _dpdk_gateway_mac: Option<String>,
+    _dpdk_eal_args: String,
+    _dpdk_port: u16,
+) -> Result<()> {
+    bail!("--dpdk requires Linux");
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_dpdk(
+    config_path: &str,
+    cc: CongestionControl,
+    recv_buf: usize,
+    send_buf: usize,
+    send_window: u64,
+    dpdk_local_ip: Option<String>,
+    dpdk_remote_ip: Option<String>,
+    dpdk_local_port: Option<u16>,
+    dpdk_gateway_mac: Option<String>,
+    dpdk_eal_args: String,
+    dpdk_port: u16,
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, RawFd};
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
+    let role = config.role();
+    let addr = config.parse_address()?;
+
+    let private_key = PrivateKey::from_base64(&config.interface.private_key)
+        .context("invalid interface private_key")?;
+
+    let peer = &config.peer[0];
+    let peer_pubkey =
+        PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
+
+    let keepalive = peer.keepalive.map(Duration::from_secs);
+
+    let tuning = TransportTuning {
+        datagram_recv_buffer: recv_buf,
+        datagram_send_buffer: send_buf,
+        send_window,
+        cc,
+        ..Default::default()
+    };
+
+    // Parse DPDK-specific IPs.
+    let dpdk_local_ip: std::net::Ipv4Addr = dpdk_local_ip
+        .context("--dpdk-local-ip is required with --dpdk")?
+        .parse()
+        .context("invalid --dpdk-local-ip")?;
+
+    let dpdk_remote_ip: std::net::Ipv4Addr = dpdk_remote_ip
+        .context("--dpdk-remote-ip is required with --dpdk")?
+        .parse()
+        .context("invalid --dpdk-remote-ip")?;
+
+    // Parse optional gateway MAC (e.g., "bc:24:11:ab:cd:ef").
+    let gateway_mac = dpdk_gateway_mac
+        .map(|s| parse_mac(&s))
+        .transpose()
+        .context("invalid --dpdk-gateway-mac (expected xx:xx:xx:xx:xx:xx)")?;
+
+    let eal_args: Vec<String> = dpdk_eal_args.split(';').map(|s| s.to_string()).collect();
+
+    tracing::info!(
+        role = ?role,
+        address = %addr,
+        mtu = config.mtu(),
+        dpdk_local_ip = %dpdk_local_ip,
+        dpdk_remote_ip = %dpdk_remote_ip,
+        dpdk_port,
+        cc = %cc,
+        "starting quictun (DPDK)"
+    );
+
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
+    // Create sync TUN device.
+    let mut tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+    tun_opts.name = Some(iface_name.clone());
+    let tun_device =
+        quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
+    let tun_fd: RawFd = tun_device.as_raw_fd();
+
+    // Write PID file.
+    state::write_pid_file(&iface_name)?;
+    let _pid_guard = state::PidFileGuard::new(iface_name);
+
+    // Build quinn-proto configs.
+    let listen_port = config.interface.listen_port.unwrap_or(0);
+    let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
+
+    let setup = match role {
+        Role::Connector => {
+            let cc = quictun_dpdk::quic::build_proto_client_config(
+                &private_key, &peer_pubkey, keepalive, &tuning,
+            )?;
+            let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+            // Override remote_addr IP with DPDK IP, keep the port.
+            let dpdk_remote_addr = SocketAddr::new(dpdk_remote_ip.into(), remote_addr.port());
+            quictun_dpdk::event_loop::EndpointSetup::Connector {
+                remote_addr: dpdk_remote_addr,
+                client_config: cc,
+            }
+        }
+        Role::Listener => {
+            let sc = quictun_dpdk::quic::build_proto_server_config(
+                &private_key, &[peer_pubkey], keepalive, &tuning,
+            )?;
+            quictun_dpdk::event_loop::EndpointSetup::Listener {
+                server_config: sc,
+            }
+        }
+    };
+
+    let dpdk_config = quictun_dpdk::event_loop::DpdkConfig {
+        eal_args,
+        port_id: dpdk_port,
+        local_ip: dpdk_local_ip,
+        remote_ip: dpdk_remote_ip,
+        local_port: dpdk_local_port,
+        gateway_mac,
+    };
+
+    // tun_device must outlive the event loop (owns the fd).
+    let result = quictun_dpdk::event_loop::run(tun_fd, local_addr, setup, dpdk_config);
+
+    drop(tun_device);
+    result
+}
+
+/// Parse a MAC address string like "bc:24:11:ab:cd:ef" into [u8; 6].
+#[cfg(target_os = "linux")]
+fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        anyhow::bail!("MAC must have 6 octets separated by ':'");
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)
+            .with_context(|| format!("invalid MAC octet: {part}"))?;
+    }
+    Ok(mac)
 }
 
 #[cfg(not(target_os = "linux"))]

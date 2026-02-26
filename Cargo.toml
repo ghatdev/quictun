@@ -5,6 +5,7 @@ members = [
     "quictun-core",
     "quictun-tun",
     "quictun-uring",
+    "quictun-dpdk",
     "quictun-cli",
 ]
 
@@ -19,6 +20,7 @@ quictun-crypto = { path = "quictun-crypto" }
 quictun-core = { path = "quictun-core" }
 quictun-tun = { path = "quictun-tun" }
 quictun-uring = { path = "quictun-uring" }
+quictun-dpdk = { path = "quictun-dpdk" }
 
 # QUIC + TLS
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }

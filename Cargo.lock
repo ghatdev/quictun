@@ -103,7 +103,7 @@ version = "0.13.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df6ea8e07e2df15b9f09f2ac5ee2977369b06d116f0c4eb5fa4ad443b73c7f53"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cc",
  "cmake",
  "dunce",
@@ -140,6 +140,26 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "bindgen"
+version = "0.71.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex",
+ "syn",
+]
 
 [[package]]
 name = "bindgen"
@@ -993,6 +1013,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkg-config"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1036,6 +1062,7 @@ dependencies = [
  "mimalloc",
  "quictun-core",
  "quictun-crypto",
+ "quictun-dpdk",
  "quictun-tun",
  "quictun-uring",
  "quinn",
@@ -1078,6 +1105,24 @@ dependencies = [
  "rustls",
  "sha2",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "quictun-dpdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bindgen 0.71.1",
+ "bytes",
+ "cc",
+ "crossbeam-channel",
+ "libc",
+ "pkg-config",
+ "quictun-core",
+ "quictun-crypto",
+ "quinn-proto",
+ "rustls",
  "tracing",
 ]
 

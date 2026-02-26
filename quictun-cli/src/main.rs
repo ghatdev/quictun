@@ -68,6 +68,27 @@ enum Command {
         /// Pin min_mtu = initial_mtu and disable DPLPMTUD (use when path MTU is known)
         #[arg(long)]
         pin_mtu: bool,
+        /// Use DPDK kernel-bypass data plane (Linux only, requires libdpdk)
+        #[arg(long)]
+        dpdk: bool,
+        /// IP address for the DPDK port (e.g., 192.168.100.10)
+        #[arg(long)]
+        dpdk_local_ip: Option<String>,
+        /// Peer IP address on the DPDK network
+        #[arg(long)]
+        dpdk_remote_ip: Option<String>,
+        /// Override local UDP port for DPDK (default: listen_port from config)
+        #[arg(long)]
+        dpdk_local_port: Option<u16>,
+        /// Static peer MAC address (e.g., "bc:24:11:ab:cd:ef"); skips ARP resolution
+        #[arg(long)]
+        dpdk_gateway_mac: Option<String>,
+        /// DPDK EAL arguments, semicolon-separated (default: "-l;0;-n;4")
+        #[arg(long, default_value = "-l;0;-n;4")]
+        dpdk_eal_args: String,
+        /// DPDK port ID (default: 0)
+        #[arg(long, default_value = "0")]
+        dpdk_port: u16,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -98,9 +119,18 @@ fn main() -> anyhow::Result<()> {
             zero_copy,
             initial_rtt,
             pin_mtu,
+            dpdk,
+            dpdk_local_ip,
+            dpdk_remote_ip,
+            dpdk_local_port,
+            dpdk_gateway_mac,
+            dpdk_eal_args,
+            dpdk_port,
         } => up::run(
             &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
             sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
+            dpdk, dpdk_local_ip, dpdk_remote_ip, dpdk_local_port, dpdk_gateway_mac,
+            dpdk_eal_args, dpdk_port,
         ),
         Command::Down { config } => down::run(&config),
     }

@@ -1,0 +1,52 @@
+#include "shim.h"
+
+uint16_t shim_rte_eth_rx_burst(uint16_t port_id, uint16_t queue_id,
+                                struct rte_mbuf **rx_pkts, uint16_t nb_pkts) {
+    return rte_eth_rx_burst(port_id, queue_id, rx_pkts, nb_pkts);
+}
+
+uint16_t shim_rte_eth_tx_burst(uint16_t port_id, uint16_t queue_id,
+                                struct rte_mbuf **tx_pkts, uint16_t nb_pkts) {
+    return rte_eth_tx_burst(port_id, queue_id, tx_pkts, nb_pkts);
+}
+
+struct rte_mbuf *shim_rte_pktmbuf_alloc(struct rte_mempool *mp) {
+    return rte_pktmbuf_alloc(mp);
+}
+
+void shim_rte_pktmbuf_free(struct rte_mbuf *m) {
+    rte_pktmbuf_free(m);
+}
+
+char *shim_rte_pktmbuf_mtod(struct rte_mbuf *m) {
+    return rte_pktmbuf_mtod(m, char *);
+}
+
+uint16_t shim_rte_pktmbuf_data_len(const struct rte_mbuf *m) {
+    return rte_pktmbuf_data_len(m);
+}
+
+char *shim_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len) {
+    return rte_pktmbuf_append(m, len);
+}
+
+char *shim_rte_pktmbuf_prepend(struct rte_mbuf *m, uint16_t len) {
+    return rte_pktmbuf_prepend(m, len);
+}
+
+char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len) {
+    return rte_pktmbuf_adj(m, len);
+}
+
+int shim_rte_pktmbuf_trim(struct rte_mbuf *m, uint16_t len) {
+    return rte_pktmbuf_trim(m, len);
+}
+
+void shim_rte_pktmbuf_reset(struct rte_mbuf *m) {
+    rte_pktmbuf_reset(m);
+}
+
+int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *pool,
+                                 struct rte_mbuf **mbufs, unsigned count) {
+    return rte_pktmbuf_alloc_bulk(pool, mbufs, count);
+}

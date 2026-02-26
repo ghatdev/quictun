@@ -1,0 +1,44 @@
+#ifndef QUICTUN_DPDK_SHIM_H
+#define QUICTUN_DPDK_SHIM_H
+
+#include <rte_ethdev.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_eal.h>
+
+/*
+ * C shim wrappers for inline DPDK functions.
+ *
+ * Many performance-critical DPDK functions are static inline in headers,
+ * which means bindgen can see their declarations but Rust can't call them
+ * directly through FFI.  These trivial wrappers make them callable.
+ */
+
+uint16_t shim_rte_eth_rx_burst(uint16_t port_id, uint16_t queue_id,
+                                struct rte_mbuf **rx_pkts, uint16_t nb_pkts);
+
+uint16_t shim_rte_eth_tx_burst(uint16_t port_id, uint16_t queue_id,
+                                struct rte_mbuf **tx_pkts, uint16_t nb_pkts);
+
+struct rte_mbuf *shim_rte_pktmbuf_alloc(struct rte_mempool *mp);
+
+void shim_rte_pktmbuf_free(struct rte_mbuf *m);
+
+char *shim_rte_pktmbuf_mtod(struct rte_mbuf *m);
+
+uint16_t shim_rte_pktmbuf_data_len(const struct rte_mbuf *m);
+
+char *shim_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len);
+
+char *shim_rte_pktmbuf_prepend(struct rte_mbuf *m, uint16_t len);
+
+char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len);
+
+int shim_rte_pktmbuf_trim(struct rte_mbuf *m, uint16_t len);
+
+void shim_rte_pktmbuf_reset(struct rte_mbuf *m);
+
+int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *pool,
+                                 struct rte_mbuf **mbufs, unsigned count);
+
+#endif /* QUICTUN_DPDK_SHIM_H */

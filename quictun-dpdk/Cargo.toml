@@ -1,0 +1,21 @@
+[package]
+name = "quictun-dpdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+quinn-proto = { workspace = true }
+rustls = { workspace = true }
+quictun-crypto = { workspace = true }
+quictun-core = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+bindgen = "0.71"
+cc = "1"
+pkg-config = "0.3"
