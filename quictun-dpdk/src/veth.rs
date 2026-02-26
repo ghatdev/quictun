@@ -8,28 +8,32 @@ use anyhow::{bail, Context, Result};
 // Constants
 // ---------------------------------------------------------------------------
 
-// Ethtool ioctl — legacy commands
-const SIOCETHTOOL: libc::c_ulong = 0x8946;
-const ETHTOOL_SRXCSUM: u32 = 0x16;
-const ETHTOOL_SGSO: u32 = 0x24;
-const ETHTOOL_SGRO: u32 = 0x2c;
+// Generic netlink
+const NETLINK_GENERIC: libc::c_int = 16;
+const GENL_ID_CTRL: u16 = 0x10;
+const CTRL_CMD_GETFAMILY: u8 = 3;
+const CTRL_ATTR_FAMILY_ID: u16 = 1;
+const CTRL_ATTR_FAMILY_NAME: u16 = 2;
 
-// Ethtool ioctl — SFEATURES API (needed for tx-checksum on modern kernels)
-const ETHTOOL_GSSET_INFO: u32 = 0x37;
-const ETHTOOL_GSTRINGS: u32 = 0x1b;
-const ETHTOOL_SFEATURES: u32 = 0x3b;
-const ETH_SS_FEATURES: u32 = 4;
-const ETH_GSTRING_LEN: usize = 32;
+// Ethtool generic netlink (ETHTOOL_MSG_FEATURES_SET)
+const ETHTOOL_MSG_FEATURES_SET: u8 = 12;
+const ETHTOOL_A_FEATURES_HEADER: u16 = 1;
+const ETHTOOL_A_FEATURES_WANTED: u16 = 3;
+const ETHTOOL_A_HEADER_DEV_NAME: u16 = 2;
+const ETHTOOL_A_BITSET_BITS: u16 = 3;
+const ETHTOOL_A_BITSET_BITS_BIT: u16 = 1;
+const ETHTOOL_A_BITSET_BIT_NAME: u16 = 2;
 
-/// Features to disable via SFEATURES (kernel GSTRINGS names).
-/// Includes TX checksum (legacy ETHTOOL_STXCSUM doesn't work on modern kernels)
-/// and rx-checksumming as a fallback if the legacy SRXCSUM didn't take effect.
-const SFEATURES_DISABLE: &[&str] = &[
+/// Features to disable on veth interfaces for AF_XDP.
+///
+/// TX checksum offloading causes partial checksums in AF_XDP-delivered frames,
+/// leading to silent packet drops. GSO/GRO are disabled for consistency.
+const FEATURES_DISABLE: &[&str] = &[
     "tx-checksum-ip-generic",
     "tx-checksum-ipv4",
     "tx-checksum-ipv6",
     "tx-checksum-sctp",
-    "rx-checksumming",
+    "rx-checksum",
     "tx-generic-segmentation",
     "rx-gro",
 ];
@@ -82,147 +86,12 @@ struct Ifaddrmsg {
     ifa_index: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Ethtool ioctl — disable offloading
-// ---------------------------------------------------------------------------
-
 #[repr(C)]
-struct EthtoolValue {
-    cmd: u32,
-    data: u32,
-}
-
-/// Disable TX checksum, GSO, and GRO on an interface via SIOCETHTOOL ioctl.
-///
-/// Uses legacy ioctls for GSO/GRO, plus the ETHTOOL_SFEATURES API for TX checksum
-/// features (the legacy ETHTOOL_STXCSUM doesn't disable tx-checksum-ip-generic on
-/// modern kernels). rx-checksumming cannot be disabled via SIOCETHTOOL on veth
-/// (RXCSUM is not in hw_features); it requires the NETLINK_GENERIC ethtool interface.
-/// This is acceptable: RX checksum only tells the kernel to trust hardware verification,
-/// which is semantically irrelevant for software veth + AF_XDP.
-///
-/// Non-fatal: logs failures at debug level (features may not exist on all drivers).
-fn disable_offloading(iface: &str) {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        tracing::debug!(iface, "ethtool: cannot open socket");
-        return;
-    }
-
-    // Legacy commands for rx-checksum, GSO, GRO.
-    for cmd in [ETHTOOL_SRXCSUM, ETHTOOL_SGSO, ETHTOOL_SGRO] {
-        let mut val = EthtoolValue { cmd, data: 0 };
-        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-        set_ifr_name(&mut ifr, iface);
-        ifr.ifr_ifru.ifru_data = &mut val as *mut _ as *mut libc::c_char;
-        let ret = unsafe { libc::ioctl(fd, SIOCETHTOOL, &mut ifr) };
-        if ret < 0 {
-            tracing::debug!(iface, "ethtool set 0x{cmd:x}: {}", std::io::Error::last_os_error());
-        }
-    }
-
-    // SFEATURES covers all features by kernel name (belt-and-suspenders with legacy above).
-    disable_features_by_name(fd, iface);
-
-    unsafe { libc::close(fd) };
-}
-
-/// Disable offloading features via ETHTOOL_SFEATURES (by kernel feature string names).
-fn disable_features_by_name(fd: RawFd, iface: &str) {
-    let count = match sset_count(fd, iface) {
-        Some(c) => c as usize,
-        None => return,
-    };
-
-    let names = match get_feature_strings(fd, iface, count) {
-        Some(n) => n,
-        None => return,
-    };
-
-    // Build SFEATURES bitmask: header(8) + blocks * (valid(4) + requested(4)).
-    let num_blocks = count.div_ceil(32);
-    let buf_len = 8 + num_blocks * 8;
-    let mut buf = vec![0u8; buf_len];
-    buf[0..4].copy_from_slice(&ETHTOOL_SFEATURES.to_ne_bytes());
-    buf[4..8].copy_from_slice(&(num_blocks as u32).to_ne_bytes());
-
-    let mut any = false;
-    for feature in SFEATURES_DISABLE {
-        if let Some(idx) = names.iter().position(|n| n == feature) {
-            let block_off = 8 + (idx / 32) * 8;
-            let bit = 1u32 << (idx % 32);
-            // Set `valid` bit — `requested` stays 0 (= off).
-            let valid = u32::from_ne_bytes(buf[block_off..block_off + 4].try_into().unwrap());
-            buf[block_off..block_off + 4].copy_from_slice(&(valid | bit).to_ne_bytes());
-            any = true;
-        }
-    }
-
-    if any {
-        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-        set_ifr_name(&mut ifr, iface);
-        ifr.ifr_ifru.ifru_data = buf.as_mut_ptr() as *mut libc::c_char;
-        let ret = unsafe { libc::ioctl(fd, SIOCETHTOOL, &mut ifr) };
-        if ret < 0 {
-            tracing::debug!(iface, "ethtool SFEATURES: {}", std::io::Error::last_os_error());
-        }
-    }
-}
-
-/// Get the number of strings in a string set via ETHTOOL_GSSET_INFO.
-fn sset_count(fd: RawFd, iface: &str) -> Option<u32> {
-    // Layout: cmd(4) + reserved(4) + sset_mask(8) + data(4)
-    let mut buf = [0u8; 20];
-    buf[0..4].copy_from_slice(&ETHTOOL_GSSET_INFO.to_ne_bytes());
-    let mask: u64 = 1 << ETH_SS_FEATURES;
-    buf[8..16].copy_from_slice(&mask.to_ne_bytes());
-
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    set_ifr_name(&mut ifr, iface);
-    ifr.ifr_ifru.ifru_data = buf.as_mut_ptr() as *mut libc::c_char;
-
-    let ret = unsafe { libc::ioctl(fd, SIOCETHTOOL, &mut ifr) };
-    if ret < 0 {
-        tracing::debug!(iface, "ethtool GSSET_INFO: {}", std::io::Error::last_os_error());
-        return None;
-    }
-    Some(u32::from_ne_bytes(buf[16..20].try_into().unwrap()))
-}
-
-/// Get feature name strings via ETHTOOL_GSTRINGS.
-fn get_feature_strings(fd: RawFd, iface: &str, count: usize) -> Option<Vec<String>> {
-    // Layout: cmd(4) + string_set(4) + len(4) + data(count * ETH_GSTRING_LEN)
-    let buf_len = 12 + count * ETH_GSTRING_LEN;
-    let mut buf = vec![0u8; buf_len];
-    buf[0..4].copy_from_slice(&ETHTOOL_GSTRINGS.to_ne_bytes());
-    buf[4..8].copy_from_slice(&ETH_SS_FEATURES.to_ne_bytes());
-    buf[8..12].copy_from_slice(&(count as u32).to_ne_bytes());
-
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    set_ifr_name(&mut ifr, iface);
-    ifr.ifr_ifru.ifru_data = buf.as_mut_ptr() as *mut libc::c_char;
-
-    let ret = unsafe { libc::ioctl(fd, SIOCETHTOOL, &mut ifr) };
-    if ret < 0 {
-        tracing::debug!(iface, "ethtool GSTRINGS: {}", std::io::Error::last_os_error());
-        return None;
-    }
-
-    let mut names = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = 12 + i * ETH_GSTRING_LEN;
-        let s = &buf[off..off + ETH_GSTRING_LEN];
-        let end = s.iter().position(|&b| b == 0).unwrap_or(ETH_GSTRING_LEN);
-        names.push(String::from_utf8_lossy(&s[..end]).into_owned());
-    }
-    Some(names)
-}
-
-/// Copy an interface name into ifreq.ifr_name (null-terminated, max 15 chars).
-fn set_ifr_name(ifr: &mut libc::ifreq, name: &str) {
-    for (dst, &src) in ifr.ifr_name.iter_mut().zip(name.as_bytes()) {
-        *dst = src as libc::c_char;
-    }
+#[derive(Clone, Copy)]
+struct Genlmsghdr {
+    cmd: u8,
+    version: u8,
+    reserved: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +115,29 @@ impl NlMsg {
             buf: Vec::with_capacity(256),
         };
         msg.put(&hdr);
+        msg
+    }
+
+    /// Create a generic netlink message (nlmsghdr + genlmsghdr).
+    ///
+    /// Unlike `new()`, the caller provides the full `nlmsg_flags` value.
+    fn new_genl(family_id: u16, cmd: u8, flags: u16) -> Self {
+        let hdr = libc::nlmsghdr {
+            nlmsg_len: 0,
+            nlmsg_type: family_id,
+            nlmsg_flags: flags,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        };
+        let mut msg = Self {
+            buf: Vec::with_capacity(256),
+        };
+        msg.put(&hdr);
+        msg.put(&Genlmsghdr {
+            cmd,
+            version: 1,
+            reserved: 0,
+        });
         msg
     }
 
@@ -311,12 +203,22 @@ impl NlMsg {
 struct NlSocket(RawFd);
 
 impl NlSocket {
+    /// Open a NETLINK_ROUTE socket (for ip link/addr operations).
     fn open() -> Result<Self> {
+        Self::open_protocol(libc::NETLINK_ROUTE)
+    }
+
+    /// Open a NETLINK_GENERIC socket (for genl ethtool).
+    fn open_generic() -> Result<Self> {
+        Self::open_protocol(NETLINK_GENERIC)
+    }
+
+    fn open_protocol(protocol: libc::c_int) -> Result<Self> {
         let fd = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_ROUTE,
+                protocol,
             )
         };
         if fd < 0 {
@@ -339,8 +241,8 @@ impl NlSocket {
         Ok(Self(fd))
     }
 
-    /// Send a netlink message and wait for the ACK.
-    fn request(&self, msg: &[u8]) -> Result<()> {
+    /// Send a netlink message and return the raw response.
+    fn send_recv(&self, msg: &[u8]) -> Result<Vec<u8>> {
         let ret = unsafe {
             libc::send(
                 self.0,
@@ -353,7 +255,7 @@ impl NlSocket {
             bail!("netlink send: {}", std::io::Error::last_os_error());
         }
 
-        let mut buf = [0u8; 4096];
+        let mut buf = vec![0u8; 4096];
         let n = unsafe {
             libc::recv(
                 self.0,
@@ -365,15 +267,21 @@ impl NlSocket {
         if n < 0 {
             bail!("netlink recv: {}", std::io::Error::last_os_error());
         }
-        let n = n as usize;
+        buf.truncate(n as usize);
+        Ok(buf)
+    }
+
+    /// Send a netlink message and wait for the ACK.
+    fn request(&self, msg: &[u8]) -> Result<()> {
+        let buf = self.send_recv(msg)?;
         let hdr_size = std::mem::size_of::<libc::nlmsghdr>();
-        if n < hdr_size {
-            bail!("netlink: response too short ({n} bytes)");
+        if buf.len() < hdr_size {
+            bail!("netlink: response too short ({} bytes)", buf.len());
         }
 
         let hdr = unsafe { &*(buf.as_ptr() as *const libc::nlmsghdr) };
         if hdr.nlmsg_type == NLMSG_ERROR {
-            if n < hdr_size + 4 {
+            if buf.len() < hdr_size + 4 {
                 bail!("netlink: error response too short");
             }
             let errno = i32::from_ne_bytes(
@@ -393,6 +301,124 @@ impl Drop for NlSocket {
     fn drop(&mut self) {
         unsafe { libc::close(self.0) };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic netlink ethtool — disable offloading
+// ---------------------------------------------------------------------------
+
+/// Find a netlink attribute by type in a buffer of NLA entries.
+fn find_nla(buf: &[u8], attr_type: u16) -> Option<&[u8]> {
+    let mut off = 0;
+    while off + 4 <= buf.len() {
+        let nla_len = u16::from_ne_bytes(buf[off..off + 2].try_into().ok()?) as usize;
+        let nla_type = u16::from_ne_bytes(buf[off + 2..off + 4].try_into().ok()?);
+        if nla_len < 4 || off + nla_len > buf.len() {
+            break;
+        }
+        if nla_type == attr_type {
+            return Some(&buf[off + 4..off + nla_len]);
+        }
+        off += (nla_len + 3) & !3;
+    }
+    None
+}
+
+/// Resolve a generic netlink family name (e.g., "ethtool") to its family ID.
+fn resolve_genl_family(sock: &NlSocket, name: &str) -> Result<u16> {
+    let mut msg = NlMsg::new_genl(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, NLM_F_REQUEST);
+    msg.put_attr_str(CTRL_ATTR_FAMILY_NAME, name);
+    let buf = sock.send_recv(msg.finish()).context("GETFAMILY send/recv")?;
+
+    // Response: nlmsghdr(16) + genlmsghdr(4) + NLA attrs.
+    let offset = std::mem::size_of::<libc::nlmsghdr>() + std::mem::size_of::<Genlmsghdr>();
+    if buf.len() < offset {
+        bail!("GETFAMILY response too short");
+    }
+
+    // Check for error response.
+    let hdr = unsafe { &*(buf.as_ptr() as *const libc::nlmsghdr) };
+    if hdr.nlmsg_type == NLMSG_ERROR {
+        let hdr_size = std::mem::size_of::<libc::nlmsghdr>();
+        if buf.len() >= hdr_size + 4 {
+            let errno =
+                i32::from_ne_bytes(buf[hdr_size..hdr_size + 4].try_into().expect("4 bytes"));
+            if errno != 0 {
+                return Err(std::io::Error::from_raw_os_error(-errno).into());
+            }
+        }
+        bail!("GETFAMILY returned error with no errno");
+    }
+
+    let attrs = &buf[offset..];
+    let id_data =
+        find_nla(attrs, CTRL_ATTR_FAMILY_ID).context("CTRL_ATTR_FAMILY_ID not in response")?;
+    if id_data.len() < 2 {
+        bail!("CTRL_ATTR_FAMILY_ID too short");
+    }
+    Ok(u16::from_ne_bytes(
+        id_data[..2].try_into().expect("2 bytes"),
+    ))
+}
+
+/// Send ETHTOOL_MSG_FEATURES_SET to disable the given features on an interface.
+fn set_features_off(sock: &NlSocket, family: u16, iface: &str, features: &[&str]) -> Result<()> {
+    let mut msg =
+        NlMsg::new_genl(family, ETHTOOL_MSG_FEATURES_SET, NLM_F_REQUEST | NLM_F_ACK);
+
+    // ETHTOOL_A_FEATURES_HEADER → dev name
+    let hdr_nest = msg.begin_nested(ETHTOOL_A_FEATURES_HEADER);
+    msg.put_attr_str(ETHTOOL_A_HEADER_DEV_NAME, iface);
+    msg.end_nested(hdr_nest);
+
+    // ETHTOOL_A_FEATURES_WANTED → BITSET_BITS → [BIT entries]
+    let wanted = msg.begin_nested(ETHTOOL_A_FEATURES_WANTED);
+    let bits = msg.begin_nested(ETHTOOL_A_BITSET_BITS);
+    for feature in features {
+        let bit = msg.begin_nested(ETHTOOL_A_BITSET_BITS_BIT);
+        msg.put_attr_str(ETHTOOL_A_BITSET_BIT_NAME, feature);
+        // No ETHTOOL_A_BITSET_BIT_VALUE → bit cleared (feature off).
+        msg.end_nested(bit);
+    }
+    msg.end_nested(bits);
+    msg.end_nested(wanted);
+
+    sock.request(msg.finish())
+}
+
+/// Disable offloading features on a veth interface via generic netlink ethtool.
+///
+/// Uses ETHTOOL_MSG_FEATURES_SET — the same interface as modern `ethtool -K`.
+/// Unlike the legacy SIOCETHTOOL ioctl, this can change all features including
+/// rx-checksumming on veth devices.
+///
+/// Non-fatal: logs failures at debug level.
+fn disable_offloading(iface: &str) {
+    if let Err(e) = disable_offloading_inner(iface) {
+        tracing::debug!(iface, "failed to disable offloading: {e:#}");
+    }
+}
+
+fn disable_offloading_inner(iface: &str) -> Result<()> {
+    let sock = NlSocket::open_generic().context("genl socket")?;
+    let family = resolve_genl_family(&sock, "ethtool").context("resolve ethtool family")?;
+
+    // Try all features in a single request.
+    match set_features_off(&sock, family, iface, FEATURES_DISABLE) {
+        Ok(()) => {
+            tracing::debug!(iface, "offloading disabled (batch)");
+        }
+        Err(e) => {
+            tracing::debug!(iface, "batch disable failed ({e:#}), trying individually");
+            for feature in FEATURES_DISABLE {
+                match set_features_off(&sock, family, iface, &[feature]) {
+                    Ok(()) => tracing::debug!(iface, feature, "disabled"),
+                    Err(e) => tracing::debug!(iface, feature, "skip: {e:#}"),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
