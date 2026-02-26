@@ -55,6 +55,10 @@ pub fn build_rustls_server_tls_config(
 
     tls_config.alpn_protocols = vec![ALPN_QUICTUN_V1.to_vec()];
 
+    // Enable session ticket issuance so clients can do 1-RTT/0-RTT resumption.
+    tls_config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
+        .context("failed to create session ticketer")?;
+
     Ok(Arc::new(tls_config))
 }
 
@@ -224,6 +228,8 @@ pub fn build_rustls_server_tls_config_x509(
         .context("failed to set server certificate")?;
 
     tls_config.alpn_protocols = vec![ALPN_QUICTUN_V1.to_vec()];
+    tls_config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
+        .context("failed to create session ticketer")?;
 
     Ok(Arc::new(tls_config))
 }
