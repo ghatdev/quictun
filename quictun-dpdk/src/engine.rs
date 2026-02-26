@@ -39,6 +39,7 @@ pub fn run(
 
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
+    let mut peer_learned = identity.remote_port != 0;
 
     // Stats.
     let mut rx_pkts: u64 = 0;
@@ -101,9 +102,10 @@ pub fn run(
                     }
 
                     // Update remote_addr for listener (first packet reveals the peer).
-                    if state.remote_addr.port() == 0 {
+                    if !peer_learned {
                         state.remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
                         identity.remote_port = udp.src_port;
+                        peer_learned = true;
                         tracing::info!(remote = %state.remote_addr, "learned peer address");
                     }
 
@@ -114,7 +116,7 @@ pub fn run(
                     if let Some(event) =
                         state
                             .endpoint
-                            .handle(now, remote_addr, None, quic_data, &mut response_buf)
+                            .handle(now, remote_addr, None, None, quic_data, &mut response_buf)
                     {
                         let responses =
                             shared::handle_datagram_event(state, event, &mut response_buf);
@@ -171,7 +173,7 @@ pub fn run(
         if let Some(conn) = state.connection.as_mut() {
             while let Ok(pkt) = tun_rx.try_recv() {
                 tun_reads += 1;
-                if let Err(e) = conn.datagrams().send(Bytes::from(pkt)) {
+                if let Err(e) = conn.datagrams().send(Bytes::from(pkt), true) {
                     tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
                 }
             }
@@ -223,7 +225,7 @@ pub fn run(
 
         // ── Update timer deadline ────────────────────────────────────
 
-        deadline = if let Some(conn) = state.connection.as_ref() {
+        deadline = if let Some(conn) = state.connection.as_mut() {
             conn.poll_timeout()
                 .unwrap_or(now + Duration::from_secs(1))
         } else {

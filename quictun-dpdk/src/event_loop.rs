@@ -65,7 +65,13 @@ pub fn run(
 
     // ── 3. Build network identity ────────────────────────────────
 
-    let local_port = dpdk_config.local_port.unwrap_or(local_addr.port());
+    // DPDK has no kernel to assign ephemeral ports, so we need a concrete port.
+    // Use: CLI override > config listen_port > default 40000 (for connectors).
+    let local_port = match dpdk_config.local_port {
+        Some(p) => p,
+        None if local_addr.port() != 0 => local_addr.port(),
+        None => 40000, // Default ephemeral port for connector
+    };
     let remote_port = match &setup {
         EndpointSetup::Connector { remote_addr, .. } => remote_addr.port(),
         EndpointSetup::Listener { .. } => 0, // learned from first packet
@@ -88,12 +94,14 @@ pub fn run(
     // ── 4. Build QUIC state ──────────────────────────────────────
 
     // For DPDK, the QUIC endpoint uses our DPDK IP:port, not the kernel socket.
-    let quic_local_addr = SocketAddr::new(dpdk_config.local_ip.into(), local_port);
+    let _quic_local_addr = SocketAddr::new(dpdk_config.local_ip.into(), local_port);
     let quic_remote_addr = match &setup {
         EndpointSetup::Connector { remote_addr, .. } => *remote_addr,
         // Listener: unknown until first packet.
         EndpointSetup::Listener { .. } => SocketAddr::new(dpdk_config.remote_ip.into(), 0),
     };
+
+    let is_connector = matches!(&setup, EndpointSetup::Connector { .. });
 
     let server_config = match &setup {
         EndpointSetup::Listener { server_config } => Some(server_config.clone()),
@@ -125,9 +133,12 @@ pub fn run(
         "DPDK network identity"
     );
 
-    // ── 5. ARP resolution for connector ──────────────────────────
+    // ── 5. ARP resolution (connector only) ─────────────────────
+    //
+    // The connector needs the peer's MAC to send the initial QUIC handshake.
+    // The listener learns the peer MAC from the first incoming packet.
 
-    if identity.remote_mac.is_none() {
+    if is_connector && identity.remote_mac.is_none() {
         tracing::info!(target_ip = %dpdk_config.remote_ip, "resolving peer MAC via ARP");
         resolve_arp(
             dpdk_config.port_id,

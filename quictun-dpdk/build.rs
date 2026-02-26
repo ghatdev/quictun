@@ -50,8 +50,11 @@ fn dpdk_build() {
         .expect("failed to write DPDK bindings");
 
     // Compile C shim (wraps inline DPDK functions).
+    // -march=native is required because DPDK headers (rte_memcpy.h) use
+    // SSSE3/SSE4 intrinsics that need the corresponding target features.
     let mut cc_build = cc::Build::new();
     cc_build.file("csrc/shim.c");
+    cc_build.flag("-march=native");
     for path in &dpdk.include_paths {
         cc_build.include(path);
     }

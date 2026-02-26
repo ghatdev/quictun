@@ -77,11 +77,13 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
     unsafe { ffi::rte_eth_link_get_nowait(port_id, link.as_mut_ptr()) };
     let link = unsafe { link.assume_init() };
 
+    // rte_eth_link is a union; access the inner struct for speed/status fields.
+    let link_inner = unsafe { &link.__bindgen_anon_1.__bindgen_anon_1 };
     tracing::info!(
         port = port_id,
         mac = %format_mac(&mac.addr_bytes),
-        link_speed = link.link_speed,
-        link_status = if link.link_status() != 0 { "UP" } else { "DOWN" },
+        link_speed = link_inner.link_speed,
+        link_status = if link_inner.link_status() != 0 { "UP" } else { "DOWN" },
         "DPDK port configured"
     );
 
