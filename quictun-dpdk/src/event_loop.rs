@@ -239,7 +239,7 @@ pub fn run(
 
             tracing::info!("inner interface: TAP PMD");
 
-            InnerInterface::AfXdp {
+            InnerInterface::DpdkPort {
                 inner_port_id,
                 inner_eth_hdr,
             }
@@ -290,7 +290,7 @@ pub fn run(
             _veth_pair = Some(veth);
             tracing::info!("inner interface: AF_XDP (veth pair)");
 
-            InnerInterface::AfXdp {
+            InnerInterface::DpdkPort {
                 inner_port_id,
                 inner_eth_hdr,
             }

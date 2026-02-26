@@ -50,8 +50,8 @@ pub enum InnerInterface {
         tun_fd: RawFd,
         tun_rx: Receiver<Vec<u8>>,
     },
-    /// v2: AF_XDP on veth pair — same rx_burst/tx_burst as outer.
-    AfXdp {
+    /// L2 DPDK inner port (AF_XDP veth or TAP PMD) — rx_burst/tx_burst.
+    DpdkPort {
         inner_port_id: u16,
         inner_eth_hdr: InnerEthHeader,
     },
@@ -102,7 +102,7 @@ pub fn run(
 
     let mode_label = match &inner {
         InnerInterface::Tun { .. } => "tun",
-        InnerInterface::AfXdp { .. } => "af_xdp",
+        InnerInterface::DpdkPort { .. } => "dpdk_port",
     };
     tracing::info!(mode = mode_label, "DPDK engine started (polling loop)");
 
@@ -222,7 +222,7 @@ pub fn run(
         // Collect IP packets from AF_XDP inner port (before connection check).
         let mut inner_ip_pkts: Vec<Bytes> = Vec::new();
 
-        if let InnerInterface::AfXdp { inner_port_id, inner_eth_hdr } = &inner {
+        if let InnerInterface::DpdkPort { inner_port_id, inner_eth_hdr } = &inner {
             let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
                 [std::ptr::null_mut(); BURST_SIZE];
             let nb = port::rx_burst(*inner_port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
@@ -274,7 +274,7 @@ pub fn run(
                         }
                     }
                 }
-                InnerInterface::AfXdp { .. } => {
+                InnerInterface::DpdkPort { .. } => {
                     for pkt in inner_ip_pkts.drain(..) {
                         inner_rx += 1;
                         if let Err(e) = conn.datagrams().send(pkt, true) {
@@ -308,7 +308,7 @@ pub fn run(
                     }
                 }
             }
-            InnerInterface::AfXdp { inner_port_id, inner_eth_hdr } => {
+            InnerInterface::DpdkPort { inner_port_id, inner_eth_hdr } => {
                 let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
                 for datagram in &drive_result.datagrams {
                     // Build Ethernet frame: pre-computed header + IP packet.
