@@ -129,8 +129,8 @@ fn run_dpdk(
     use std::os::fd::AsRawFd;
 
     // Validate mode.
-    if dpdk_mode != "tun" && dpdk_mode != "xdp" {
-        anyhow::bail!("--dpdk mode must be 'tun' or 'xdp', got '{dpdk_mode}'");
+    if dpdk_mode != "tun" && dpdk_mode != "xdp" && dpdk_mode != "tap" {
+        anyhow::bail!("--dpdk mode must be 'tun', 'xdp', or 'tap', got '{dpdk_mode}'");
     }
 
     tracing_subscriber::fmt()
@@ -200,7 +200,7 @@ fn run_dpdk(
     let tunnel_prefix = addr.prefix_len();
     let tunnel_mtu = config.mtu();
 
-    // TUN mode: create TUN device. XDP mode: skip TUN, use veth pair instead.
+    // TUN mode: create TUN device. XDP/TAP modes: skip TUN, use DPDK inner port.
     let tun_device = if dpdk_mode == "tun" {
         let mut tun_opts = TunOptions::new(tunnel_ip, tunnel_prefix, tunnel_mtu);
         tun_opts.name = Some(iface_name.clone());
@@ -244,6 +244,7 @@ fn run_dpdk(
     };
 
     let dpdk_config = quictun_dpdk::event_loop::DpdkConfig {
+        mode: dpdk_mode.to_string(),
         eal_args,
         port_id: dpdk_port,
         local_ip: dpdk_local_ip,

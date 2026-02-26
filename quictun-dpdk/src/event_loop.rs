@@ -30,6 +30,8 @@ pub enum EndpointSetup {
 
 /// DPDK-specific configuration from CLI flags.
 pub struct DpdkConfig {
+    /// Inner interface mode: "tun", "xdp", or "tap".
+    pub mode: String,
     /// EAL arguments (e.g., ["-l", "0", "-n", "4"]).
     pub eal_args: Vec<String>,
     /// DPDK port ID (default: 0).
@@ -57,8 +59,9 @@ pub struct DpdkConfig {
 /// Initializes EAL, configures the port, resolves ARP, and runs the
 /// engine polling loop.  Returns when the connection is lost or SIGINT.
 ///
-/// - `tun_fd: Some(fd)` → TUN mode (v1, reader thread + channel)
-/// - `tun_fd: None` → AF_XDP mode (v2, veth pair + DPDK AF_XDP PMD)
+/// - `tun_fd: Some(fd)` → TUN mode (reader thread + channel)
+/// - `tun_fd: None` + mode "xdp" → AF_XDP mode (veth pair + DPDK AF_XDP PMD)
+/// - `tun_fd: None` + mode "tap" → TAP PMD mode (DPDK TAP virtual device)
 pub fn run(
     tun_fd: Option<RawFd>,
     local_addr: SocketAddr,
@@ -67,7 +70,16 @@ pub fn run(
 ) -> Result<()> {
     // ── 1. Initialize DPDK EAL ───────────────────────────────────
 
-    let _eal = Eal::init(&dpdk_config.eal_args)?;
+    // For TAP mode, inject the TAP vdev into EAL args before init.
+    let mut eal_args = dpdk_config.eal_args.clone();
+    if dpdk_config.mode == "tap" {
+        eal_args.push(format!(
+            "--vdev=net_tap0,iface={}",
+            dpdk_config.tunnel_iface
+        ));
+    }
+
+    let _eal = Eal::init(&eal_args)?;
 
     // ── 2. Create mempool and configure outer port ────────────────
 
@@ -189,6 +201,49 @@ pub fn run(
             tracing::info!("inner interface: TUN (reader thread)");
             InnerInterface::Tun { tun_fd: fd, tun_rx }
         }
+        None if dpdk_config.mode == "tap" => {
+            // TAP PMD mode: DPDK created the TAP device via --vdev in EAL args.
+            // Find the TAP port (next available after outer port).
+            let total_ports = unsafe { ffi::rte_eth_dev_count_avail() };
+            if total_ports < 2 {
+                bail!("TAP vdev not found: only {total_ports} port(s) available (expected ≥ 2)");
+            }
+            let inner_port_id = total_ports as u16 - 1;
+
+            // Configure the TAP port (same setup as outer).
+            let tap_mac = port::configure_port(inner_port_id, mempool)?;
+
+            // Fabricate a locally-administered peer MAC for ARP replies.
+            // The kernel uses tap_mac for the TAP interface; the engine
+            // presents itself as peer_mac when replying to ARP.
+            let peer_mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+            tracing::info!(
+                inner_port = inner_port_id,
+                tap_mac = %format_mac(&tap_mac),
+                peer_mac = %format_mac(&peer_mac),
+                iface = %dpdk_config.tunnel_iface,
+                "TAP PMD inner port configured"
+            );
+
+            // Assign IP and bring up the TAP interface.
+            configure_tap_interface(
+                &dpdk_config.tunnel_iface,
+                dpdk_config.tunnel_ip,
+                dpdk_config.tunnel_prefix,
+                dpdk_config.tunnel_mtu,
+            )?;
+
+            // Build pre-computed Ethernet header: src=peer_mac, dst=tap_mac.
+            let inner_eth_hdr = InnerEthHeader::new(peer_mac, tap_mac);
+
+            tracing::info!("inner interface: TAP PMD");
+
+            InnerInterface::AfXdp {
+                inner_port_id,
+                inner_eth_hdr,
+            }
+        }
         None => {
             // AF_XDP mode: create veth pair, init DPDK AF_XDP PMD.
             let veth = VethPair::create(
@@ -222,7 +277,6 @@ pub fn run(
             // Configure the inner port (same setup as outer).
             let inner_mac = port::configure_port(inner_port_id, mempool)?;
 
-            // Promiscuous mode may fail on AF_XDP — make it non-fatal (already attempted in configure_port).
             tracing::info!(
                 inner_port = inner_port_id,
                 inner_mac = %format_mac(&inner_mac),
@@ -277,6 +331,52 @@ pub fn run(
     // _veth_pair dropped here → deletes veth pair.
 
     result
+}
+
+// ── TAP interface configuration ─────────────────────────────────────
+
+/// Assign IP address, set MTU, and bring up a TAP interface created by DPDK.
+fn configure_tap_interface(
+    iface: &str,
+    ip: Ipv4Addr,
+    prefix: u8,
+    mtu: u16,
+) -> Result<()> {
+    let mtu_str = mtu.to_string();
+    let addr = format!("{ip}/{prefix}");
+
+    run_cmd("ip", &["link", "set", iface, "mtu", &mtu_str])
+        .context("failed to set TAP MTU")?;
+    run_cmd("ip", &["addr", "add", &addr, "dev", iface])
+        .context("failed to assign IP to TAP")?;
+    run_cmd("ip", &["link", "set", iface, "up"])
+        .context("failed to bring TAP up")?;
+
+    tracing::info!(
+        iface,
+        ip = %ip,
+        prefix,
+        mtu,
+        "TAP interface configured"
+    );
+    Ok(())
+}
+
+fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute: {program} {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "{program} {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 // ── ARP resolution ──────────────────────────────────────────────────
