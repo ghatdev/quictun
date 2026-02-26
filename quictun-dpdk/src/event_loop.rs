@@ -15,6 +15,22 @@ use crate::port;
 use crate::shared::QuicState;
 use crate::veth::VethPair;
 
+/// Wrapper around `*mut T` that implements `Send`.
+///
+/// SAFETY: The caller must ensure that the pointee is safe to access from another
+/// thread.  DPDK mempools (`rte_mempool`) are thread-safe by design — they use
+/// per-lcore caches and internal locking — so sharing the pointer across engine
+/// threads is correct.
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn as_ptr(self) -> *mut T {
+        self.0
+    }
+}
+
 /// QUIC endpoint setup (connector or listener), same pattern as quictun-uring.
 pub enum EndpointSetup {
     Connector {
@@ -143,6 +159,8 @@ pub fn run(
         EndpointSetup::Listener { server_config } => Some(server_config.clone()),
         EndpointSetup::Connector { .. } => None,
     };
+    // Clone for multi-core path (each thread builds its own QuicState).
+    let server_config_for_multicore = server_config.clone();
     let mut quic_state = QuicState::new(quic_remote_addr, server_config);
 
     // For connector: initiate QUIC connection.
@@ -352,7 +370,7 @@ pub fn run(
 
         // Extract setup info for cloning into threads.
         let remote_addr_base = quic_remote_addr;
-        let server_config_arc = server_config;
+        let server_config_arc = server_config_for_multicore;
         let saved_setup_is_connector = is_connector;
 
         // We need the client config for multi-core connectors.
@@ -377,6 +395,7 @@ pub fn run(
                 let shutdown = shutdown.clone();
                 let server_config = server_config_arc.clone();
                 let core_local_port = base_local_port + core_idx as u16;
+                let mempool = SendPtr(mempool);
 
                 let core_remote_addr = SocketAddr::new(
                     remote_addr_base.ip(),
@@ -384,6 +403,7 @@ pub fn run(
                 );
 
                 handles.push(s.spawn(move || -> Result<()> {
+                    let mempool = mempool.as_ptr();
                     // Pin thread to CPU core_idx.
                     #[cfg(target_os = "linux")]
                     {
