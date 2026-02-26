@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::ffi;
 use crate::mbuf::Mbuf;
-use crate::net::{self, ArpTable, NetIdentity, ParsedPacket};
+use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{self, DriveResult, QuicState, BUF_SIZE};
 
@@ -74,6 +74,7 @@ pub fn run(
     inner: InnerPort,
     shutdown: Arc<AtomicBool>,
     adaptive_poll: bool,
+    checksum_mode: ChecksumMode,
 ) -> Result<()> {
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut drive_result = DriveResult::new();
@@ -109,6 +110,7 @@ pub fn run(
         &mut transmit_buf,
         &mut tx_pkts,
         &mut ip_id,
+        checksum_mode,
     )?;
 
     tracing::info!("DPDK engine started (polling loop)");
@@ -192,6 +194,7 @@ pub fn run(
                                 &mut pkt_buf,
                                 0, // no ECN for stateless responses
                                 ip_id,
+                                checksum_mode,
                             );
                             pending_frames.push(pkt_buf[..frame_len].to_vec());
                         }
@@ -336,6 +339,7 @@ pub fn run(
             &mut transmit_buf,
             &mut tx_pkts,
             &mut ip_id,
+            checksum_mode,
         )?;
 
         // Send pending raw frames (ARP replies, stateless QUIC responses).
@@ -394,6 +398,7 @@ fn drain_and_send(
     transmit_buf: &mut Vec<u8>,
     tx_count: &mut u64,
     ip_id: &mut u16,
+    checksum_mode: ChecksumMode,
 ) -> Result<()> {
     let Some(conn) = state.connection.as_mut() else {
         return Ok(());
@@ -449,7 +454,11 @@ fn drain_and_send(
                 buf,
                 ecn_bits,
                 *ip_id,
+                checksum_mode,
             );
+            if checksum_mode == ChecksumMode::HardwareOffload {
+                mbuf.set_tx_checksum_offload();
+            }
             tx_mbufs.push(mbuf.into_raw());
         }
     }

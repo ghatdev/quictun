@@ -33,3 +33,22 @@ pub const RTE_ETH_RSS_IP: u64 = 0x1 | 0x2; // IPV4 | FRAG_IPV4
 
 /// RSS hash function: hash on UDP src/dst ports (IPv4).
 pub const RTE_ETH_RSS_UDP: u64 = 0x40; // UDP IPv4
+
+// TX offload capability flags (rte_ethdev.h #define macros).
+
+/// Device supports IPv4 header TX checksum offload.
+pub const RTE_ETH_TX_OFFLOAD_IPV4_CKSUM: u64 = 1 << 1;
+
+/// Device supports UDP TX checksum offload.
+pub const RTE_ETH_TX_OFFLOAD_UDP_CKSUM: u64 = 1 << 2;
+
+// Mbuf TX flags (rte_mbuf_core.h #define macros).
+
+/// Request UDP checksum offload (ol_flags).
+pub const RTE_MBUF_F_TX_UDP_CKSUM: u64 = 3 << 52;
+
+/// Request IPv4 header checksum offload (ol_flags).
+pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
+
+/// Packet is IPv4 (ol_flags, required for IP/UDP checksum offload).
+pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;

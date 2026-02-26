@@ -42,6 +42,7 @@ pub fn run(
     dpdk_port: u16,
     no_adaptive_poll: bool,
     dpdk_cores: usize,
+    no_udp_checksum: bool,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -63,6 +64,7 @@ pub fn run(
             dpdk_port,
             no_adaptive_poll,
             dpdk_cores,
+            no_udp_checksum,
         );
     }
 
@@ -112,6 +114,7 @@ fn run_dpdk(
     _dpdk_port: u16,
     _no_adaptive_poll: bool,
     _dpdk_cores: usize,
+    _no_udp_checksum: bool,
 ) -> Result<()> {
     bail!("--dpdk requires Linux");
 }
@@ -133,6 +136,7 @@ fn run_dpdk(
     dpdk_port: u16,
     no_adaptive_poll: bool,
     dpdk_cores: usize,
+    no_udp_checksum: bool,
 ) -> Result<()> {
     // Validate mode.
     if dpdk_mode != "tap" && dpdk_mode != "xdp" {
@@ -250,6 +254,7 @@ fn run_dpdk(
         tunnel_iface: iface_name,
         adaptive_poll: !no_adaptive_poll,
         n_cores: dpdk_cores,
+        no_udp_checksum,
     };
 
     quictun_dpdk::event_loop::run(local_addr, setup, dpdk_config)

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
+use crate::checksum;
+
 // ── Header sizes ──────────────────────────────────────────────────
 
 const ETH_HLEN: usize = 14;
@@ -22,6 +24,20 @@ const ARP_PTYPE_IPV4: u16 = 0x0800;
 const ARP_OP_REQUEST: u16 = 1;
 const ARP_OP_REPLY: u16 = 2;
 const ARP_PACKET_LEN: usize = 28; // fixed for Ethernet + IPv4
+
+// ── Checksum mode ────────────────────────────────────────────────
+
+/// UDP checksum computation strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksumMode {
+    /// Skip UDP checksum entirely (write 0x0000). Valid for IPv4 (RFC 768).
+    /// Use `--no-udp-checksum` for benchmarking.
+    None,
+    /// Optimized software checksum (u64 scalar / AVX2 / NEON).
+    Software,
+    /// NIC hardware offload: write pseudo-header seed, NIC finishes.
+    HardwareOffload,
+}
 
 // ── Identity & ARP table ──────────────────────────────────────────
 
@@ -202,6 +218,7 @@ fn parse_arp(data: &[u8], src_mac: [u8; 6]) -> Option<ParsedPacket<'_>> {
 ///
 /// - `ecn`: ECN codepoint to set in IP TOS (low 2 bits). 0 = Not-ECT.
 /// - `ip_id`: IP identification field (wrapping u16 counter).
+/// - `checksum_mode`: how to compute UDP (and optionally IPv4) checksum.
 pub fn build_udp_packet(
     src_mac: &[u8; 6],
     dst_mac: &[u8; 6],
@@ -213,6 +230,7 @@ pub fn build_udp_packet(
     buf: &mut [u8],
     ecn: u8,
     ip_id: u16,
+    checksum_mode: ChecksumMode,
 ) -> usize {
     let total_len = HEADER_SIZE + payload.len();
     assert!(buf.len() >= total_len);
@@ -237,9 +255,11 @@ pub fn build_udp_packet(
     ip[12..16].copy_from_slice(&src_ip.octets());
     ip[16..20].copy_from_slice(&dst_ip.octets());
 
-    // Compute IPv4 header checksum.
-    let cksum = ipv4_checksum(ip);
-    ip[10..12].copy_from_slice(&cksum.to_be_bytes());
+    // IPv4 header checksum: HW offload leaves 0x0000 (NIC computes it).
+    if checksum_mode != ChecksumMode::HardwareOffload {
+        let cksum = ipv4_checksum(ip);
+        ip[10..12].copy_from_slice(&cksum.to_be_bytes());
+    }
 
     // ── UDP header (8 bytes) ──
     let udp_offset = ETH_HLEN + IPV4_HLEN;
@@ -253,9 +273,21 @@ pub fn build_udp_packet(
     // ── Payload ──
     buf[HEADER_SIZE..total_len].copy_from_slice(payload);
 
-    // Compute UDP checksum over pseudo-header + UDP header + payload.
-    let cksum = udp_checksum(src_ip, dst_ip, &buf[udp_offset..total_len]);
-    buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&cksum.to_be_bytes());
+    // ── UDP checksum ──
+    match checksum_mode {
+        ChecksumMode::None => {
+            // Leave 0x0000 — valid for IPv4 (RFC 768: "no checksum").
+        }
+        ChecksumMode::Software => {
+            let cksum = checksum::udp_checksum(src_ip, dst_ip, &buf[udp_offset..total_len]);
+            buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&cksum.to_be_bytes());
+        }
+        ChecksumMode::HardwareOffload => {
+            // Write pseudo-header seed; NIC adds the UDP segment sum.
+            let seed = checksum::udp_pseudo_header_checksum(src_ip, dst_ip, udp_len);
+            buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&seed.to_be_bytes());
+        }
+    }
 
     total_len
 }
@@ -322,62 +354,11 @@ pub fn build_arp_request(
 
 // ── Checksums ─────────────────────────────────────────────────────
 
-/// RFC 1071 Internet checksum over arbitrary data.
-fn internet_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for chunk in data.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        } else {
-            u16::from_be_bytes([chunk[0], 0])
-        };
-        sum += word as u32;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 /// RFC 1071 Internet checksum over an IPv4 header.
-fn ipv4_checksum(header: &[u8]) -> u16 {
-    internet_checksum(header)
-}
-
-/// UDP checksum over pseudo-header + UDP header + payload (RFC 768).
 ///
-/// `udp_segment` must include the UDP header and payload (starting at src_port).
-/// Returns 0xFFFF if the computed checksum is zero (per RFC 768: 0 means "no checksum").
-fn udp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_segment: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-
-    // Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + protocol(1) + udp_length(2)
-    let src = src_ip.octets();
-    let dst = dst_ip.octets();
-    sum += u16::from_be_bytes([src[0], src[1]]) as u32;
-    sum += u16::from_be_bytes([src[2], src[3]]) as u32;
-    sum += u16::from_be_bytes([dst[0], dst[1]]) as u32;
-    sum += u16::from_be_bytes([dst[2], dst[3]]) as u32;
-    sum += 17u32; // protocol = UDP
-    sum += udp_segment.len() as u32; // UDP length
-
-    // UDP header + payload.
-    for chunk in udp_segment.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        } else {
-            u16::from_be_bytes([chunk[0], 0])
-        };
-        sum += word as u32;
-    }
-
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-
-    let cksum = !(sum as u16);
-    // Per RFC 768: if the computed checksum is zero, transmit 0xFFFF.
-    if cksum == 0 { 0xFFFF } else { cksum }
+/// Delegates to the optimized `checksum` module.
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    checksum::internet_checksum(header)
 }
 
 #[cfg(test)]
@@ -415,6 +396,7 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
             &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 0,
+            ChecksumMode::Software,
         );
 
         assert_eq!(len, HEADER_SIZE + payload.len());
@@ -446,6 +428,7 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
             &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, &mut buf, 0x02, 42,
+            ChecksumMode::Software,
         );
 
         let parsed = parse_packet(&buf[..len]).expect("should parse");
@@ -459,6 +442,7 @@ mod tests {
         // CE = 0b11 = 3
         let len = build_udp_packet(
             &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, &mut buf, 0x03, 43,
+            ChecksumMode::Software,
         );
         let parsed = parse_packet(&buf[..len]).expect("should parse");
         match parsed {
@@ -480,6 +464,7 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
             &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
+            ChecksumMode::Software,
         );
 
         // UDP checksum should be non-zero.
@@ -487,13 +472,69 @@ mod tests {
         let cksum = u16::from_be_bytes([buf[udp_offset + 6], buf[udp_offset + 7]]);
         assert_ne!(cksum, 0, "UDP checksum should be non-zero");
 
-        // Verify: recompute checksum over pseudo-header + UDP segment should yield 0.
-        let udp_segment = &buf[udp_offset..len];
-        let verify = super::udp_checksum(src_ip, dst_ip, udp_segment);
-        // When verified, the checksum-with-checksum-field-set should fold to 0xFFFF
-        // (which our function maps from 0). Just check the packet still parses.
+        // Verify: packet still parses correctly.
         let parsed = parse_packet(&buf[..len]).expect("should parse with checksum");
         assert!(matches!(parsed, ParsedPacket::Udp(_)));
+    }
+
+    #[test]
+    fn test_checksum_mode_none() {
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let src_ip = Ipv4Addr::new(192, 168, 100, 10);
+        let dst_ip = Ipv4Addr::new(192, 168, 100, 11);
+        let payload = b"no checksum";
+
+        let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+        let len = build_udp_packet(
+            &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
+            ChecksumMode::None,
+        );
+
+        // UDP checksum field should be 0x0000.
+        let udp_offset = ETH_HLEN + IPV4_HLEN;
+        let cksum = u16::from_be_bytes([buf[udp_offset + 6], buf[udp_offset + 7]]);
+        assert_eq!(cksum, 0, "UDP checksum should be zero in None mode");
+
+        // IPv4 checksum should still be computed.
+        let ip_cksum = u16::from_be_bytes([buf[ETH_HLEN + 10], buf[ETH_HLEN + 11]]);
+        assert_ne!(ip_cksum, 0, "IPv4 checksum should be non-zero");
+
+        // Packet should still parse.
+        let parsed = parse_packet(&buf[..len]).expect("should parse");
+        assert!(matches!(parsed, ParsedPacket::Udp(_)));
+    }
+
+    #[test]
+    fn test_checksum_mode_hw_offload() {
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let src_ip = Ipv4Addr::new(192, 168, 100, 10);
+        let dst_ip = Ipv4Addr::new(192, 168, 100, 11);
+        let payload = b"hw offload";
+
+        let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+        let len = build_udp_packet(
+            &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
+            ChecksumMode::HardwareOffload,
+        );
+
+        // IPv4 checksum should be 0x0000 (NIC computes).
+        let ip_cksum = u16::from_be_bytes([buf[ETH_HLEN + 10], buf[ETH_HLEN + 11]]);
+        assert_eq!(ip_cksum, 0, "IPv4 checksum should be zero (HW offload)");
+
+        // UDP checksum should contain the pseudo-header seed (non-zero).
+        let udp_offset = ETH_HLEN + IPV4_HLEN;
+        let udp_cksum = u16::from_be_bytes([buf[udp_offset + 6], buf[udp_offset + 7]]);
+        assert_ne!(udp_cksum, 0, "pseudo-header seed should be non-zero");
+
+        // Verify the seed matches what udp_pseudo_header_checksum computes.
+        let udp_len = (UDP_HLEN + payload.len()) as u16;
+        let expected_seed = checksum::udp_pseudo_header_checksum(src_ip, dst_ip, udp_len);
+        assert_eq!(udp_cksum, expected_seed);
+
+        // Packet should still parse (structure is valid even without final checksum).
+        assert_eq!(len, HEADER_SIZE + payload.len());
     }
 
     #[test]
@@ -507,6 +548,7 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         build_udp_packet(
             &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, &mut buf, 0, 0x1234,
+            ChecksumMode::Software,
         );
 
         // IP identification at bytes [ETH_HLEN + 4 .. ETH_HLEN + 6]

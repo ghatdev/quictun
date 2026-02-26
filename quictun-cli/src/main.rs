@@ -95,6 +95,9 @@ enum Command {
         /// Number of DPDK engine cores (default: 1, multi-queue RSS for N > 1)
         #[arg(long, default_value = "1")]
         dpdk_cores: usize,
+        /// Skip UDP checksum (write 0x0000; valid for IPv4, for benchmarking)
+        #[arg(long)]
+        no_udp_checksum: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -134,11 +137,12 @@ fn main() -> anyhow::Result<()> {
             dpdk_port,
             no_adaptive_poll,
             dpdk_cores,
+            no_udp_checksum,
         } => up::run(
             &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
             sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
             dpdk, dpdk_local_ip, dpdk_remote_ip, dpdk_local_port, dpdk_gateway_mac,
-            dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores,
+            dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores, no_udp_checksum,
         ),
         Command::Down { config } => down::run(&config),
     }

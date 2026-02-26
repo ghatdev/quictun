@@ -10,8 +10,8 @@ const DEFAULT_NB_DESC: u16 = 1024;
 
 /// Configure and start a DPDK Ethernet port with 1 RX queue and 1 TX queue.
 ///
-/// Returns the port's MAC address on success.
-pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u8; 6]> {
+/// Returns `(mac_address, hw_udp_checksum_offload_supported)` on success.
+pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([u8; 6], bool)> {
     // Get device info for default RX/TX conf.
     let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
     // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
@@ -91,6 +91,11 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
     // SAFETY: rte_eth_link_get_nowait always initializes the struct (even on error, zeroed).
     let link = unsafe { link.assume_init() };
 
+    // Check TX checksum offload capability.
+    let hw_udp_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+    let hw_ip_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
+    let hw_offload = hw_udp_cksum && hw_ip_cksum;
+
     // SAFETY: rte_eth_link is a bindgen union; accessing the inner bitfield struct
     // is valid because both union variants share the same underlying memory layout.
     let link_inner = unsafe { &link.__bindgen_anon_1.__bindgen_anon_1 };
@@ -99,20 +104,22 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<[u
         mac = %format_mac(&mac.addr_bytes),
         link_speed = link_inner.link_speed,
         link_status = if link_inner.link_status() != 0 { "UP" } else { "DOWN" },
+        hw_udp_cksum,
+        hw_ip_cksum,
         "DPDK port configured"
     );
 
-    Ok(mac.addr_bytes)
+    Ok((mac.addr_bytes, hw_offload))
 }
 
 /// Configure and start a DPDK Ethernet port with N RX/TX queues and RSS.
 ///
-/// Returns the port's MAC address on success.
+/// Returns `(mac_address, hw_udp_checksum_offload_supported)` on success.
 pub fn configure_port_multiqueue(
     port_id: u16,
     n_queues: u16,
     mempool: *mut ffi::rte_mempool,
-) -> Result<[u8; 6]> {
+) -> Result<([u8; 6], bool)> {
     // Get device info for default RX/TX conf.
     let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
     // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
@@ -198,14 +205,21 @@ pub fn configure_port_multiqueue(
     // SAFETY: ret == 0 guarantees mac_addr was fully initialized.
     let mac = unsafe { mac_addr.assume_init() };
 
+    // Check TX checksum offload capability.
+    let hw_udp_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+    let hw_ip_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
+    let hw_offload = hw_udp_cksum && hw_ip_cksum;
+
     tracing::info!(
         port = port_id,
         mac = %format_mac(&mac.addr_bytes),
         n_queues,
+        hw_udp_cksum,
+        hw_ip_cksum,
         "DPDK port configured (multi-queue RSS)"
     );
 
-    Ok(mac.addr_bytes)
+    Ok((mac.addr_bytes, hw_offload))
 }
 
 /// Stop and close a DPDK port.

@@ -6,6 +6,8 @@ mod eal;
 mod port;
 #[cfg(target_os = "linux")]
 mod mbuf;
+#[allow(dead_code)] // Used from net.rs on Linux; appears unused on macOS (net.rs is cfg-gated).
+mod checksum;
 #[cfg(target_os = "linux")]
 mod net;
 #[cfg(target_os = "linux")]

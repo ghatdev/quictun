@@ -10,7 +10,7 @@ use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
 use crate::mbuf;
-use crate::net::{self, ArpTable, NetIdentity};
+use crate::net::{self, ArpTable, ChecksumMode, NetIdentity};
 use crate::port;
 use crate::shared::QuicState;
 use crate::veth::VethPair;
@@ -71,6 +71,8 @@ pub struct DpdkConfig {
     pub adaptive_poll: bool,
     /// Number of engine cores (1 = single-threaded, N = multi-queue RSS).
     pub n_cores: usize,
+    /// Skip UDP checksum entirely (write 0x0000). Valid for IPv4, useful for benchmarking.
+    pub no_udp_checksum: bool,
 }
 
 /// Run the DPDK data plane.
@@ -109,10 +111,22 @@ pub fn run(
     let mempool =
         mbuf::create_mempool("quictun_dpdk", ffi::DEFAULT_NUM_MBUFS, ffi::MEMPOOL_CACHE_SIZE)?;
 
-    let local_mac = if n_cores > 1 {
+    let (local_mac, hw_cksum_offload) = if n_cores > 1 {
         port::configure_port_multiqueue(dpdk_config.port_id, n_cores as u16, mempool)?
     } else {
         port::configure_port(dpdk_config.port_id, mempool)?
+    };
+
+    // Determine checksum mode: CLI flag > HW offload > software.
+    let checksum_mode = if dpdk_config.no_udp_checksum {
+        tracing::info!("UDP checksum disabled (--no-udp-checksum)");
+        ChecksumMode::None
+    } else if hw_cksum_offload {
+        tracing::info!("using hardware TX checksum offload");
+        ChecksumMode::HardwareOffload
+    } else {
+        tracing::info!("using optimized software UDP checksum");
+        ChecksumMode::Software
     };
 
     // ── 3. Build network identity ────────────────────────────────
@@ -234,7 +248,7 @@ pub fn run(
 
         for i in 0..n_cores {
             let inner_port_id = (total_ports - n_cores as u16) + i as u16;
-            let tap_mac = port::configure_port(inner_port_id, mempool)?;
+            let (tap_mac, _inner_hw_offload) = port::configure_port(inner_port_id, mempool)?;
 
             let iface = if n_cores == 1 {
                 dpdk_config.tunnel_iface.clone()
@@ -308,7 +322,7 @@ pub fn run(
             );
         }
         let inner_port_id = total_ports as u16 - 1;
-        let inner_mac = port::configure_port(inner_port_id, mempool)?;
+        let (inner_mac, _inner_hw_offload) = port::configure_port(inner_port_id, mempool)?;
 
         tracing::info!(
             inner_port = inner_port_id,
@@ -357,6 +371,7 @@ pub fn run(
             inner,
             shutdown.clone(),
             dpdk_config.adaptive_poll,
+            checksum_mode,
         )
     } else {
         // Multi-core: N engine threads, each with own QUIC state + inner port.
@@ -456,6 +471,7 @@ pub fn run(
                         inner,
                         shutdown,
                         adaptive_poll,
+                        checksum_mode,
                     )
                 }));
             }
