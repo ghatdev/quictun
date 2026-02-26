@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use quictun_core::config::{Config, Role};
-use quictun_core::connection::{self, TransportTuning};
+use quictun_core::connection::{self, CongestionControl, TransportTuning};
 use quictun_core::tunnel;
 use quictun_crypto::{PrivateKey, PublicKey};
 use quictun_tun::{TunDevice, TunOptions};
@@ -20,7 +20,7 @@ use crate::state;
 pub fn run(
     config_path: &str,
     serial: bool,
-    newreno: bool,
+    cc: &str,
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
@@ -31,11 +31,17 @@ pub fn run(
     iouring_cores: usize,
     pool_size: usize,
     zero_copy: bool,
+    initial_rtt: u64,
+    pin_mtu: bool,
 ) -> Result<()> {
+    let cc: CongestionControl = cc
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
     if iouring {
         return run_iouring(
             config_path,
-            newreno,
+            cc,
             recv_buf,
             send_buf,
             send_window,
@@ -51,11 +57,13 @@ pub fn run(
     rt.block_on(run_async(
         config_path,
         serial,
-        newreno,
+        cc,
         recv_buf,
         send_buf,
         send_window,
         queues,
+        initial_rtt,
+        pin_mtu,
     ))
 }
 
@@ -63,7 +71,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn run_iouring(
     _config_path: &str,
-    _newreno: bool,
+    _cc: CongestionControl,
     _recv_buf: usize,
     _send_buf: usize,
     _send_window: u64,
@@ -79,7 +87,7 @@ fn run_iouring(
 #[cfg(target_os = "linux")]
 fn run_iouring(
     config_path: &str,
-    newreno: bool,
+    cc: CongestionControl,
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
@@ -90,7 +98,6 @@ fn run_iouring(
     zero_copy: bool,
 ) -> Result<()> {
     use std::os::fd::{AsRawFd, RawFd};
-    use quictun_core::connection::TransportTuning;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -111,13 +118,12 @@ fn run_iouring(
         PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
 
     let keepalive = peer.keepalive.map(Duration::from_secs);
-    let bbr = !newreno;
 
     let tuning = TransportTuning {
         datagram_recv_buffer: recv_buf,
         datagram_send_buffer: send_buf,
         send_window,
-        use_bbr: bbr,
+        cc,
         ..Default::default()
     };
 
@@ -128,7 +134,7 @@ fn run_iouring(
         address = %addr,
         mtu = config.mtu(),
         peer_fingerprint = %peer_pubkey.fingerprint(),
-        bbr,
+        cc = %cc,
         recv_buf,
         send_buf,
         send_window,
@@ -208,11 +214,13 @@ fn run_iouring(
 async fn run_async(
     config_path: &str,
     serial: bool,
-    newreno: bool,
+    cc: CongestionControl,
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
     queues: usize,
+    initial_rtt: u64,
+    pin_mtu: bool,
 ) -> Result<()> {
     use quictun_core::tunnel::TunnelResult;
 
@@ -238,14 +246,15 @@ async fn run_async(
     let reconnect_interval = peer.reconnect_interval;
 
     let parallel = !serial;
-    let bbr = !newreno;
 
     let tuning = TransportTuning {
         datagram_recv_buffer: recv_buf,
         datagram_send_buffer: send_buf,
         send_window,
-        use_bbr: bbr,
+        cc,
         max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
+        initial_rtt_ms: initial_rtt,
+        pin_mtu,
         ..Default::default()
     };
 
@@ -255,7 +264,7 @@ async fn run_async(
         mtu = config.mtu(),
         peer_fingerprint = %peer_pubkey.fingerprint(),
         parallel,
-        bbr,
+        cc = %cc,
         recv_buf,
         send_buf,
         send_window,

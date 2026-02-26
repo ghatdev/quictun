@@ -29,9 +29,9 @@ enum Command {
         /// Use serial forwarding (single select loop) instead of parallel
         #[arg(long)]
         serial: bool,
-        /// Use NewReno congestion control instead of BBR
-        #[arg(long)]
-        newreno: bool,
+        /// Congestion control algorithm: bbr, cubic, newreno, none
+        #[arg(long, default_value = "bbr")]
+        cc: String,
         /// Datagram receive buffer size in bytes
         #[arg(long, default_value_t = 8 * 1024 * 1024)]
         recv_buf: usize,
@@ -62,6 +62,12 @@ enum Command {
         /// Use SendZc for zero-copy UDP sends (kernel 6.0+, io_uring only)
         #[arg(long)]
         zero_copy: bool,
+        /// Initial RTT estimate in ms (default: 333). Set lower for LAN (e.g. 5).
+        #[arg(long, default_value = "0")]
+        initial_rtt: u64,
+        /// Pin min_mtu = initial_mtu and disable DPLPMTUD (use when path MTU is known)
+        #[arg(long)]
+        pin_mtu: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -79,7 +85,7 @@ fn main() -> anyhow::Result<()> {
         Command::Up {
             config,
             serial,
-            newreno,
+            cc,
             recv_buf,
             send_buf,
             send_window,
@@ -90,9 +96,11 @@ fn main() -> anyhow::Result<()> {
             iouring_cores,
             pool_size,
             zero_copy,
+            initial_rtt,
+            pin_mtu,
         } => up::run(
-            &config, serial, newreno, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
-            sqpoll_cpu, iouring_cores, pool_size, zero_copy,
+            &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
+            sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
         ),
         Command::Down { config } => down::run(&config),
     }

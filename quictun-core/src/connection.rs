@@ -347,6 +347,102 @@ pub fn build_endpoint_config(cid_length: usize) -> quinn::EndpointConfig {
     config
 }
 
+/// Congestion control algorithm selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionControl {
+    /// BBR (Bottleneck Bandwidth and RTT) — high throughput, probes aggressively.
+    Bbr,
+    /// CUBIC (RFC 8312) — standard TCP CC, moderate aggressiveness.
+    Cubic,
+    /// NewReno — classic AIMD, conservative.
+    NewReno,
+    /// No congestion control — unlimited send window. For controlled LAN testing only.
+    None,
+}
+
+impl std::fmt::Display for CongestionControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bbr => write!(f, "bbr"),
+            Self::Cubic => write!(f, "cubic"),
+            Self::NewReno => write!(f, "newreno"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl std::str::FromStr for CongestionControl {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "bbr" => Ok(Self::Bbr),
+            "cubic" => Ok(Self::Cubic),
+            "newreno" => Ok(Self::NewReno),
+            "none" => Ok(Self::None),
+            _ => Err(format!("unknown congestion control: {s} (expected bbr, cubic, newreno, none)")),
+        }
+    }
+}
+
+// ── Unconstrained (no-op) congestion controller ──────────────────────────────
+
+/// A congestion controller that imposes no limits.
+///
+/// Always returns a large window and ignores all loss/congestion signals.
+/// Useful for controlled LAN benchmarking to find the raw throughput ceiling.
+#[derive(Debug, Clone)]
+struct Unconstrained {
+    window: u64,
+}
+
+impl quinn::congestion::Controller for Unconstrained {
+    fn on_congestion_event(
+        &mut self,
+        _now: std::time::Instant,
+        _sent: std::time::Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        // No-op: never reduce the window.
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.window = new_mtu as u64 * 65536;
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// Factory for [`Unconstrained`] controllers.
+#[derive(Debug)]
+struct UnconstrainedConfig;
+
+impl quinn::congestion::ControllerFactory for UnconstrainedConfig {
+    fn build(
+        self: Arc<Self>,
+        _now: std::time::Instant,
+        current_mtu: u16,
+    ) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(Unconstrained {
+            window: current_mtu as u64 * 65536,
+        })
+    }
+}
+
 /// Tuning knobs for the QUIC transport layer.
 #[derive(Debug, Clone)]
 pub struct TransportTuning {
@@ -354,9 +450,15 @@ pub struct TransportTuning {
     pub datagram_send_buffer: usize,
     pub initial_mtu: u16,
     pub send_window: u64,
-    pub use_bbr: bool,
+    pub cc: CongestionControl,
     /// Max idle timeout in milliseconds. 0 = use quinn default.
     pub max_idle_timeout_ms: u64,
+    /// Initial RTT estimate in milliseconds. 0 = use quinn default (333ms).
+    /// Set to ~5ms for LAN tunnels to speed up loss detection and pacing.
+    pub initial_rtt_ms: u64,
+    /// Pin min_mtu = initial_mtu to skip DPLPMTUD fallback. Useful when the
+    /// path MTU is known (e.g. Ethernet LAN).
+    pub pin_mtu: bool,
 }
 
 impl Default for TransportTuning {
@@ -366,8 +468,10 @@ impl Default for TransportTuning {
             datagram_send_buffer: 8 * 1024 * 1024,  // 8 MB
             initial_mtu: 1452,
             send_window: 0, // 0 = use default
-            use_bbr: true,
+            cc: CongestionControl::Bbr,
             max_idle_timeout_ms: 0,
+            initial_rtt_ms: 0,
+            pin_mtu: false,
         }
     }
 }
@@ -384,11 +488,29 @@ pub fn make_transport_config(
     transport.datagram_receive_buffer_size(Some(tuning.datagram_recv_buffer));
     transport.datagram_send_buffer_size(tuning.datagram_send_buffer);
     transport.initial_mtu(tuning.initial_mtu);
+    if tuning.pin_mtu {
+        transport.min_mtu(tuning.initial_mtu);
+        transport.mtu_discovery_config(None);
+    }
+    if tuning.initial_rtt_ms > 0 {
+        transport.initial_rtt(Duration::from_millis(tuning.initial_rtt_ms));
+    }
     if tuning.send_window > 0 {
         transport.send_window(tuning.send_window);
     }
-    if tuning.use_bbr {
-        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    match tuning.cc {
+        CongestionControl::Bbr => {
+            transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        CongestionControl::Cubic => {
+            transport.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+        CongestionControl::NewReno => {
+            transport.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
+        }
+        CongestionControl::None => {
+            transport.congestion_controller_factory(Arc::new(UnconstrainedConfig));
+        }
     }
     if let Some(interval) = keepalive {
         transport.keep_alive_interval(Some(interval));
