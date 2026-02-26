@@ -43,6 +43,7 @@ pub fn run(
     no_adaptive_poll: bool,
     dpdk_cores: usize,
     no_udp_checksum: bool,
+    offload: bool,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -94,6 +95,7 @@ pub fn run(
         queues,
         initial_rtt,
         pin_mtu,
+        offload,
     ))
 }
 
@@ -429,6 +431,7 @@ async fn run_async(
     queues: usize,
     initial_rtt: u64,
     pin_mtu: bool,
+    offload: bool,
 ) -> Result<()> {
     use quictun_core::tunnel::TunnelResult;
 
@@ -466,12 +469,18 @@ async fn run_async(
         ..Default::default()
     };
 
+    #[cfg(not(target_os = "linux"))]
+    if offload {
+        tracing::warn!("--offload is only supported on Linux, ignoring");
+    }
+
     tracing::info!(
         role = ?role,
         address = %addr,
         mtu = config.mtu(),
         peer_fingerprint = %peer_pubkey.fingerprint(),
         parallel,
+        offload,
         cc = %cc,
         recv_buf,
         send_buf,
@@ -499,6 +508,7 @@ async fn run_async(
         #[cfg(target_os = "linux")]
         {
             opts.multi_queue = use_multi_queue;
+            opts.offload = offload;
         }
         opts
     };
@@ -763,6 +773,18 @@ async fn run_async(
                 shutdown_rx.clone(),
             )
             .await
+        } else if cfg!(target_os = "linux") && offload && parallel && queues <= 1 {
+            #[cfg(target_os = "linux")]
+            {
+                tunnel::run_forwarding_loop_offload(
+                    connection,
+                    tun_queues[0].clone(),
+                    shutdown_rx.clone(),
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!()
         } else if parallel {
             tunnel::run_forwarding_loop_parallel(
                 connection,

@@ -17,6 +17,8 @@ pub struct TunOptions {
     pub name: Option<String>,
     #[cfg(target_os = "linux")]
     pub multi_queue: bool,
+    #[cfg(target_os = "linux")]
+    pub offload: bool,
 }
 
 impl TunOptions {
@@ -28,6 +30,8 @@ impl TunOptions {
             name: None,
             #[cfg(target_os = "linux")]
             multi_queue: false,
+            #[cfg(target_os = "linux")]
+            offload: false,
         }
     }
 }
@@ -55,6 +59,8 @@ impl TunDevice {
             name: name.map(|s| s.to_string()),
             #[cfg(target_os = "linux")]
             multi_queue: false,
+            #[cfg(target_os = "linux")]
+            offload: false,
         })
     }
 
@@ -71,6 +77,11 @@ impl TunDevice {
             builder = builder.multi_queue(true);
         }
 
+        #[cfg(target_os = "linux")]
+        if opts.offload {
+            builder = builder.offload(true);
+        }
+
         let device = builder
             .ipv4(opts.address, opts.prefix_len, None)
             .mtu(opts.mtu)
@@ -79,6 +90,17 @@ impl TunDevice {
         let actual_name = device
             .name()
             .unwrap_or_else(|_| opts.name.as_deref().unwrap_or("tun?").to_string());
+
+        #[cfg(target_os = "linux")]
+        if opts.offload {
+            tracing::info!(
+                name = %actual_name,
+                tcp_gso = device.tcp_gso(),
+                udp_gso = device.udp_gso(),
+                "TUN offload capabilities"
+            );
+        }
+
         tracing::info!(
             name = %actual_name,
             address = %opts.address,
@@ -139,6 +161,48 @@ impl TunDevice {
     /// Return the interface name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Read one or more packets from TUN with GSO splitting (Linux only, requires offload).
+    ///
+    /// `original_buffer` stores the raw read including virtio_net_hdr (size: VIRTIO_NET_HDR_LEN + 65535).
+    /// `bufs`/`sizes` receive the split IP packets. Returns the number of packets.
+    #[cfg(target_os = "linux")]
+    pub async fn recv_multiple<B: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        original_buffer: &mut [u8],
+        bufs: &mut [B],
+        sizes: &mut [usize],
+        offset: usize,
+    ) -> std::io::Result<usize> {
+        self.inner
+            .recv_multiple(original_buffer, bufs, sizes, offset)
+            .await
+    }
+
+    /// Write multiple packets to TUN with GRO coalescing (Linux only, requires offload).
+    ///
+    /// `offset` must be >= VIRTIO_NET_HDR_LEN (space for the virtio header prepended by tun-rs).
+    #[cfg(target_os = "linux")]
+    pub async fn send_multiple<B: tun_rs::ExpandBuffer>(
+        &self,
+        gro_table: &mut tun_rs::GROTable,
+        bufs: &mut [B],
+        offset: usize,
+    ) -> std::io::Result<usize> {
+        self.inner.send_multiple(gro_table, bufs, offset).await
+    }
+
+    /// Whether TCP GSO is supported (Linux only).
+    #[cfg(target_os = "linux")]
+    pub fn tcp_gso(&self) -> bool {
+        self.inner.tcp_gso()
+    }
+
+    /// Whether UDP GSO is supported (Linux only).
+    #[cfg(target_os = "linux")]
+    pub fn udp_gso(&self) -> bool {
+        self.inner.udp_gso()
     }
 }
 

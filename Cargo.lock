@@ -1129,6 +1129,7 @@ dependencies = [
 name = "quictun-tun"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "thiserror 2.0.18",
  "tracing",
  "tun-rs",

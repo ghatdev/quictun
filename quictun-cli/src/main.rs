@@ -98,6 +98,9 @@ enum Command {
         /// Skip UDP checksum (write 0x0000; valid for IPv4, for benchmarking)
         #[arg(long)]
         no_udp_checksum: bool,
+        /// Enable TUN GSO/GRO offload for batched I/O (Linux only, kernel 6.2+)
+        #[arg(long)]
+        offload: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -138,11 +141,12 @@ fn main() -> anyhow::Result<()> {
             no_adaptive_poll,
             dpdk_cores,
             no_udp_checksum,
+            offload,
         } => up::run(
             &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
             sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
             dpdk, dpdk_local_ip, dpdk_remote_ip, dpdk_local_port, dpdk_gateway_mac,
-            dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores, no_udp_checksum,
+            dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores, no_udp_checksum, offload,
         ),
         Command::Down { config } => down::run(&config),
     }
