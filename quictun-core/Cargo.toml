@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+fips = ["quictun-crypto/fips"]
+
 [dependencies]
 quictun-crypto = { workspace = true }
 quinn = { workspace = true }
@@ -18,3 +21,5 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 quictun-tun = { workspace = true }
 bytes = { workspace = true }
+aws-lc-rs = { workspace = true }
+rustls-pemfile = { workspace = true }

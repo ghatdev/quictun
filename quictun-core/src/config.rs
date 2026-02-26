@@ -34,10 +34,40 @@ pub struct InterfaceConfig {
     /// Optional explicit interface name (e.g. "connector"). If omitted,
     /// `Config::interface_name()` derives it from the config filename.
     pub name: Option<String>,
+    /// Max QUIC idle timeout in milliseconds. 0 = quinn default.
+    #[serde(default)]
+    pub max_idle_timeout_ms: u64,
+    /// Enable FIPS-only ciphersuites (AES-GCM + P-256/P-384, no ChaCha20/x25519).
+    /// Requires the `fips` cargo feature.
+    #[serde(default)]
+    pub fips_mode: bool,
+    /// QUIC Connection ID length in bytes. Valid values: 0, 4, 8. Default 8.
+    #[serde(default = "default_cid_length")]
+    pub cid_length: u8,
+    /// Enable 0-RTT session resumption on reconnect (connector only).
+    #[serde(default)]
+    pub zero_rtt: bool,
+    /// Authentication mode: "rpk" (default) or "x509".
+    #[serde(default = "default_auth_mode")]
+    pub auth_mode: String,
+    /// PEM certificate chain file (x509 mode).
+    pub cert_file: Option<String>,
+    /// PEM private key file (x509 mode, alternative to base64 private_key).
+    pub key_file: Option<String>,
+    /// PEM CA bundle for peer verification (x509 mode).
+    pub ca_file: Option<String>,
 }
 
 fn default_mtu() -> u16 {
     1380
+}
+
+fn default_cid_length() -> u8 {
+    8
+}
+
+fn default_auth_mode() -> String {
+    "rpk".to_owned()
 }
 
 /// Remote peer configuration.
@@ -48,6 +78,9 @@ pub struct PeerConfig {
     pub allowed_ips: Vec<String>,
     pub endpoint: Option<SocketAddr>,
     pub keepalive: Option<u64>,
+    /// Auto-reconnect interval in seconds. None = no auto-reconnect (process exits on drop).
+    #[serde(default)]
+    pub reconnect_interval: Option<u64>,
 }
 
 /// Whether this node acts as a listener (server) or connector (client).
@@ -77,6 +110,44 @@ impl Config {
         }
         // Validate address parses as IPv4 network
         self.parse_address()?;
+
+        // Validate CID length
+        match self.interface.cid_length {
+            0 | 4 | 8 => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "cid_length must be 0, 4, or 8 (got {other})"
+                )));
+            }
+        }
+
+        // Validate auth_mode
+        match self.interface.auth_mode.as_str() {
+            "rpk" => {}
+            "x509" => {
+                if self.interface.cert_file.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "auth_mode = \"x509\" requires cert_file".into(),
+                    ));
+                }
+                if self.interface.key_file.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "auth_mode = \"x509\" requires key_file".into(),
+                    ));
+                }
+                if self.interface.ca_file.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "auth_mode = \"x509\" requires ca_file".into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "auth_mode must be \"rpk\" or \"x509\" (got \"{other}\")"
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -179,6 +250,14 @@ allowed_ips = ["10.0.0.2/32"]
                 listen_port: None,
                 mtu: 1380,
                 name: None,
+                max_idle_timeout_ms: 0,
+                fips_mode: false,
+                cid_length: 8,
+                zero_rtt: false,
+                auth_mode: "rpk".into(),
+                cert_file: None,
+                key_file: None,
+                ca_file: None,
             },
             peer: vec![],
         };

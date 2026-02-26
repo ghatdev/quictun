@@ -1,12 +1,41 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use bytes::Bytes;
 use quinn::Connection;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use quictun_tun::TunDevice;
+
+/// Result of a forwarding loop iteration.
+#[derive(Debug)]
+pub enum TunnelResult {
+    /// Clean shutdown (signal received or graceful close).
+    Shutdown,
+    /// Connection lost — retriable (peer disappeared, timeout, reset).
+    ConnectionLost(quinn::ConnectionError),
+    /// Fatal error — not retriable (TUN I/O failure, etc.).
+    Fatal(anyhow::Error),
+}
+
+/// Classify a `quinn::ConnectionError` as retriable or fatal.
+fn classify_connection_error(e: quinn::ConnectionError) -> TunnelResult {
+    match e {
+        quinn::ConnectionError::TimedOut
+        | quinn::ConnectionError::Reset
+        | quinn::ConnectionError::ConnectionClosed(_)
+        | quinn::ConnectionError::ApplicationClosed(_) => TunnelResult::ConnectionLost(e),
+        other => TunnelResult::Fatal(other.into()),
+    }
+}
+
+/// Classify a `quinn::SendDatagramError` as retriable or fatal.
+fn classify_send_error(e: quinn::SendDatagramError) -> TunnelResult {
+    match e {
+        quinn::SendDatagramError::ConnectionLost(ce) => classify_connection_error(ce),
+        other => TunnelResult::Fatal(other.into()),
+    }
+}
 
 /// Run the bidirectional forwarding loop: TUN ↔ QUIC DATAGRAMs.
 ///
@@ -15,7 +44,7 @@ pub async fn run_forwarding_loop(
     connection: Connection,
     tun: &TunDevice,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+) -> TunnelResult {
     let initial_max = connection.max_datagram_size().unwrap_or(1200);
     tracing::info!(max_datagram_size = initial_max, "forwarding loop started (serial)");
 
@@ -24,7 +53,10 @@ pub async fn run_forwarding_loop(
     loop {
         tokio::select! {
             result = tun.recv(&mut buf) => {
-                let n = result?;
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => return TunnelResult::Fatal(e.into()),
+                };
                 // Check dynamically — DPLPMTUD may have updated the path MTU
                 let max = connection.max_datagram_size().unwrap_or(1200);
                 if n > max {
@@ -36,24 +68,29 @@ pub async fn run_forwarding_loop(
                     continue;
                 }
                 debug!(size = n, "TUN → QUIC");
-                connection.send_datagram(Bytes::copy_from_slice(&buf[..n]))?;
+                if let Err(e) = connection.send_datagram(Bytes::copy_from_slice(&buf[..n])) {
+                    return classify_send_error(e);
+                }
             }
             result = connection.read_datagram() => {
-                let datagram = result?;
+                let datagram = match result {
+                    Ok(d) => d,
+                    Err(e) => return classify_connection_error(e),
+                };
                 debug!(size = datagram.len(), "QUIC → TUN");
-                tun.send(&datagram).await?;
+                if let Err(e) = tun.send(&datagram).await {
+                    return TunnelResult::Fatal(e.into());
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     tracing::info!("shutdown signal received, closing connection");
                     connection.close(0u32.into(), b"shutdown");
-                    break;
+                    return TunnelResult::Shutdown;
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Parallel forwarding: TUN→QUIC and QUIC→TUN run as separate tasks.
@@ -63,7 +100,7 @@ pub async fn run_forwarding_loop_parallel(
     connection: Connection,
     tun: Arc<TunDevice>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+) -> TunnelResult {
     let initial_max = connection.max_datagram_size().unwrap_or(1200);
     tracing::info!(max_datagram_size = initial_max, "forwarding loop started (parallel)");
 
@@ -76,7 +113,7 @@ pub async fn run_forwarding_loop_parallel(
         loop {
             if let Err(e) = tun_rx.readable().await {
                 tracing::error!(error = %e, "TUN readable failed");
-                return;
+                return TunnelResult::Fatal(e.into());
             }
             loop {
                 let mut packet = vec![0u8; max_packet];
@@ -91,13 +128,13 @@ pub async fn run_forwarding_loop_parallel(
                         packet.truncate(n);
                         if let Err(e) = conn_tx.send_datagram(Bytes::from(packet)) {
                             tracing::error!(error = %e, "QUIC send failed");
-                            return;
+                            return classify_send_error(e);
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         tracing::error!(error = %e, "TUN recv failed");
-                        return;
+                        return TunnelResult::Fatal(e.into());
                     }
                 }
             }
@@ -114,13 +151,13 @@ pub async fn run_forwarding_loop_parallel(
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(error = %e, "QUIC recv failed");
-                    return;
+                    return classify_connection_error(e);
                 }
             };
             debug!(size = datagram.len(), "QUIC → TUN");
             if let Err(e) = tun_tx.send(&datagram).await {
                 tracing::error!(error = %e, "TUN send failed");
-                return;
+                return TunnelResult::Fatal(e.into());
             }
         }
     });
@@ -130,16 +167,23 @@ pub async fn run_forwarding_loop_parallel(
         _ = shutdown.changed() => {
             tracing::info!("shutdown signal received, closing connection");
             connection.close(0u32.into(), b"shutdown");
+            TunnelResult::Shutdown
         }
-        _ = tun_to_quic => {
+        result = tun_to_quic => {
             tracing::info!("TUN→QUIC task ended");
+            match result {
+                Ok(r) => r,
+                Err(e) => TunnelResult::Fatal(e.into()),
+            }
         }
-        _ = quic_to_tun => {
+        result = quic_to_tun => {
             tracing::info!("QUIC→TUN task ended");
+            match result {
+                Ok(r) => r,
+                Err(e) => TunnelResult::Fatal(e.into()),
+            }
         }
     }
-
-    Ok(())
 }
 
 /// Multi-queue forwarding: N TUN→QUIC drain workers + N QUIC→TUN writers.
@@ -151,7 +195,7 @@ pub async fn run_forwarding_loop_multiqueue(
     connection: Connection,
     tun_queues: Vec<Arc<TunDevice>>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+) -> TunnelResult {
     let n = tun_queues.len();
     let initial_max = connection.max_datagram_size().unwrap_or(1200);
     tracing::info!(
@@ -171,7 +215,7 @@ pub async fn run_forwarding_loop_multiqueue(
             loop {
                 if let Err(e) = tun.readable().await {
                     tracing::error!(queue = i, error = %e, "TUN readable failed");
-                    return;
+                    return TunnelResult::Fatal(e.into());
                 }
                 loop {
                     let mut packet = vec![0u8; max_packet];
@@ -186,13 +230,13 @@ pub async fn run_forwarding_loop_multiqueue(
                             packet.truncate(n);
                             if let Err(e) = conn.send_datagram(Bytes::from(packet)) {
                                 tracing::error!(queue = i, error = %e, "QUIC send failed");
-                                return;
+                                return classify_send_error(e);
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
                             tracing::error!(queue = i, error = %e, "TUN recv failed");
-                            return;
+                            return TunnelResult::Fatal(e.into());
                         }
                     }
                 }
@@ -210,13 +254,13 @@ pub async fn run_forwarding_loop_multiqueue(
                     Ok(d) => d,
                     Err(e) => {
                         tracing::error!(queue = i, error = %e, "QUIC recv failed");
-                        return;
+                        return classify_connection_error(e);
                     }
                 };
                 debug!(queue = i, size = datagram.len(), "QUIC → TUN");
                 if let Err(e) = tun.send(&datagram).await {
                     tracing::error!(queue = i, error = %e, "TUN send failed");
-                    return;
+                    return TunnelResult::Fatal(e.into());
                 }
             }
         });
@@ -227,11 +271,15 @@ pub async fn run_forwarding_loop_multiqueue(
         _ = shutdown.changed() => {
             tracing::info!("shutdown signal received, closing connection");
             connection.close(0u32.into(), b"shutdown");
+            TunnelResult::Shutdown
         }
-        _ = tasks.join_next() => {
+        result = tasks.join_next() => {
             tracing::info!("a forwarding task ended");
+            match result {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => TunnelResult::Fatal(e.into()),
+                None => TunnelResult::Fatal(anyhow::anyhow!("no forwarding tasks")),
+            }
         }
     }
-
-    Ok(())
 }

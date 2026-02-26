@@ -214,6 +214,8 @@ async fn run_async(
     send_window: u64,
     queues: usize,
 ) -> Result<()> {
+    use quictun_core::tunnel::TunnelResult;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -233,6 +235,7 @@ async fn run_async(
         PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
 
     let keepalive = peer.keepalive.map(Duration::from_secs);
+    let reconnect_interval = peer.reconnect_interval;
 
     let parallel = !serial;
     let bbr = !newreno;
@@ -242,6 +245,7 @@ async fn run_async(
         datagram_send_buffer: send_buf,
         send_window,
         use_bbr: bbr,
+        max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
         ..Default::default()
     };
 
@@ -256,6 +260,7 @@ async fn run_async(
         send_buf,
         send_window,
         queues,
+        reconnect = reconnect_interval.is_some(),
         "starting quictun"
     );
 
@@ -297,77 +302,287 @@ async fn run_async(
         let _ = shutdown_tx.send(true);
     });
 
-    let connection = match role {
+    // Build TUN handles once — persist across reconnections.
+    // Always wrap in Arc so both parallel and serial modes work in the reconnection loop.
+    let tun_queues: Vec<Arc<TunDevice>> = if use_multi_queue {
+        let tun_arc = Arc::new(tun);
+        let mut qs: Vec<Arc<TunDevice>> = Vec::with_capacity(queues);
+        qs.push(tun_arc);
+        #[cfg(target_os = "linux")]
+        for _ in 1..queues {
+            let cloned = qs[0]
+                .try_clone()
+                .context("failed to clone TUN queue")?;
+            qs.push(Arc::new(cloned));
+        }
+        tracing::info!(queues = qs.len(), "multi-queue TUN ready");
+        qs
+    } else {
+        vec![Arc::new(tun)]
+    };
+
+    // Feature flags from config.
+    let fips_mode = config.interface.fips_mode;
+    let cid_length = config.interface.cid_length as usize;
+    let zero_rtt = config.interface.zero_rtt;
+    let auth_mode = config.interface.auth_mode.as_str();
+
+    // Enable session resumption when reconnect or 0-RTT is configured.
+    let enable_session_resumption = reconnect_interval.is_some() || zero_rtt;
+
+    // Build endpoint config with custom CID length.
+    let endpoint_config = connection::build_endpoint_config(cid_length);
+
+    // Create endpoint once (persists across reconnections).
+    let endpoint = match role {
         Role::Listener => {
             let listen_port = config
                 .interface
                 .listen_port
                 .context("listener requires listen_port")?;
-
             let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
-            let server_config =
-                connection::build_server_config(&private_key, &[peer_pubkey], keepalive, &tuning)
-                    .context("failed to build server config")?;
+            let server_config = match auth_mode {
+                "x509" => {
+                    let cert_file = config.interface.cert_file.as_ref()
+                        .context("x509 mode requires cert_file")?;
+                    let key_file = config.interface.key_file.as_ref()
+                        .context("x509 mode requires key_file")?;
+                    let ca_file = config.interface.ca_file.as_ref()
+                        .context("x509 mode requires ca_file")?;
+                    connection::build_server_config_x509(
+                        Path::new(cert_file),
+                        Path::new(key_file),
+                        Path::new(ca_file),
+                        keepalive,
+                        &tuning,
+                        fips_mode,
+                    )
+                    .context("failed to build X.509 server config")?
+                }
+                _ => {
+                    connection::build_server_config_ext(
+                        &private_key,
+                        &[peer_pubkey.clone()],
+                        keepalive,
+                        &tuning,
+                        fips_mode,
+                    )
+                    .context("failed to build RPK server config")?
+                }
+            };
 
-            let endpoint = quinn::Endpoint::server(server_config, bind_addr)
-                .context("failed to bind QUIC endpoint")?;
-
-            tracing::info!(address = %bind_addr, "listening for incoming connection");
-
-            let incoming = endpoint.accept().await.context("no incoming connection")?;
-
-            let conn = incoming.await.context("failed to accept connection")?;
-            tracing::info!(
-                remote = %conn.remote_address(),
-                "connection established (listener)"
-            );
-            conn
+            let socket = std::net::UdpSocket::bind(bind_addr)
+                .context("failed to bind UDP socket")?;
+            quinn::Endpoint::new(
+                endpoint_config,
+                Some(server_config),
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .context("failed to create QUIC endpoint")?
         }
         Role::Connector => {
-            let server_endpoint = peer.endpoint.context("connector requires peer endpoint")?;
+            let client_config = match auth_mode {
+                "x509" => {
+                    let cert_file = config.interface.cert_file.as_ref()
+                        .context("x509 mode requires cert_file")?;
+                    let key_file = config.interface.key_file.as_ref()
+                        .context("x509 mode requires key_file")?;
+                    let ca_file = config.interface.ca_file.as_ref()
+                        .context("x509 mode requires ca_file")?;
+                    connection::build_client_config_x509(
+                        Path::new(cert_file),
+                        Path::new(key_file),
+                        Path::new(ca_file),
+                        keepalive,
+                        &tuning,
+                        fips_mode,
+                        enable_session_resumption,
+                    )
+                    .context("failed to build X.509 client config")?
+                }
+                _ => {
+                    connection::build_client_config_ext(
+                        &private_key,
+                        &peer_pubkey,
+                        keepalive,
+                        &tuning,
+                        fips_mode,
+                        enable_session_resumption,
+                    )
+                    .context("failed to build RPK client config")?
+                }
+            };
 
-            let client_config =
-                connection::build_client_config(&private_key, &peer_pubkey, keepalive, &tuning)
-                    .context("failed to build client config")?;
-
-            let mut endpoint =
-                quinn::Endpoint::client("0.0.0.0:0".parse()?).context("failed to bind client")?;
-
-            endpoint.set_default_client_config(client_config);
-
-            tracing::info!(endpoint = %server_endpoint, "connecting to peer");
-
-            let conn = endpoint
-                .connect(server_endpoint, "quictun")?
-                .await
-                .context("failed to connect to peer")?;
-
-            tracing::info!(
-                remote = %conn.remote_address(),
-                "connection established (connector)"
-            );
-            conn
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>()?)
+                .context("failed to bind UDP socket")?;
+            let mut ep = quinn::Endpoint::new(
+                endpoint_config,
+                None,
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .context("failed to create QUIC endpoint")?;
+            ep.set_default_client_config(client_config);
+            ep
         }
     };
 
-    if use_multi_queue {
-        // Build N queue handles: the original + (N-1) clones
-        let mut tun_queues: Vec<Arc<TunDevice>> = Vec::with_capacity(queues);
-        tun_queues.push(Arc::new(tun));
-        #[cfg(target_os = "linux")]
-        for _ in 1..queues {
-            let cloned = tun_queues[0]
-                .try_clone()
-                .context("failed to clone TUN queue")?;
-            tun_queues.push(Arc::new(cloned));
+    let server_endpoint_addr = peer.endpoint;
+
+    // Backoff state for reconnection.
+    let mut backoff_secs: u64 = 1;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    loop {
+        // Check if shutdown was already requested.
+        if *shutdown_rx.borrow() {
+            break;
         }
-        tracing::info!(queues = tun_queues.len(), "multi-queue TUN ready");
-        tunnel::run_forwarding_loop_multiqueue(connection, tun_queues, shutdown_rx).await?;
-    } else if parallel {
-        tunnel::run_forwarding_loop_parallel(connection, Arc::new(tun), shutdown_rx).await?;
-    } else {
-        tunnel::run_forwarding_loop(connection, &tun, shutdown_rx).await?;
+
+        // Establish connection.
+        let connection = match role {
+            Role::Listener => {
+                let bind_addr = endpoint.local_addr()?;
+                tracing::info!(address = %bind_addr, "listening for incoming connection");
+
+                let incoming = match endpoint.accept().await {
+                    Some(inc) => inc,
+                    None => {
+                        tracing::error!("endpoint closed, no more incoming connections");
+                        break;
+                    }
+                };
+
+                match incoming.await {
+                    Ok(conn) => {
+                        tracing::info!(
+                            remote = %conn.remote_address(),
+                            "connection established (listener)"
+                        );
+                        conn
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to accept connection");
+                        if reconnect_interval.is_some() {
+                            continue;
+                        }
+                        return Err(e).context("failed to accept connection");
+                    }
+                }
+            }
+            Role::Connector => {
+                let remote = server_endpoint_addr.context("connector requires peer endpoint")?;
+                tracing::info!(endpoint = %remote, "connecting to peer");
+
+                match endpoint.connect(remote, "quictun") {
+                    Ok(connecting) => {
+                        // Try 0-RTT if enabled (requires a cached session ticket).
+                        let conn_result = if zero_rtt {
+                            match connecting.into_0rtt() {
+                                Ok((conn, zero_rtt_accepted)) => {
+                                    tracing::info!("0-RTT connection initiated");
+                                    tokio::spawn(async move {
+                                        if zero_rtt_accepted.await {
+                                            tracing::info!("0-RTT accepted by server");
+                                        } else {
+                                            tracing::warn!("0-RTT rejected, fell back to 1-RTT");
+                                        }
+                                    });
+                                    Ok(conn)
+                                }
+                                Err(connecting) => {
+                                    tracing::debug!("no session ticket for 0-RTT, using 1-RTT");
+                                    connecting.await
+                                }
+                            }
+                        } else {
+                            connecting.await
+                        };
+
+                        match conn_result {
+                            Ok(conn) => {
+                                tracing::info!(
+                                    remote = %conn.remote_address(),
+                                    "connection established (connector)"
+                                );
+                                conn
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to connect to peer");
+                                if reconnect_interval.is_some() {
+                                    let jitter_ms = (std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .subsec_nanos()
+                                        % 1000) as u64;
+                                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                                    tokio::time::sleep(delay).await;
+                                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                                    continue;
+                                }
+                                return Err(e).context("failed to connect to peer");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "connect call failed");
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
+
+        // Connection established — reset backoff.
+        backoff_secs = 1;
+
+        // Run forwarding loop. TUN device + endpoint persist; only Connection is recycled.
+        let result = if use_multi_queue {
+            tunnel::run_forwarding_loop_multiqueue(
+                connection,
+                tun_queues.clone(),
+                shutdown_rx.clone(),
+            )
+            .await
+        } else if parallel {
+            tunnel::run_forwarding_loop_parallel(
+                connection,
+                tun_queues[0].clone(),
+                shutdown_rx.clone(),
+            )
+            .await
+        } else {
+            tunnel::run_forwarding_loop(connection, &tun_queues[0], shutdown_rx.clone()).await
+        };
+
+        match result {
+            TunnelResult::Shutdown => {
+                tracing::info!("tunnel closed (shutdown)");
+                break;
+            }
+            TunnelResult::ConnectionLost(e) => {
+                if reconnect_interval.is_some() {
+                    tracing::warn!(error = %e, "connection lost, will reconnect");
+                    let jitter_ms = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos()
+                        % 1000) as u64;
+                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                    tokio::time::sleep(delay).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+                tracing::info!(error = %e, "connection lost, exiting (no reconnect configured)");
+                break;
+            }
+            TunnelResult::Fatal(e) => {
+                return Err(e).context("fatal tunnel error");
+            }
+        }
     }
 
     tracing::info!("tunnel closed");
