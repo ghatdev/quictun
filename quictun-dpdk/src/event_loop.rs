@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,13 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::eal::Eal;
-use crate::engine;
+use crate::engine::{self, InnerEthHeader, InnerInterface};
 use crate::ffi;
 use crate::mbuf;
 use crate::net::{self, ArpTable, NetIdentity};
 use crate::port;
 use crate::reader;
 use crate::shared::QuicState;
+use crate::veth::VethPair;
 
 /// QUIC endpoint setup (connector or listener), same pattern as quictun-uring.
 pub enum EndpointSetup {
@@ -40,14 +42,25 @@ pub struct DpdkConfig {
     pub local_port: Option<u16>,
     /// Static peer MAC address (skip ARP if provided).
     pub gateway_mac: Option<[u8; 6]>,
+    /// Tunnel IP for the inner interface (e.g., 10.0.0.1).
+    pub tunnel_ip: Ipv4Addr,
+    /// Tunnel subnet prefix length (e.g., 24).
+    pub tunnel_prefix: u8,
+    /// Tunnel MTU from config.
+    pub tunnel_mtu: u16,
+    /// Tunnel interface name (e.g., "quictun0").
+    pub tunnel_iface: String,
 }
 
 /// Run the DPDK data plane.
 ///
 /// Initializes EAL, configures the port, resolves ARP, and runs the
 /// engine polling loop.  Returns when the connection is lost or SIGINT.
+///
+/// - `tun_fd: Some(fd)` → TUN mode (v1, reader thread + channel)
+/// - `tun_fd: None` → AF_XDP mode (v2, veth pair + DPDK AF_XDP PMD)
 pub fn run(
-    tun_fd: RawFd,
+    tun_fd: Option<RawFd>,
     local_addr: SocketAddr,
     setup: EndpointSetup,
     dpdk_config: DpdkConfig,
@@ -56,7 +69,7 @@ pub fn run(
 
     let _eal = Eal::init(&dpdk_config.eal_args)?;
 
-    // ── 2. Create mempool and configure port ─────────────────────
+    // ── 2. Create mempool and configure outer port ────────────────
 
     let mempool =
         mbuf::create_mempool("quictun_dpdk", ffi::DEFAULT_NUM_MBUFS, ffi::MEMPOOL_CACHE_SIZE)?;
@@ -155,16 +168,80 @@ pub fn run(
         }
     }
 
-    // ── 6. Spawn TUN reader thread ───────────────────────────────
+    // ── 6. Build inner interface ─────────────────────────────────
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (tun_tx, tun_rx) = crossbeam_channel::bounded(512);
 
-    let reader_shutdown = shutdown.clone();
-    let reader_handle = std::thread::Builder::new()
-        .name("dpdk-reader".into())
-        .spawn(move || reader::run(tun_fd, tun_tx, reader_shutdown))
-        .context("failed to spawn reader thread")?;
+    // These hold ownership for the lifetime of the engine loop.
+    let mut _reader_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut _veth_pair: Option<VethPair> = None;
+
+    let inner = match tun_fd {
+        Some(fd) => {
+            // TUN mode: spawn reader thread + channel.
+            let (tun_tx, tun_rx) = crossbeam_channel::bounded(512);
+            let reader_shutdown = shutdown.clone();
+            let handle = std::thread::Builder::new()
+                .name("dpdk-reader".into())
+                .spawn(move || reader::run(fd, tun_tx, reader_shutdown))
+                .context("failed to spawn reader thread")?;
+            _reader_handle = Some(handle);
+            tracing::info!("inner interface: TUN (reader thread)");
+            InnerInterface::Tun { tun_fd: fd, tun_rx }
+        }
+        None => {
+            // AF_XDP mode: create veth pair, init DPDK AF_XDP PMD.
+            let veth = VethPair::create(
+                &dpdk_config.tunnel_iface,
+                dpdk_config.tunnel_ip,
+                dpdk_config.tunnel_prefix,
+                dpdk_config.tunnel_mtu,
+            )?;
+
+            // Initialize AF_XDP vdev on the xdp-facing veth end.
+            let vdev_name = CString::new("net_af_xdp0")
+                .expect("CString::new failed");
+            let vdev_args = CString::new(format!("iface={}", veth.xdp_iface))
+                .expect("CString::new failed");
+
+            let ret = unsafe {
+                ffi::rte_vdev_init(vdev_name.as_ptr(), vdev_args.as_ptr())
+            };
+            if ret != 0 {
+                bail!("rte_vdev_init(net_af_xdp0, iface={}) failed: error {ret}", veth.xdp_iface);
+            }
+
+            // Find the newly created port. It's the next available port after the outer port.
+            let total_ports = unsafe { ffi::rte_eth_dev_count_avail() };
+            if total_ports < 2 {
+                bail!("AF_XDP vdev created but only {total_ports} port(s) available (expected ≥ 2)");
+            }
+            // The inner port is the highest port ID (newly created vdev).
+            let inner_port_id = total_ports as u16 - 1;
+
+            // Configure the inner port (same setup as outer).
+            let inner_mac = port::configure_port(inner_port_id, mempool)?;
+
+            // Promiscuous mode may fail on AF_XDP — make it non-fatal (already attempted in configure_port).
+            tracing::info!(
+                inner_port = inner_port_id,
+                inner_mac = %format_mac(&inner_mac),
+                xdp_iface = %veth.xdp_iface,
+                "AF_XDP inner port configured"
+            );
+
+            // Build the pre-computed Ethernet header for engine → app direction.
+            let inner_eth_hdr = InnerEthHeader::new(inner_mac, veth.app_mac);
+
+            _veth_pair = Some(veth);
+            tracing::info!("inner interface: AF_XDP (veth pair)");
+
+            InnerInterface::AfXdp {
+                inner_port_id,
+                inner_eth_hdr,
+            }
+        }
+    };
 
     // ── 7. Set up SIGINT handler ─────────────────────────────────
 
@@ -186,16 +263,18 @@ pub fn run(
         &mut quic_state,
         &mut identity,
         &mut arp_table,
-        tun_fd,
-        tun_rx,
+        inner,
         shutdown.clone(),
     );
 
     // ── 9. Cleanup ───────────────────────────────────────────────
 
     shutdown.store(true, Ordering::Release);
-    let _ = reader_handle.join();
+    if let Some(handle) = _reader_handle {
+        let _ = handle.join();
+    }
     port::close_port(dpdk_config.port_id);
+    // _veth_pair dropped here → deletes veth pair.
 
     result
 }

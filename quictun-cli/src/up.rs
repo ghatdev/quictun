@@ -33,7 +33,7 @@ pub fn run(
     zero_copy: bool,
     initial_rtt: u64,
     pin_mtu: bool,
-    dpdk: bool,
+    dpdk: Option<String>,
     dpdk_local_ip: Option<String>,
     dpdk_remote_ip: Option<String>,
     dpdk_local_port: Option<u16>,
@@ -45,13 +45,14 @@ pub fn run(
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
 
-    if dpdk {
+    if let Some(dpdk_mode) = dpdk {
         return run_dpdk(
             config_path,
             cc,
             recv_buf,
             send_buf,
             send_window,
+            &dpdk_mode,
             dpdk_local_ip,
             dpdk_remote_ip,
             dpdk_local_port,
@@ -98,6 +99,7 @@ fn run_dpdk(
     _recv_buf: usize,
     _send_buf: usize,
     _send_window: u64,
+    _dpdk_mode: &str,
     _dpdk_local_ip: Option<String>,
     _dpdk_remote_ip: Option<String>,
     _dpdk_local_port: Option<u16>,
@@ -116,6 +118,7 @@ fn run_dpdk(
     recv_buf: usize,
     send_buf: usize,
     send_window: u64,
+    dpdk_mode: &str,
     dpdk_local_ip: Option<String>,
     dpdk_remote_ip: Option<String>,
     dpdk_local_port: Option<u16>,
@@ -123,7 +126,12 @@ fn run_dpdk(
     dpdk_eal_args: String,
     dpdk_port: u16,
 ) -> Result<()> {
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::AsRawFd;
+
+    // Validate mode.
+    if dpdk_mode != "tun" && dpdk_mode != "xdp" {
+        anyhow::bail!("--dpdk mode must be 'tun' or 'xdp', got '{dpdk_mode}'");
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -172,6 +180,9 @@ fn run_dpdk(
 
     let eal_args: Vec<String> = dpdk_eal_args.split(';').map(|s| s.to_string()).collect();
 
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
     tracing::info!(
         role = ?role,
         address = %addr,
@@ -179,23 +190,31 @@ fn run_dpdk(
         dpdk_local_ip = %dpdk_local_ip,
         dpdk_remote_ip = %dpdk_remote_ip,
         dpdk_port,
+        dpdk_mode,
         cc = %cc,
         "starting quictun (DPDK)"
     );
 
-    // Resolve interface name from config.
-    let iface_name = config.interface_name(Path::new(config_path));
+    // Build tunnel network config (used by both modes, cheap).
+    let tunnel_ip = addr.addr();
+    let tunnel_prefix = addr.prefix_len();
+    let tunnel_mtu = config.mtu();
 
-    // Create sync TUN device.
-    let mut tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
-    tun_opts.name = Some(iface_name.clone());
-    let tun_device =
-        quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
-    let tun_fd: RawFd = tun_device.as_raw_fd();
+    // TUN mode: create TUN device. XDP mode: skip TUN, use veth pair instead.
+    let tun_device = if dpdk_mode == "tun" {
+        let mut tun_opts = TunOptions::new(tunnel_ip, tunnel_prefix, tunnel_mtu);
+        tun_opts.name = Some(iface_name.clone());
+        let dev = quictun_tun::create_sync(&tun_opts)
+            .context("failed to create sync TUN device")?;
+        Some(dev)
+    } else {
+        None
+    };
+    let tun_fd = tun_device.as_ref().map(|d| d.as_raw_fd());
 
     // Write PID file.
     state::write_pid_file(&iface_name)?;
-    let _pid_guard = state::PidFileGuard::new(iface_name);
+    let _pid_guard = state::PidFileGuard::new(iface_name.clone());
 
     // Build quinn-proto configs.
     let listen_port = config.interface.listen_port.unwrap_or(0);
@@ -231,6 +250,10 @@ fn run_dpdk(
         remote_ip: dpdk_remote_ip,
         local_port: dpdk_local_port,
         gateway_mac,
+        tunnel_ip,
+        tunnel_prefix,
+        tunnel_mtu,
+        tunnel_iface: iface_name,
     };
 
     // tun_device must outlive the event loop (owns the fd).

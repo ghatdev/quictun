@@ -5,6 +5,7 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_eal.h>
+#include <rte_bus_vdev.h>
 
 /*
  * C shim wrappers for inline DPDK functions.
