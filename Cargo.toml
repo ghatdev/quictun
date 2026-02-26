@@ -48,6 +48,9 @@ clap = { version = "4", features = ["derive"] }
 # PEM parsing (for X.509 mode)
 rustls-pemfile = "2"
 
+# Test utilities
+rcgen = "0.13"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

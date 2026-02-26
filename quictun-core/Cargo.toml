@@ -23,3 +23,7 @@ quictun-tun = { workspace = true }
 bytes = { workspace = true }
 aws-lc-rs = { workspace = true }
 rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = "3"
