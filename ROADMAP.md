@@ -428,6 +428,7 @@ allowed_ips = ["10.0.0.0/24"]
 - **Signal handling**: SIGTERM/SIGINT → graceful shutdown (PreDown, PostDown)
 - **PID file**: `/run/quictun/<interface>.pid`
 - **Hooks**: `PreUp`, `PostUp`, `PreDown`, `PostDown` — shell commands run at lifecycle points
+- **Auto NIC binding (DPDK)**: bind PCI device to vfio-pci via sysfs writes before EAL init — no `dpdk-devbind.py` or Python runtime needed. Just `modprobe vfio-pci` + sysfs `unbind`/`bind`. Could be built into quictun startup or provided as a default PreUp hook.
 - **Remove `Command`**: current `down` command uses PID file + SIGTERM; hooks replace ad-hoc scripting
 - **Systemd unit**: `quictun@.service` template for per-tunnel management
 

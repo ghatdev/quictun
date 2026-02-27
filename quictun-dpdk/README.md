@@ -209,9 +209,13 @@ sudo modprobe vfio-pci
 echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
 
 # Bind ens19 to DPDK (NEVER bind the primary NIC!)
+# Uses raw sysfs writes — no dpdk-devbind.py or Python runtime needed.
 sudo ip link set ens19 down
-sudo dpdk-devbind.py --bind=vfio-pci 0000:00:13.0
-dpdk-devbind.py --status  # verify
+echo "0000:00:13.0" | sudo tee /sys/bus/pci/devices/0000:00:13.0/driver/unbind
+echo "0000:00:13.0" | sudo tee /sys/bus/pci/drivers/vfio-pci/bind
+
+# Verify binding
+ls -l /sys/bus/pci/devices/0000:00:13.0/driver  # should symlink to vfio-pci
 ```
 
 ## Build Notes
