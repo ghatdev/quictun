@@ -550,28 +550,92 @@ void shim_generate_rss_key(uint8_t *key, size_t key_len,
 
 ---
 
+## Optimization Map (Post-Profiling)
+
+Profiling at 5.13 Gbps (DPDK single-core) revealed: **quinn-proto state machine (19.3%) is the #1 CPU cost**, followed by inner I/O (10.4%), crypto (8.3%), and timing (4.0%). IPC=1.77 — the single core is compute-saturated.
+
+### Cross-Backend Optimizations (all data planes benefit)
+
+| # | Optimization | Layer | Impact | Effort | Status |
+|---|-------------|-------|--------|--------|--------|
+| **1** | **N connections on N cores** | `quictun-core` | **2-4x throughput** | High | Design phase |
+| 2 | TUN GSO/GRO for io_uring | `quictun-tun` | ~25-30% | Medium | Not started |
+| 3 | Cache `tag_len` after handshake | `quinn-proto` fork | ~1-2% per core | Low | Not started |
+| 4 | `#[inline]` hot functions | `quinn-proto` fork | ~1-3% per core | Low | Not started |
+| 5 | Reduce `predict_1rtt_overhead` calls | `quinn-proto` fork | ~2% per core | Medium | Not started |
+| 6 | DATAGRAM fast path (skip stream checks) | `quinn-proto` fork | ~0.5-1% per core | Medium | Not started |
+| 7 | PGO build | build pipeline | ~5-15% per core | Medium | Not started |
+| 8 | Thin LTO | `Cargo.toml` | ~3-5% per core | — | **DONE** |
+
+**N connections on N cores** is backend-agnostic: tokio gets N `quinn::Connection` on N tasks, io_uring/DPDK get N `quinn-proto::Connection` on N threads. Traffic splitting (hash inner packets → connection N) lives in `quictun-core`.
+
+**TUN GSO/GRO for io_uring**: same kernel TUN feature (`IFF_VNET_HDR` + `TUN_F_USO4/6`) that gave tokio +29%. Needs sync `recv_multiple`/`send_multiple` in tun-rs or raw `virtio_net_hdr` parsing. DPDK doesn't use kernel TUN so this doesn't apply there.
+
+**quinn-proto fork items (3-6)**: all backends use quinn-proto (tokio indirectly via `quinn` crate). Per-core savings compound with multi-core.
+
+### Per-Backend Optimizations
+
+**DPDK only:**
+
+| Optimization | Impact | Status |
+|-------------|--------|--------|
+| Zero-copy `Bytes::from_owner` (MbufSlice) | ~1.5-2% | **DONE** |
+| Batched `Instant::now()` | ~3-4% | **DONE** |
+| Reuse `BytesMut` for RX | ~0.5-1% | **DONE** |
+| Software UDP checksum (AVX2) | ~2-3% vs naive | DONE |
+| Virtio-user multi-queue inner | enables multi-core | Not started |
+
+**io_uring only:**
+
+| Optimization | Impact | Status |
+|-------------|--------|--------|
+| SendZc zero-copy | +27% | DONE |
+| RecvMulti + provided buffers | +5% | DONE |
+| Batched `Instant::now()` | ~2-3% | Not started |
+| Reuse `BytesMut` for RX | ~0.5% | Not started |
+
+**tokio only:**
+
+| Optimization | Impact | Status |
+|-------------|--------|--------|
+| TUN GSO/GRO (`--offload`) | +29% | DONE |
+| Socket buffer tuning (`rmem_max`) | +177% | DONE |
+
+### Profiling Results (DPDK virtio-user, single core)
+
+| Category | % CPU | Key functions |
+|----------|-------|---------------|
+| **quinn-proto state machine** | 19.3% | `Endpoint::handle` (3.8%), `predict_1rtt_overhead` (3.0%), `poll_transmit` (2.0%), `process_payload` (1.0%), 20+ other functions |
+| **Inner I/O (vhost kernel)** | 10.4% | `_copy_from_iter`, `spin_unlock`, `csum_partial`, `clear_page_erms` |
+| **AES-GCM crypto** | 8.3% | `aes_gcm_decrypt_avx512` (5.0%), `gcm_gmult` (1.0%), `aead_open_gather` (0.8%) |
+| **Memory copy (libc)** | 6.3% | `memcpy`/`memmove` (6 symbols) |
+| **Timing (vdso + Instant)** | 4.0% | `clock_gettime` (2.8%), `Instant::now` (0.3%), `sub_timespec` (0.3%) |
+| **quictun engine** | 6.4% | `process_events` (3.4%), `engine::run` (1.7%), `drain_and_send` (0.7%) |
+| **Allocation** | 0.7% | mimalloc (malloc/free/find_page) |
+
+Hardware counters: IPC=1.77 (compute-bound), cache miss rate 0.59% (excellent), branch misses low. **Single core is saturated — multi-core is the only path to 2x+.**
+
 ## Priority Summary
 
 | # | Item | Priority | Expected Impact | Effort | Status |
 |---|------|----------|----------------|--------|--------|
-| 1 | ~~TUN GSO/GRO (tokio)~~ | — | 1.24 → 1.60 Gbps (+29%) | — | **DONE** |
-| 2 | Profile bottlenecks | **Highest** | Determines remaining priorities | Low | |
-| 3 | ~~Virtio-user inner (DPDK)~~ | — | 2.22 Gbps (+14% vs TAP) | — | **DONE (initial)** |
-| 4 | Build DPDK 25.11 from source | High | Multi-queue virtio-user, SORING | Medium | |
-| 5 | Daemon mode + hooks | High | Production readiness | Medium | |
-| 6 | Router mode + memif | Medium | Zero-kernel data path | High | |
-| 7 | SORING multi-core pipeline | Medium | Scale past single-core | High | |
-| 8 | Optimized RSS hash keys | Low* | Better multi-core distribution | Low | |
-| ~~9~~ | ~~Inner interface research~~ | — | — | — | **Resolved**: virtio-user wins |
-
-*Priority 8 becomes High once multi-queue hardware is available.
+| **1** | **N connections on N cores** | **Highest** | **2-4x all backends** | High | Design phase |
+| ~~2~~ | ~~Profile bottlenecks~~ | — | Determined priorities | — | **DONE** |
+| 3 | quinn-proto fork optimizations | High | ~5-8% per core, all backends | Medium | Not started |
+| ~~4~~ | ~~DPDK hot path optimizations~~ | — | 4.97 → 5.13 Gbps (+3.2%) | — | **DONE** |
+| ~~5~~ | ~~Build DPDK 25.11 from source~~ | — | — | — | **DONE** |
+| 6 | TUN GSO/GRO for io_uring | Medium | ~25-30% for io_uring | Medium | Not started |
+| 7 | Daemon mode + lifecycle hooks | Medium | Production readiness | Medium | Not started |
+| 8 | PGO build | Medium | ~5-15% all backends | Medium | Not started |
+| 9 | Router mode + memif | Low | Zero-kernel data path | High | Not started |
+| 10 | SORING multi-core pipeline | Low | Alternative to N-connections | High | Not started |
 
 **Key realizations (updated Feb 27)**:
-- **TUN GSO/GRO closes the gap**: tokio + `--offload` matches kernel WireGuard (1.60 vs 1.62 Gbps) on VMs. The userspace overhead is eliminated.
-- **Virtio-user replaces AF_XDP**: same throughput (2.22 vs 2.25 Gbps), much simpler, better bare-metal potential. AF_XDP+veth is deprecated.
-- **DPDK inner interface is solved**: virtio-user is the answer. Remaining DPDK work is multi-queue + multi-core (needs DPDK 25.11 source build).
-- **Two production paths**: tokio + `--offload` (simple, no dependencies) vs DPDK + virtio-user (higher throughput, more complexity).
-- **All our benchmarks are VM-limited.** Bare-metal testing would reveal the true potential of both paths.
+- **quinn-proto is the #1 bottleneck** — 19.3% of CPU. State machine overhead (CC, ACK, loss detection, header parsing) costs 2.3x more than AES-GCM crypto.
+- **Single-core is saturated at ~5 Gbps.** IPC=1.77, no memory stalls. Only multi-core can push past this.
+- **Multi-core is a cross-backend problem.** quinn-proto's `Connection` is `!Send` and single-threaded. N independent connections is the pragmatic solution — works for all three data planes without quinn-proto changes.
+- **Crypto is NOT the bottleneck.** AVX-512 VAES makes AES-GCM only 8.3% of CPU. Optimizing crypto further yields diminishing returns.
+- **Two production paths**: tokio + `--offload` (2.59 Gbps, simple) vs DPDK + virtio-user (5.13 Gbps, complex). Both hit the same quinn-proto single-core wall.
 
 ---
 
