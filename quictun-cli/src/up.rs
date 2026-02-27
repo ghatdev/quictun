@@ -141,8 +141,8 @@ fn run_dpdk(
     no_udp_checksum: bool,
 ) -> Result<()> {
     // Validate mode.
-    if dpdk_mode != "tap" && dpdk_mode != "xdp" {
-        anyhow::bail!("--dpdk mode must be 'tap' or 'xdp', got '{dpdk_mode}'");
+    if dpdk_mode != "tap" && dpdk_mode != "xdp" && dpdk_mode != "virtio" {
+        anyhow::bail!("--dpdk mode must be 'tap', 'xdp', or 'virtio', got '{dpdk_mode}'");
     }
 
     tracing_subscriber::fmt()

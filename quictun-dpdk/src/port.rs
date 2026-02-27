@@ -61,7 +61,12 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([
     // SAFETY: port is configured and queues are set up.
     let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
     if ret != 0 {
-        bail!("rte_eth_promiscuous_enable failed: {}", dpdk_strerror(-ret));
+        // Non-fatal: virtio-user doesn't support promiscuous mode, but it's not
+        // required for inner ports where we send/receive to known MACs.
+        tracing::warn!(
+            port = port_id,
+            "rte_eth_promiscuous_enable not supported (ok for inner ports)"
+        );
     }
 
     // Start the port.

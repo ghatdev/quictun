@@ -44,7 +44,7 @@ pub enum EndpointSetup {
 
 /// DPDK-specific configuration from CLI flags.
 pub struct DpdkConfig {
-    /// Inner interface mode: "tap" (default) or "xdp".
+    /// Inner interface mode: "tap" (default), "xdp", or "virtio".
     pub mode: String,
     /// EAL arguments (e.g., ["-l", "0", "-n", "4"]).
     pub eal_args: Vec<String>,
@@ -82,6 +82,7 @@ pub struct DpdkConfig {
 ///
 /// - mode "tap" → TAP PMD (default, DPDK built-in TAP virtual device)
 /// - mode "xdp" → AF_XDP (veth pair + DPDK AF_XDP PMD)
+/// - mode "virtio" → virtio-user + vhost-net (kernel TAP with offload support)
 pub fn run(
     local_addr: SocketAddr,
     setup: EndpointSetup,
@@ -89,8 +90,8 @@ pub fn run(
 ) -> Result<()> {
     // ── 1. Initialize DPDK EAL ───────────────────────────────────
 
-    // For TAP mode, inject TAP vdev(s) into EAL args before init.
-    // Multi-core: N TAP PMDs (quictun0, quictun1, ...).
+    // For TAP/virtio mode, inject vdev(s) into EAL args before init.
+    // Multi-core: N vdevs (quictun0, quictun1, ...).
     let n_cores = dpdk_config.n_cores.max(1);
     let mut eal_args = dpdk_config.eal_args.clone();
     if dpdk_config.mode == "tap" {
@@ -102,6 +103,14 @@ pub fn run(
             };
             eal_args.push(format!("--vdev=net_tap{i},iface={iface}"));
         }
+    } else if dpdk_config.mode == "virtio" {
+        if n_cores > 1 {
+            bail!("multi-core (--dpdk-cores > 1) is not yet supported with virtio-user mode");
+        }
+        let iface = dpdk_config.tunnel_iface.clone();
+        eal_args.push(format!(
+            "--vdev=net_virtio_user0,path=/dev/vhost-net,iface={iface},queues=1,queue_size=1024"
+        ));
     }
 
     let _eal = Eal::init(&eal_args)?;
@@ -232,14 +241,15 @@ pub fn run(
 
     let mut inner_ports: Vec<InnerPort> = Vec::with_capacity(n_cores);
 
-    if dpdk_config.mode == "tap" {
-        // TAP PMD mode: DPDK created TAP device(s) via --vdev in EAL args.
+    if dpdk_config.mode == "tap" || dpdk_config.mode == "virtio" {
+        // TAP PMD or virtio-user mode: DPDK created device(s) via --vdev in EAL args.
+        // Both create kernel-visible TAP interfaces that need IP configuration.
         // SAFETY: EAL is initialized; returns the count of available DPDK ports.
         let total_ports = unsafe { ffi::rte_eth_dev_count_avail() } as u16;
-        let expected = 1 + n_cores as u16; // outer + N TAPs
+        let expected = 1 + n_cores as u16; // outer + N inner ports
         if total_ports < expected {
             bail!(
-                "TAP vdev not found: only {total_ports} port(s) available (expected ≥ {expected})"
+                "inner vdev not found: only {total_ports} port(s) available (expected ≥ {expected})"
             );
         }
 
@@ -248,7 +258,7 @@ pub fn run(
 
         for i in 0..n_cores {
             let inner_port_id = (total_ports - n_cores as u16) + i as u16;
-            let (tap_mac, _inner_hw_offload) = port::configure_port(inner_port_id, mempool)?;
+            let (inner_mac, inner_hw_offload) = port::configure_port(inner_port_id, mempool)?;
 
             let iface = if n_cores == 1 {
                 dpdk_config.tunnel_iface.clone()
@@ -258,12 +268,14 @@ pub fn run(
 
             tracing::info!(
                 inner_port = inner_port_id,
-                tap_mac = %format_mac(&tap_mac),
+                inner_mac = %format_mac(&inner_mac),
+                hw_offload = inner_hw_offload,
                 iface = %iface,
-                "TAP PMD inner port configured"
+                mode = %dpdk_config.mode,
+                "inner port configured"
             );
 
-            // Each TAP gets its own tunnel IP for multi-core.
+            // Each inner port gets its own tunnel IP for multi-core.
             // Core 0 gets the base IP; additional cores get base+i.
             let tunnel_ip = if n_cores == 1 {
                 dpdk_config.tunnel_ip
@@ -279,14 +291,14 @@ pub fn run(
                 dpdk_config.tunnel_mtu,
             )?;
 
-            let eth_hdr = InnerEthHeader::new(peer_mac, tap_mac);
+            let eth_hdr = InnerEthHeader::new(peer_mac, inner_mac);
             inner_ports.push(InnerPort {
                 port_id: inner_port_id,
                 eth_hdr,
             });
         }
 
-        tracing::info!(n_cores, "inner interface: TAP PMD");
+        tracing::info!(n_cores, mode = %dpdk_config.mode, "inner interface ready");
     } else {
         // AF_XDP mode: create veth pair, init DPDK AF_XDP PMD.
         // Multi-core AF_XDP not supported yet — requires per-queue veth pairs.
