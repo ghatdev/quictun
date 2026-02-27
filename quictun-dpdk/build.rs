@@ -75,11 +75,23 @@ fn dpdk_build() {
     }
     cc_build.compile("dpdk_shim");
 
-    // DPDK PMDs register via __attribute__((constructor)). Use +whole-archive
-    // to prevent the linker from stripping these constructors in static builds.
-    // (Inspired by Demikernel's static:-bundle,+whole-archive approach.)
-    println!("cargo:rustc-link-lib=static:+whole-archive=rte_bus_vdev");
-    // librte_net_af_xdp: only link if available (requires libxdp at DPDK build time).
+    // DPDK PMDs register via __attribute__((constructor)). The pkg-config crate
+    // emits --whole-archive flags but Cargo doesn't preserve their ordering relative
+    // to library links. Explicitly link each PMD with +whole-archive to ensure
+    // constructors survive static linking. (Demikernel does the same on Windows.)
+    let pmd_libs = [
+        ("rte_bus_pci", true),     // PCI bus (dep of net_virtio PCI driver)
+        ("rte_bus_vdev", true),    // vdev bus (rte_vdev_init/uninit)
+        ("rte_net_virtio", true),  // virtio-user PMD (--dpdk virtio)
+        ("rte_net_tap", true),     // TAP PMD (--dpdk tap)
+        ("rte_mempool_ring", true), // ring mempool (always needed)
+    ];
+    for (lib, required) in pmd_libs {
+        if required || dpdk.libs.iter().any(|l| l.contains(lib)) {
+            println!("cargo:rustc-link-lib=static:+whole-archive={lib}");
+        }
+    }
+    // AF_XDP: only link if available (requires libxdp at DPDK build time).
     if dpdk.libs.iter().any(|l| l.contains("af_xdp")) {
         println!("cargo:rustc-link-lib=static:+whole-archive=rte_net_af_xdp");
     }
