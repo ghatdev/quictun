@@ -9,6 +9,7 @@
 # Environment variables:
 #   DPDK_VERSION   DPDK version to build (default: 25.11)
 #   DPDK_PREFIX    Install prefix (default: /opt/dpdk)
+#   DPDK_DRIVERS   Comma-separated driver list (default: see below)
 #   BUILD_DIR      Temporary build directory (default: /tmp/dpdk-build)
 
 set -euo pipefail
@@ -16,6 +17,27 @@ set -euo pipefail
 DPDK_VERSION="${DPDK_VERSION:-25.11}"
 DPDK_PREFIX="${DPDK_PREFIX:-/opt/dpdk}"
 BUILD_DIR="${BUILD_DIR:-/tmp/dpdk-build}"
+
+# Drivers to build. Override via DPDK_DRIVERS env var to add NIC drivers.
+#
+# Required (do not remove):
+#   bus/pci       — PCI bus (physical NICs)
+#   bus/vdev      — Virtual device bus (TAP, virtio-user, memif)
+#   mempool/ring  — Ring-based mempool
+#
+# Inner interfaces (need at least one):
+#   net/virtio    — Virtio NIC + virtio-user via vhost-net (recommended)
+#   net/af_xdp    — AF_XDP socket PMD (alternative)
+#   net/tap       — TAP PMD (simplest)
+#
+# To add NIC drivers, append to the list:
+#   DPDK_DRIVERS="...,net/i40e,net/ice"      # Intel X710, E810
+#   DPDK_DRIVERS="...,net/mlx5"              # Mellanox ConnectX-4/5/6 (needs libibverbs-dev)
+#   DPDK_DRIVERS="...,net/ixgbe"             # Intel 82599, X520
+#   DPDK_DRIVERS="...,net/ena"               # AWS ENA
+#   DPDK_DRIVERS="...,net/bnxt"              # Broadcom NetXtreme
+#
+DPDK_DRIVERS="${DPDK_DRIVERS:-bus/pci,bus/vdev,mempool/ring,net/virtio,net/af_xdp,net/tap}"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -60,23 +82,15 @@ fi
 cd "${src_dir}"
 
 # ── 3. Configure ─────────────────────────────────────────────────────
-#
-# Drivers included:
-#   bus/pci       — PCI bus (required for physical NICs)
-#   bus/vdev      — Virtual device bus (required for TAP, virtio-user, memif)
-#   mempool/ring  — Ring-based mempool (default, required)
-#   net/virtio    — Virtio NIC + virtio-user (inner interface via vhost-net)
-#   net/af_xdp    — AF_XDP socket PMD (alternative inner interface)
-#   net/tap       — TAP PMD (simple inner interface)
 
-info "Configuring DPDK ${DPDK_VERSION} (static, 6 drivers)..."
+info "Configuring DPDK ${DPDK_VERSION} (static, drivers: ${DPDK_DRIVERS})..."
 [[ -d build ]] && rm -rf build
 
 meson setup build \
     --prefix="${DPDK_PREFIX}" \
     -Dplatform=native \
     -Ddefault_library=static \
-    -Denable_drivers=bus/pci,bus/vdev,mempool/ring,net/virtio,net/af_xdp,net/tap \
+    -Denable_drivers="${DPDK_DRIVERS}" \
     -Ddisable_apps='*' \
     -Dtests=false \
     -Dexamples='' \
