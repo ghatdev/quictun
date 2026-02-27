@@ -4,31 +4,45 @@
 
 ### Benchmarks
 
+**Current (DPDK 25.11 static, host CPU with AES-NI + AVX-512):**
+
 | Backend | Throughput | vs WireGuard | vs Raw NIC (26.8 Gbps) |
 |---------|-----------|-------------|------------------------|
-| DPDK AF_XDP (no cksum) | 2.25 Gbps | +39% | 8.4% |
-| **DPDK virtio-user (vhost-net)** | **2.22 Gbps** | **+37%** | **8.3%** |
-| DPDK AF_XDP (AVX2 cksum) | 2.19 Gbps | +35% | 8.2% |
-| DPDK TAP (no cksum) | 1.94 Gbps | +20% | 7.2% |
-| DPDK TAP (AVX2 cksum) | 1.90 Gbps | +17% | 7.1% |
-| Kernel WireGuard | 1.62 Gbps | baseline | 6.0% |
-| **tokio + GSO/GRO (--offload)** | **1.60 Gbps** | **-1%** | **6.0%** |
-| tokio parallel (default) | 1.24 Gbps | -23% | 4.6% |
-| io_uring (1-core, SendZc) | 820 Mbps | -49% | 3.1% |
+| **DPDK virtio-user** | **4.97 Gbps** | **+225%** | **18.5%** |
+| **DPDK AF_XDP** | **4.86 Gbps** | **+218%** | **18.1%** |
+| **tokio + GSO/GRO (--offload)** | **2.59 Gbps** | **+69%** | **9.7%** |
+| **Kernel WireGuard** | **1.53 Gbps** | **baseline** | **5.7%** |
+| io_uring (1-core, SendZc) | 820 Mbps | -46% | 3.1% |
 
-All benchmarks on VM with virtio NIC (single RSS queue). Raw NIC: 26.8 Gbps.
+All benchmarks on AMD Ryzen 9700X, Proxmox KVM VM, virtio NIC, host CPU passthrough. DPDK on ens19 (no Proxmox firewall), tokio/WireGuard on ens18. Raw NIC: 26.8 Gbps. Socket buffers: 8 MB (`sysctl net.core.rmem_max=8388608`).
+
+**Key findings:**
+- **Packet I/O overhead dominates, not protocol overhead.** Same QUIC+TLS stack, DPDK removes kernel I/O → 1.9x over tokio.
+- **Hardware crypto acceleration matters.** Previous results with QEMU generic CPU (no AES-NI): DPDK 2.22 Gbps, WireGuard 1.62 Gbps. With host CPU (AES-NI + AVX-512 VAES): DPDK 4.97 Gbps (+124%). Software AES was the hidden bottleneck.
+- **Socket buffer tuning is critical.** Default `rmem_max=212992` (208 KB) caused 600+ retransmits and capped tokio at 937 Mbps. With 8 MB buffers: 2.59 Gbps, zero retransmits.
+
+**Previous results (system DPDK ~23.11, QEMU generic CPU without AES-NI):**
+
+| Backend | Throughput | Notes |
+|---------|-----------|-------|
+| DPDK AF_XDP (no cksum) | 2.25 Gbps | software AES, generic CPU |
+| DPDK virtio-user | 2.22 Gbps | software AES, generic CPU |
+| DPDK TAP (no cksum) | 1.94 Gbps | software AES, generic CPU |
+| Kernel WireGuard | 1.62 Gbps | software AES, generic CPU |
+| tokio + GSO/GRO (--offload) | 1.60 Gbps | software AES, 208 KB socket buffers |
+| tokio parallel (default) | 1.24 Gbps | software AES |
 
 ### Industry Context
 
 | Implementation | Throughput | Notes |
 |----------------|-----------|-------|
-| Tailscale wireguard-go | 13.0 Gbps | Go, TUN GSO + GRO + batched syscalls |
+| Tailscale wireguard-go | 13.0 Gbps | Go, TUN GSO + GRO + batched syscalls, bare metal |
 | MsQuic + XDP | 7.99 Gbps | C, Windows XDP bypass, multi-threaded |
 | ngtcp2 + GSO/GRO | 4.94 Gbps | C, kernel-mode with GSO/GRO |
+| **quictun DPDK** | **4.97 Gbps** | **Rust, DPDK 25.11 kernel-bypass, virtio VM** |
 | quiche (Cloudflare) | ~2-4 Gbps | Rust, used in MASQUE/WARP |
-| **quictun DPDK** | **2.25 Gbps** | **Rust, DPDK AF_XDP, virtio VM** |
 
-Key insight: we're competitive with quiche on VM hardware. MsQuic shows 8 Gbps is achievable with kernel bypass + multi-thread. Tailscale's 13 Gbps proves TUN GSO/GRO is transformative for the inner side.
+Key insight: **quictun matches ngtcp2 throughput on VM hardware** despite being Rust + single-core DPDK on virtio. On bare metal with real NICs and multi-core, 8+ Gbps is achievable. Protocol overhead is not the bottleneck — packet I/O and hardware crypto acceleration are.
 
 ### How Tailscale Achieved 13 Gbps with wireguard-go
 
@@ -44,7 +58,7 @@ This is the most important reference for quictun. A **Go** implementation surpas
 
 Hardware: i5-12400 bare metal, Mellanox 25G NICs. In-kernel WireGuard on same hardware: 11.8 Gbps.
 
-**Our hardware for context**: AMD Ryzen 9700X (Zen 5), 4 vCPUs, Proxmox KVM VM, virtio NIC. Kernel WireGuard on our VMs: **1.62 Gbps** (vs Tailscale's 11.8 Gbps = 7.3x gap from VM + virtio overhead alone). The virtio NIC is a hard ceiling — WireGuard itself can't go faster than 1.62 Gbps on our hardware.
+**Our hardware for context**: AMD Ryzen 9700X (Zen 5), Proxmox KVM VM (vm1: 4 vCPU, vm2: 2 vCPU), virtio NIC, host CPU passthrough (AES-NI + AVX-512). Kernel WireGuard on our VMs: **1.53 Gbps** (vs Tailscale's 11.8 Gbps = 7.7x gap from VM + virtio overhead alone).
 
 **The key insight**: `sendmmsg` = 1 syscall, N stack traversals. **GSO** = 1 syscall, **1** stack traversal, N packets. Per-packet kernel stack traversal is the bottleneck — not crypto, not language speed, not GC.
 
@@ -88,14 +102,14 @@ Both sides are independently optimizable. Crypto is irreducible (must touch ever
 | **USO on TUN (UDP/QUIC inner)** | **v6.2+** | **UDP super-packets through TUN — critical for QUIC** |
 | rx-udp-gro-forwarding | v6.2+ | GRO preservation for VPN forwarding |
 
-### Why Throughput Is Lower Than Expected
+### Bottleneck Hierarchy
 
-At 2.25 Gbps vs 26.8 Gbps raw NIC (8.4%), DPDK I/O is **not** the bottleneck. The bottleneck hierarchy:
+At 4.97 Gbps vs 26.8 Gbps raw NIC (18.5%), the remaining bottleneck hierarchy:
 
-1. **Inner TUN/TAP per-packet overhead** — every read/write traverses kernel stack individually. TUN GSO/GRO (Tailscale's key insight) amortizes this.
+1. **VM virtio NIC** — single RSS queue prevents multi-core scaling. The ~5 Gbps ceiling is likely the virtio NIC limit with host CPU passthrough.
 2. **quinn-proto single-threaded processing** — QUIC decrypt + state machine + encrypt all on one core
-3. **QUIC protocol overhead vs WireGuard** — header protection (1x AES-ECB per packet for PN encryption), AEAD (same as WG), congestion control, ACK tracking, flow control (WireGuard has none of these except AEAD)
-4. **VM virtio NIC** — single RSS queue prevents multi-core scaling
+3. **Software AES without AES-NI** — previous 2.22 Gbps ceiling was caused by QEMU generic CPU lacking AES-NI. Host CPU passthrough (+AES-NI + AVX-512 VAES) → 4.97 Gbps (+124%).
+4. **QUIC protocol overhead vs WireGuard** — header protection, congestion control, ACK tracking, flow control. Proved minimal: DPDK is 3.2x faster than kernel WireGuard despite heavier protocol.
 
 **Tested and ruled out:**
 - **`--cc none`** (disable congestion control): negligible improvement. CC overhead is not a significant bottleneck.
@@ -110,7 +124,7 @@ Upgrading from system packages (~23.11) to DPDK 25.11.0 LTS unlocks several crit
 
 ### Virtio-User Inner Interface (vhost-net) — TAP/AF_XDP Replacement [DONE]
 
-**Implemented and benchmarked.** `--dpdk virtio` uses virtio-user backed by vhost-net. Works with system DPDK 23.11 — no source build needed for basic operation. **2.22 Gbps** (matches AF_XDP, +14% over TAP PMD).
+**Implemented and benchmarked.** `--dpdk virtio` uses virtio-user backed by vhost-net. Now built with DPDK 25.11 LTS from source (static linking). **4.97 Gbps** with host CPU passthrough (AES-NI + AVX-512).
 
 ```
 --vdev=net_virtio_user0,path=/dev/vhost-net,iface=tunnel,queues=1,queue_size=1024
@@ -118,14 +132,14 @@ Upgrading from system packages (~23.11) to DPDK 25.11.0 LTS unlocks several crit
 
 | Feature | TAP PMD | AF_XDP+veth (deprecated) | Virtio-User + vhost-net |
 |---------|---------|--------------------------|------------------------|
-| Throughput | 1.94 Gbps | 2.25 Gbps | **2.22 Gbps** |
+| Throughput | 1.94 Gbps* | 4.86 Gbps | **4.97 Gbps** |
 | Multi-queue | 1 TAP per core | Not supported | **Native kthreads per queue** |
 | Checksum offload | Software (AVX2) | Software (AVX2) | **vhost-net (kernel)*** |
 | TSO/LRO | Not available | Not available | **Yes** |
 | Setup complexity | Simple | High (veth + ethtool + BPF) | **Simple** |
 | Reliability | Good | Fragile (ethtool regression) | **Good** |
 
-*On our virtio VMs, `hw_ip_cksum=false` forces software fallback. Bare-metal NICs should report full offload.
+*TAP PMD not re-benchmarked with host CPU. On our virtio VMs, `hw_ip_cksum=false` forces software fallback. Bare-metal NICs should report full offload.
 
 **DPDK 25.11 adds:** multi-queue virtio-user (needs source build), which enables scaling with `queues=N` via native vhost-net kthreads — no eBPF RSS hacks needed.
 
