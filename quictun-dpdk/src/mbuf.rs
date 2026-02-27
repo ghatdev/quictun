@@ -181,3 +181,50 @@ impl Drop for Mbuf {
         }
     }
 }
+
+/// Zero-copy slice of an mbuf's data region, usable as `Bytes::from_owner`.
+///
+/// Owns the underlying mbuf and exposes a subslice (e.g., IP payload after
+/// stripping the Ethernet header). The mbuf is freed when this is dropped.
+pub struct MbufSlice {
+    raw: *mut ffi::rte_mbuf,
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: The mbuf is exclusively owned by this MbufSlice (transferred via Mbuf::into_raw).
+// DPDK mbufs themselves are thread-safe to free from any thread.
+unsafe impl Send for MbufSlice {}
+unsafe impl Sync for MbufSlice {}
+
+impl MbufSlice {
+    /// Create a zero-copy slice from an mbuf, starting at `offset` bytes into the data.
+    ///
+    /// Takes ownership of the mbuf. The returned slice covers `data[offset..]`.
+    /// Panics if `offset > data.len()`.
+    pub fn new(mbuf: Mbuf, offset: usize) -> Self {
+        let data = mbuf.data();
+        assert!(offset <= data.len(), "MbufSlice offset out of bounds");
+        let ptr = data[offset..].as_ptr();
+        let len = data.len() - offset;
+        let raw = mbuf.into_raw(); // transfer ownership, prevent Mbuf::drop
+        Self { raw, ptr, len }
+    }
+}
+
+impl AsRef<[u8]> for MbufSlice {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: ptr and len were computed from valid mbuf data in new().
+        // The mbuf is alive (owned by self) so the data region is valid.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for MbufSlice {
+    fn drop(&mut self) {
+        // SAFETY: self.raw is a valid mbuf transferred from Mbuf::into_raw.
+        unsafe {
+            ffi::shim_rte_pktmbuf_free(self.raw);
+        }
+    }
+}

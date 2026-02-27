@@ -7,7 +7,7 @@ use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 
 use crate::ffi;
-use crate::mbuf::Mbuf;
+use crate::mbuf::{Mbuf, MbufSlice};
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{self, DriveResult, QuicState, BUF_SIZE};
@@ -82,6 +82,8 @@ pub fn run(
     let mut pkt_buf = [0u8; 2048];
     let mut deadline = Instant::now() + Duration::from_secs(1);
     let mut ip_id: u16 = 0;
+    // Reusable BytesMut for feeding QUIC RX — avoids per-packet allocation.
+    let mut rx_buf = BytesMut::with_capacity(2048);
 
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
@@ -102,6 +104,7 @@ pub fn run(
     // If connector, drain initial handshake transmits.
     drain_and_send(
         state,
+        Instant::now(),
         outer_port_id,
         queue_id,
         mempool,
@@ -164,7 +167,9 @@ pub fn run(
                     }
 
                     quic_rx += 1;
-                    let quic_data = BytesMut::from(udp.payload);
+                    rx_buf.clear();
+                    rx_buf.extend_from_slice(udp.payload);
+                    let quic_data = rx_buf.split();
 
                     let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
                     if let Some(event) =
@@ -247,14 +252,17 @@ pub fn run(
             let ethertype = u16::from_be_bytes([data[12], data[13]]);
             match ethertype {
                 0x0800 => {
-                    // IPv4: strip Ethernet header, send via QUIC.
+                    // IPv4: strip Ethernet header, send via QUIC (zero-copy).
                     if let Some(conn) = state.connection.as_mut() {
                         inner_rx += 1;
-                        let pkt = Bytes::copy_from_slice(&data[ETH_HLEN..]);
+                        // Zero-copy: transfer mbuf ownership to Bytes via MbufSlice.
+                        // The mbuf lives until quinn consumes/drops the datagram.
+                        let pkt = Bytes::from_owner(MbufSlice::new(mbuf, ETH_HLEN));
                         if let Err(e) = conn.datagrams().send(pkt, true) {
                             tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
                         }
                         inner_ip_count += 1;
+                        continue; // mbuf owned by Bytes now, skip drop
                     }
                 }
                 0x0806 => {
@@ -331,6 +339,7 @@ pub fn run(
 
         drain_and_send(
             state,
+            now,
             outer_port_id,
             queue_id,
             mempool,
@@ -390,6 +399,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn drain_and_send(
     state: &mut QuicState,
+    now: Instant,
     outer_port_id: u16,
     outer_queue_id: u16,
     mempool: *mut ffi::rte_mempool,
@@ -403,7 +413,6 @@ fn drain_and_send(
     let Some(conn) = state.connection.as_mut() else {
         return Ok(());
     };
-    let now = Instant::now();
 
     let dst_mac = identity
         .remote_mac
