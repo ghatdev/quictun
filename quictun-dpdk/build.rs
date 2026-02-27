@@ -3,9 +3,15 @@ fn dpdk_build() {
     use std::env;
     use std::path::PathBuf;
 
+    // Rebuild when DPDK install path changes.
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+
+    // Use .statik(true) for static DPDK builds (-Ddefault_library=static).
+    // pkg-config will output --whole-archive flags to preserve PMD constructors.
     let dpdk = pkg_config::Config::new()
+        .statik(true)
         .probe("libdpdk")
-        .expect("pkg-config: libdpdk not found (install libdpdk-dev)");
+        .expect("pkg-config: libdpdk not found (set PKG_CONFIG_PATH for source builds)");
 
     // Generate FFI bindings via bindgen.
     let mut builder = bindgen::Builder::default().header("csrc/shim.h");
@@ -54,21 +60,33 @@ fn dpdk_build() {
         .expect("failed to write DPDK bindings");
 
     // Compile C shim (wraps inline DPDK functions).
-    // -march=native is required because DPDK headers (rte_memcpy.h) use
-    // SSSE3/SSE4 intrinsics that need the corresponding target features.
+    // DPDK headers (rte_memcpy.h) use SIMD intrinsics that need target features.
+    // Use -march=native for native builds, skip for cross-compilation so the
+    // cross-compiler uses sane defaults for the target arch (NEON on aarch64, etc.).
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
     let mut cc_build = cc::Build::new();
     cc_build.file("csrc/shim.c");
-    cc_build.flag("-march=native");
+    if target == host {
+        cc_build.flag("-march=native");
+    }
     for path in &dpdk.include_paths {
         cc_build.include(path);
     }
     cc_build.compile("dpdk_shim");
 
-    // librte_bus_vdev is not included in pkg-config --libs libdpdk by default,
-    // but we need it for rte_vdev_init/uninit (AF_XDP PMD creation).
-    println!("cargo:rustc-link-lib=rte_bus_vdev");
-    // librte_net_af_xdp must be linked so the PMD is registered at EAL init.
-    println!("cargo:rustc-link-lib=rte_net_af_xdp");
+    // DPDK PMDs register via __attribute__((constructor)). Use +whole-archive
+    // to prevent the linker from stripping these constructors in static builds.
+    // (Inspired by Demikernel's static:-bundle,+whole-archive approach.)
+    println!("cargo:rustc-link-lib=static:+whole-archive=rte_bus_vdev");
+    // librte_net_af_xdp: only link if available (requires libxdp at DPDK build time).
+    if dpdk.libs.iter().any(|l| l.contains("af_xdp")) {
+        println!("cargo:rustc-link-lib=static:+whole-archive=rte_net_af_xdp");
+    }
+
+    // Track C source changes for incremental rebuilds (fixes cargo clean requirement).
+    println!("cargo:rerun-if-changed=csrc/shim.h");
+    println!("cargo:rerun-if-changed=csrc/shim.c");
 }
 
 fn main() {
