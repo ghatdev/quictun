@@ -8,7 +8,7 @@
 
 | Backend | Throughput | vs WireGuard | vs Raw NIC (26.8 Gbps) |
 |---------|-----------|-------------|------------------------|
-| **DPDK virtio-user** | **4.97 Gbps** | **+225%** | **18.5%** |
+| **DPDK virtio-user** | **14.0 Gbps** | **+815%** | **52.2%** |
 | **DPDK AF_XDP** | **4.86 Gbps** | **+218%** | **18.1%** |
 | **tokio + GSO/GRO (--offload)** | **2.59 Gbps** | **+69%** | **9.7%** |
 | **Kernel WireGuard** | **1.53 Gbps** | **baseline** | **5.7%** |
@@ -17,7 +17,8 @@
 All benchmarks on AMD Ryzen 9700X, Proxmox KVM VM, virtio NIC, host CPU passthrough. DPDK on ens19 (no Proxmox firewall), tokio/WireGuard on ens18. Raw NIC: 26.8 Gbps. Socket buffers: 8 MB (`sysctl net.core.rmem_max=8388608`).
 
 **Key findings:**
-- **Packet I/O overhead dominates, not protocol overhead.** Same QUIC+TLS stack, DPDK removes kernel I/O → 1.9x over tokio.
+- **Packet I/O overhead dominates, not protocol overhead.** Same QUIC+TLS stack, DPDK removes kernel I/O → 5.4x over tokio.
+- **Virtio-user tuning is critical.** Packed vectorized virtqueue (`packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1` + AVX-512) and vhost thread pinning pushed 8.1 → 14.0 Gbps (+73%). Cache thrashing between DPDK and vhost threads was the hidden bottleneck.
 - **Hardware crypto acceleration matters.** Previous results with QEMU generic CPU (no AES-NI): DPDK 2.22 Gbps, WireGuard 1.62 Gbps. With host CPU (AES-NI + AVX-512 VAES): DPDK 4.97 Gbps (+124%). Software AES was the hidden bottleneck.
 - **Socket buffer tuning is critical.** Default `rmem_max=212992` (208 KB) caused 600+ retransmits and capped tokio at 937 Mbps. With 8 MB buffers: 2.59 Gbps, zero retransmits.
 
@@ -39,10 +40,10 @@ All benchmarks on AMD Ryzen 9700X, Proxmox KVM VM, virtio NIC, host CPU passthro
 | Tailscale wireguard-go | 13.0 Gbps | Go, TUN GSO + GRO + batched syscalls, bare metal |
 | MsQuic + XDP | 7.99 Gbps | C, Windows XDP bypass, multi-threaded |
 | ngtcp2 + GSO/GRO | 4.94 Gbps | C, kernel-mode with GSO/GRO |
-| **quictun DPDK** | **4.97 Gbps** | **Rust, DPDK 25.11 kernel-bypass, virtio VM** |
+| **quictun DPDK** | **14.0 Gbps** | **Rust, DPDK 25.11 kernel-bypass, virtio VM, single core** |
 | quiche (Cloudflare) | ~2-4 Gbps | Rust, used in MASQUE/WARP |
 
-Key insight: **quictun matches ngtcp2 throughput on VM hardware** despite being Rust + single-core DPDK on virtio. On bare metal with real NICs and multi-core, 8+ Gbps is achievable. Protocol overhead is not the bottleneck — packet I/O and hardware crypto acceleration are.
+Key insight: **quictun exceeds all known QUIC VPN implementations** at 14.0 Gbps single-core on VM hardware. Surpasses Tailscale wireguard-go (13.0 Gbps on bare metal i5-12400 + 25G NICs). On bare metal with real NICs and multi-core, 18+ Gbps is achievable.
 
 ### How Tailscale Achieved 13 Gbps with wireguard-go
 
@@ -104,12 +105,11 @@ Both sides are independently optimizable. Crypto is irreducible (must touch ever
 
 ### Bottleneck Hierarchy
 
-At 4.97 Gbps vs 26.8 Gbps raw NIC (18.5%), the remaining bottleneck hierarchy:
+At 14.0 Gbps vs 26.8 Gbps raw NIC (52.2%), the remaining bottleneck hierarchy:
 
-1. **VM virtio NIC** — single RSS queue prevents multi-core scaling. The ~5 Gbps ceiling is likely the virtio NIC limit with host CPU passthrough.
-2. **quinn-proto single-threaded processing** — QUIC decrypt + state machine + encrypt all on one core
-3. **Software AES without AES-NI** — previous 2.22 Gbps ceiling was caused by QEMU generic CPU lacking AES-NI. Host CPU passthrough (+AES-NI + AVX-512 VAES) → 4.97 Gbps (+124%).
-4. **QUIC protocol overhead vs WireGuard** — header protection, congestion control, ACK tracking, flow control. Proved minimal: DPDK is 3.2x faster than kernel WireGuard despite heavier protocol.
+1. **vhost-net kernel thread** — at 14.0 Gbps, the vhost thread runs at 99.9% CPU on its dedicated core. This is the current ceiling. Multi-queue virtio-user (`queues=2+`) would parallelize vhost across multiple kthreads.
+2. **DPDK engine single core** — at 90% CPU utilization. Room for ~10% more before saturation. Multi-core DPDK (`--dpdk-cores N`) can scale this with software distributor (Step 2D).
+3. **Cache thrashing** — when vhost thread shares CPU with DPDK engine, throughput drops to 6.2 Gbps (−56%). Solved by pinning vhost to non-DPDK cores.
 
 **Tested and ruled out:**
 - **`--cc none`** (disable congestion control): negligible improvement. CC overhead is not a significant bottleneck.
@@ -124,15 +124,16 @@ Upgrading from system packages (~23.11) to DPDK 25.11.0 LTS unlocks several crit
 
 ### Virtio-User Inner Interface (vhost-net) — TAP/AF_XDP Replacement [DONE]
 
-**Implemented and benchmarked.** `--dpdk virtio` uses virtio-user backed by vhost-net. Now built with DPDK 25.11 LTS from source (static linking). **4.97 Gbps** with host CPU passthrough (AES-NI + AVX-512).
+**Implemented and benchmarked.** `--dpdk virtio` uses virtio-user backed by vhost-net. Now built with DPDK 25.11 LTS from source (static linking). **14.0 Gbps** with host CPU passthrough (AES-NI + AVX-512), packed vectorized virtqueue, and vhost thread pinning.
 
 ```
---vdev=net_virtio_user0,path=/dev/vhost-net,iface=tunnel,queues=1,queue_size=1024
+--vdev=net_virtio_user0,path=/dev/vhost-net,iface=tunnel,queues=1,queue_size=1024,packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1
+--force-max-simd-bitwidth=512
 ```
 
 | Feature | TAP PMD | AF_XDP+veth (deprecated) | Virtio-User + vhost-net |
 |---------|---------|--------------------------|------------------------|
-| Throughput | 1.94 Gbps* | 4.86 Gbps | **4.97 Gbps** |
+| Throughput | 1.94 Gbps* | 4.86 Gbps | **14.0 Gbps** |
 | Multi-queue | 1 TAP per core | Not supported | **Native kthreads per queue** |
 | Checksum offload | Software (AVX2) | Software (AVX2) | **vhost-net (kernel)*** |
 | TSO/LRO | Not available | Not available | **Yes** |
@@ -140,6 +141,18 @@ Upgrading from system packages (~23.11) to DPDK 25.11.0 LTS unlocks several crit
 | Reliability | Good | Fragile (ethtool regression) | **Good** |
 
 *TAP PMD not re-benchmarked with host CPU. On our virtio VMs, `hw_ip_cksum=false` forces software fallback. Bare-metal NICs should report full offload.
+
+**Virtio-user tuning progression:**
+
+| Configuration | Throughput | Delta |
+|---------------|-----------|-------|
+| Default split virtqueue | 8.1 Gbps | baseline |
+| + Traffic-based Instant::now() | 8.9 Gbps | +9% |
+| + Packed vectorized (AVX-512) | ~11 Gbps | est. |
+| + Disable TAP kernel offload | ~12 Gbps | est. |
+| + Pin vhost to non-DPDK cores | **14.0 Gbps** | **+73% total** |
+
+The packed vectorized path (`packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1`) enables the AVX-512 batch descriptor processing path in the virtio PMD. Pinning vhost threads to separate cores eliminates L1/L2 cache thrashing (without pinning: 6.2 Gbps, −56%).
 
 **DPDK 25.11 adds:** multi-queue virtio-user (needs source build), which enables scaling with `queues=N` via native vhost-net kthreads — no eBPF RSS hacks needed.
 
@@ -580,7 +593,10 @@ Profiling at 5.13 Gbps (DPDK single-core) revealed: **quinn-proto state machine 
 | Optimization | Impact | Status |
 |-------------|--------|--------|
 | Zero-copy `Bytes::from_owner` (MbufSlice) | ~1.5-2% | **DONE** |
-| Batched `Instant::now()` | ~3-4% | **DONE** |
+| Traffic-based `Instant::now()` | +9% (8.1→8.9 Gbps) | **DONE** |
+| Packed vectorized virtqueue (AVX-512) | +73% combined | **DONE** |
+| Vhost thread pinning | (included above) | **DONE** |
+| Single `data_mut()` FFI per RX pkt | code quality | **DONE** |
 | Reuse `BytesMut` for RX | ~0.5-1% | **DONE** |
 | Software UDP checksum (AVX2) | ~2-3% vs naive | DONE |
 | Virtio-user multi-queue inner | enables multi-core | Not started |
@@ -630,12 +646,13 @@ Hardware counters: IPC=1.77 (compute-bound), cache miss rate 0.59% (excellent), 
 | 9 | Router mode + memif | Low | Zero-kernel data path | High | Not started |
 | 10 | SORING multi-core pipeline | Low | Alternative to N-connections | High | Not started |
 
-**Key realizations (updated Feb 27)**:
-- **quinn-proto is the #1 bottleneck** — 19.3% of CPU. State machine overhead (CC, ACK, loss detection, header parsing) costs 2.3x more than AES-GCM crypto.
-- **Single-core is saturated at ~5 Gbps.** IPC=1.77, no memory stalls. Only multi-core can push past this.
-- **Multi-core is a cross-backend problem.** quinn-proto's `Connection` is `!Send` and single-threaded. N independent connections is the pragmatic solution — works for all three data planes without quinn-proto changes.
-- **Crypto is NOT the bottleneck.** AVX-512 VAES makes AES-GCM only 8.3% of CPU. Optimizing crypto further yields diminishing returns.
-- **Two production paths**: tokio + `--offload` (2.59 Gbps, simple) vs DPDK + virtio-user (5.13 Gbps, complex). Both hit the same quinn-proto single-core wall.
+**Key realizations (updated Mar 1)**:
+- **quictun-quic eliminated quinn-proto bottleneck** — custom 1-RTT data plane replaces quinn-proto after handshake. No state machine overhead (CC, ACK, loss detection) in data path. quinn-proto only used for handshake (cold path).
+- **vhost-net is the new ceiling at 14.0 Gbps.** vhost kernel thread runs at 99.9% CPU. DPDK engine at 90% CPU. Multi-queue virtio-user (`queues=2+`) is the path to higher throughput.
+- **Cache thrashing was the "VM anomaly".** vhost thread landing on DPDK core caused 56% throughput drop (14.0 → 6.2 Gbps). Pinning vhost to separate cores solved it.
+- **Packed vectorized virtqueue is massive.** `packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1` + AVX-512 SIMD enables batch descriptor processing. Combined with vhost pinning: 8.1 → 14.0 Gbps (+73%).
+- **Crypto is NOT the bottleneck.** AVX-512 VAES makes AES-GCM negligible in profile at 14 Gbps.
+- **Two production paths**: tokio + `--offload` (2.59 Gbps, simple) vs DPDK + virtio-user (14.0 Gbps, complex). Router mode with memif could reach 18+ Gbps.
 
 ---
 

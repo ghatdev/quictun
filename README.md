@@ -43,12 +43,12 @@ quictun-dpdk/     [Experimental] Linux DPDK kernel-bypass data plane
 
 | Data Plane | Backend | Throughput | Maturity |
 |------------|---------|-----------|----------|
-| **DPDK virtio-user** | quictun-quic + DPDK 25.11 | **8.1 Gbps** | Experimental |
+| **DPDK virtio-user** | quictun-quic + DPDK 25.11 | **14.0 Gbps** | Experimental |
 | **DPDK AF_XDP** | quinn-proto + DPDK 25.11 | **4.86 Gbps** | Experimental |
 | **tokio + offload** | quinn + tokio + TUN GSO/GRO | 2.59 Gbps | Production |
 | **io_uring** | quinn-proto + io_uring | 820 Mbps | Experimental |
 
-Kernel WireGuard reference: 1.53 Gbps (same hardware, same NIC). DPDK is **5.3x faster** than kernel WireGuard. All benchmarks on AMD Ryzen 9700X (AES-NI, AVX-512), Proxmox KVM VM, virtio NIC, host CPU passthrough. Raw NIC: 26.8 Gbps.
+Kernel WireGuard reference: 1.53 Gbps (same hardware, same NIC). DPDK is **9.1x faster** than kernel WireGuard. All benchmarks on AMD Ryzen 9700X (AES-NI, AVX-512), Proxmox KVM VM, virtio NIC, host CPU passthrough. Raw NIC: 26.8 Gbps.
 
 See [quictun-dpdk/README.md](quictun-dpdk/README.md) and [quictun-uring/README.md](quictun-uring/README.md) for details.
 
