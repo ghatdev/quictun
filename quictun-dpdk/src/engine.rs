@@ -11,6 +11,7 @@ use crate::mbuf::{Mbuf, MbufSlice};
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{self, DriveResult, QuicState, BUF_SIZE};
+use quictun_quic::ConnectionState;
 
 /// Maximum burst size for rx/tx.
 const BURST_SIZE: usize = 32;
@@ -101,6 +102,11 @@ pub fn run(
     let mut empty_polls: u32 = 0;
     let mut delay_us: u32 = MIN_DELAY_US;
 
+    // quictun-quic: fast data plane state (set after handshake completes).
+    let mut quic_conn_state: Option<Arc<ConnectionState>> = None;
+    // Scratch buffer for quictun-quic encrypted packets.
+    let mut quic_tx_buf = [0u8; 2048];
+
     // If connector, drain initial handshake transmits.
     drain_and_send(
         state,
@@ -167,41 +173,76 @@ pub fn run(
                     }
 
                     quic_rx += 1;
-                    rx_buf.clear();
-                    rx_buf.extend_from_slice(udp.payload);
-                    let quic_data = rx_buf.split();
 
-                    let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
-                    if let Some(event) =
-                        state
-                            .endpoint
-                            .handle(now, remote_addr, None, udp.ecn, quic_data, &mut response_buf)
-                    {
-                        let responses =
-                            shared::handle_datagram_event(state, event, &mut response_buf);
+                    // Route: short header (1-RTT) → quictun-quic, long header → quinn-proto
+                    if udp.payload.is_empty() {
+                        continue;
+                    }
+                    let first_byte = udp.payload[0];
+                    if first_byte & 0x80 == 0 {
+                        // Short header → quictun-quic fast path
+                        if let Some(ref conn_state) = quic_conn_state {
+                            // Copy into mutable scratch buffer for in-place decrypt
+                            let pkt_len = udp.payload.len();
+                            if pkt_len <= pkt_buf.len() {
+                                pkt_buf[..pkt_len].copy_from_slice(udp.payload);
+                                match conn_state.decrypt_packet(&mut pkt_buf[..pkt_len]) {
+                                    Ok(decrypted) => {
+                                        // Process ACK if present
+                                        if let Some(ref ack) = decrypted.ack {
+                                            let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                            conn_state.process_ack(ack, now_ns);
+                                        }
+                                        // Deliver datagrams to inner interface
+                                        for datagram in &decrypted.datagrams {
+                                            drive_result.datagrams.push(datagram.clone());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::trace!(error = %e, "quictun-quic decrypt failed");
+                                    }
+                                }
+                            }
+                        }
+                        // else: short header before handshake complete, drop
+                    } else {
+                        // Long header → quinn-proto (handshake, retry, etc.)
+                        rx_buf.clear();
+                        rx_buf.extend_from_slice(udp.payload);
+                        let quic_data = rx_buf.split();
 
-                        // Queue any stateless response transmits.
-                        for (len, buf) in responses {
-                            let dst_mac = identity
-                                .remote_mac
-                                .or_else(|| arp_table.lookup(identity.remote_ip))
-                                .unwrap_or([0xff; 6]);
+                        let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
+                        if let Some(event) =
+                            state
+                                .endpoint
+                                .handle(now, remote_addr, None, udp.ecn, quic_data, &mut response_buf)
+                        {
+                            let responses =
+                                shared::handle_datagram_event(state, event, &mut response_buf);
 
-                            ip_id = ip_id.wrapping_add(1);
-                            let frame_len = net::build_udp_packet(
-                                &identity.local_mac,
-                                &dst_mac,
-                                identity.local_ip,
-                                identity.remote_ip,
-                                identity.local_port,
-                                identity.remote_port,
-                                &buf[..len],
-                                &mut pkt_buf,
-                                0, // no ECN for stateless responses
-                                ip_id,
-                                checksum_mode,
-                            );
-                            pending_frames.push(pkt_buf[..frame_len].to_vec());
+                            // Queue any stateless response transmits.
+                            for (len, buf) in responses {
+                                let dst_mac = identity
+                                    .remote_mac
+                                    .or_else(|| arp_table.lookup(identity.remote_ip))
+                                    .unwrap_or([0xff; 6]);
+
+                                ip_id = ip_id.wrapping_add(1);
+                                let frame_len = net::build_udp_packet(
+                                    &identity.local_mac,
+                                    &dst_mac,
+                                    identity.local_ip,
+                                    identity.remote_ip,
+                                    identity.local_port,
+                                    identity.remote_port,
+                                    &buf[..len],
+                                    &mut pkt_buf,
+                                    0, // no ECN for stateless responses
+                                    ip_id,
+                                    checksum_mode,
+                                );
+                                pending_frames.push(pkt_buf[..frame_len].to_vec());
+                            }
                         }
                     }
                 }
@@ -241,6 +282,8 @@ pub fn run(
         let nb = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
 
         let mut inner_ip_count: usize = 0;
+        // Collect quictun-quic TX mbufs for batch send
+        let mut pending_frames_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
 
         for i in 0..nb as usize {
             // SAFETY: inner rx_burst wrote a valid mbuf pointer; exclusive ownership taken.
@@ -252,8 +295,61 @@ pub fn run(
             let ethertype = u16::from_be_bytes([data[12], data[13]]);
             match ethertype {
                 0x0800 => {
-                    // IPv4: strip Ethernet header, send via QUIC (zero-copy).
-                    if let Some(conn) = state.connection.as_mut() {
+                    // IPv4: strip Ethernet header, send via QUIC.
+                    if let Some(ref conn_state) = quic_conn_state {
+                        // quictun-quic fast path: encrypt and collect mbufs for batch TX
+                        inner_rx += 1;
+                        let ip_payload = &data[ETH_HLEN..];
+
+                        if conn_state.can_send() {
+                            // Piggyback ACK on first packet if needed
+                            let ack_ranges = if inner_ip_count == 0 && conn_state.needs_ack() {
+                                Some(conn_state.generate_ack_ranges())
+                            } else {
+                                None
+                            };
+                            let ack_ref = ack_ranges.as_deref();
+
+                            match conn_state.encrypt_datagram(ip_payload, ack_ref, &mut quic_tx_buf) {
+                                Ok(result) => {
+                                    let dst_mac = identity
+                                        .remote_mac
+                                        .or_else(|| arp_table.lookup(identity.remote_ip))
+                                        .unwrap_or([0xff; 6]);
+                                    ip_id = ip_id.wrapping_add(1);
+
+                                    let frame_len = net::HEADER_SIZE + result.len;
+                                    if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
+                                        if let Ok(buf) = tx_mbuf.alloc_space(frame_len as u16) {
+                                            net::build_udp_packet(
+                                                &identity.local_mac,
+                                                &dst_mac,
+                                                identity.local_ip,
+                                                identity.remote_ip,
+                                                identity.local_port,
+                                                identity.remote_port,
+                                                &quic_tx_buf[..result.len],
+                                                buf,
+                                                0, // ECN: could pass from CC
+                                                ip_id,
+                                                checksum_mode,
+                                            );
+                                            if checksum_mode == ChecksumMode::HardwareOffload {
+                                                tx_mbuf.set_tx_checksum_offload();
+                                            }
+                                            pending_frames_mbufs.push(tx_mbuf.into_raw());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::trace!(error = %e, "quictun-quic encrypt failed");
+                                }
+                            }
+                        }
+                        inner_ip_count += 1;
+                        // mbuf freed on drop (we copied the payload, not zero-copy for now)
+                    } else if let Some(conn) = state.connection.as_mut() {
+                        // Handshake still in progress: use quinn-proto path
                         inner_rx += 1;
                         // Zero-copy: transfer mbuf ownership to Bytes via MbufSlice.
                         // The mbuf lives until quinn consumes/drops the datagram.
@@ -291,6 +387,16 @@ pub fn run(
         }
         let _ = inner_ip_count;
 
+        // Batch TX for quictun-quic encrypted packets
+        if !pending_frames_mbufs.is_empty() {
+            let nb_tx = pending_frames_mbufs.len() as u16;
+            let sent = port::tx_burst(outer_port_id, queue_id, &mut pending_frames_mbufs, nb_tx);
+            tx_pkts += sent as u64;
+            for raw in &pending_frames_mbufs[sent as usize..] {
+                unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+            }
+        }
+
         // ── Phase 1c: Timer check ───────────────────────────────────
 
         if now >= deadline {
@@ -327,8 +433,14 @@ pub fn run(
             }
         }
 
+        // Capture quictun-quic state on first Connected event
         if drive_result.connected {
-            tracing::info!("tunnel established via DPDK");
+            if let Some(cs) = drive_result.connection_state.take() {
+                tracing::info!("tunnel established via DPDK (quictun-quic data plane active)");
+                quic_conn_state = Some(cs);
+            } else {
+                tracing::info!("tunnel established via DPDK");
+            }
         }
         if drive_result.connection_lost {
             tracing::info!("connection lost, engine exiting");
@@ -336,6 +448,10 @@ pub fn run(
         }
 
         // ── Phase 3: Drain transmits → build packets → TX burst ──────
+        //
+        // When quictun-quic is active, quinn-proto's Data space keys are gone,
+        // so poll_transmit only produces handshake/control packets (if any).
+        // We still call it to handle keepalives and connection close frames.
 
         drain_and_send(
             state,

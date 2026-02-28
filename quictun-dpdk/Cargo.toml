@@ -9,6 +9,7 @@ quinn-proto = { workspace = true }
 rustls = { workspace = true }
 quictun-crypto = { workspace = true }
 quictun-core = { workspace = true }
+quictun-quic = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

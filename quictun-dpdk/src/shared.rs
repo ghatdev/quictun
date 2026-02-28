@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +50,8 @@ pub struct DriveResult {
     pub connected: bool,
     /// Whether the connection was lost.
     pub connection_lost: bool,
+    /// quictun-quic connection state, set once on Event::Connected.
+    pub connection_state: Option<Arc<quictun_quic::ConnectionState>>,
 }
 
 impl DriveResult {
@@ -57,6 +60,7 @@ impl DriveResult {
             datagrams: Vec::new(),
             connected: false,
             connection_lost: false,
+            connection_state: None,
         }
     }
 
@@ -64,6 +68,7 @@ impl DriveResult {
         self.datagrams.clear();
         self.connected = false;
         self.connection_lost = false;
+        // NOTE: connection_state is NOT cleared — it persists across loop iterations.
     }
 }
 
@@ -91,8 +96,38 @@ pub fn process_events(state: &mut QuicState, result: &mut DriveResult) {
             Event::Connected => {
                 info!("quic: connection established");
                 result.connected = true;
+
+                // Extract 1-RTT keys for quictun-quic data plane
+                if let Some(keys) = conn.take_1rtt_keys() {
+                    let local_cid = conn.local_cid().clone();
+                    let remote_cid = conn.remote_cid();
+                    let is_server = state.server_config.is_some();
+
+                    // Pre-compute key update generations (~2ms, ~128KB)
+                    let mut key_gens = VecDeque::new();
+                    if let Some(first) = conn.take_next_1rtt_keys() {
+                        key_gens.push_back(first);
+                    }
+                    for _ in 0..999 {
+                        if let Some(kp) = conn.produce_next_1rtt_keys() {
+                            key_gens.push_back(kp);
+                        } else {
+                            break;
+                        }
+                    }
+                    info!(key_generations = key_gens.len(), "pre-computed key update generations");
+
+                    let conn_state = quictun_quic::ConnectionState::new(
+                        keys, key_gens, local_cid, remote_cid, is_server,
+                    );
+                    result.connection_state = Some(conn_state);
+                } else {
+                    warn!("quic: Connected but no 1-RTT keys available");
+                }
             }
             Event::DatagramReceived => {
+                // Only process datagrams via quinn-proto if quictun-quic hasn't taken over.
+                // After key extraction, quinn-proto can't decrypt 1-RTT data anyway.
                 while let Some(datagram) = conn.datagrams().recv() {
                     result.datagrams.push(datagram);
                 }

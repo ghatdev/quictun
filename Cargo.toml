@@ -6,6 +6,7 @@ members = [
     "quictun-tun",
     "quictun-uring",
     "quictun-dpdk",
+    "quictun-quic",
     "quictun-cli",
 ]
 
@@ -68,6 +69,13 @@ tun-rs = { version = "2", features = ["async"] }
 io-uring = "0.7"
 libc = "0.2"
 crossbeam-channel = "0.5"
+
+# quictun-quic
+quictun-quic = { path = "quictun-quic" }
+smallvec = { version = "1", features = ["const_generics"] }
+
+[patch.crates-io]
+quinn-proto = { path = "third_party/quinn/quinn-proto" }
 
 [profile.release]
 lto = "thin"

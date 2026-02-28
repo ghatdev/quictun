@@ -1,0 +1,11 @@
+[package]
+name = "quictun-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quinn-proto = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }
+tracing = { workspace = true }
