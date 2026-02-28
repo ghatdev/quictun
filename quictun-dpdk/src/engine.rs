@@ -109,6 +109,7 @@ pub fn run(
     // Adaptive polling state.
     let mut empty_polls: u32 = 0;
     let mut delay_us: u32 = MIN_DELAY_US;
+    let mut now = Instant::now();
 
     // quictun-quic: fast data plane state (set after handshake completes).
     let mut quic_conn_state: Option<Arc<ConnectionState>> = None;
@@ -142,7 +143,12 @@ pub fn run(
             break;
         }
 
-        let now = Instant::now();
+        // During handshake, quinn-proto needs accurate time every iteration.
+        // After handshake (quictun-quic), `now` is only used for stats — sample less.
+        // We also refresh when packets arrive (see below after rx_burst).
+        if quic_conn_state.is_none() {
+            now = Instant::now();
+        }
 
         // ── Phase 1a: RX burst from outer port → parse → feed QUIC ──
 
@@ -160,8 +166,8 @@ pub fn run(
             let mut mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
             rx_pkts += 1;
 
-            // Phase 1: immutable parse to extract owned metadata.
-            // Scope limits the immutable borrow so we can get data_mut() for in-place decrypt.
+            // Single data_mut() call for the entire packet lifecycle.
+            // Reborrows as &[u8] for read-only phases (parse, datagram copy).
             enum RxAction {
                 ShortHeader {
                     src_mac: [u8; 6],
@@ -182,8 +188,9 @@ pub fn run(
                 Skip,
             }
 
+            let data = mbuf.data_mut();
+
             let action = {
-                let data = mbuf.data();
                 match net::parse_packet(data) {
                     Some(ParsedPacket::Udp(udp)) => {
                         if udp.dst_ip != identity.local_ip
@@ -224,7 +231,6 @@ pub fn run(
                 }
             };
 
-            // Phase 2: process with mutable access where needed.
             match action {
                 RxAction::ShortHeader {
                     src_mac,
@@ -233,7 +239,6 @@ pub fn run(
                     payload_offset,
                     payload_len,
                 } => {
-                    // MAC / peer learning
                     arp_table.learn(src_ip, src_mac);
                     if identity.remote_mac.is_none() {
                         identity.remote_mac = Some(src_mac);
@@ -251,9 +256,7 @@ pub fn run(
                     }
                     quic_rx += 1;
 
-                    // Zero-copy in-place decrypt directly in mbuf data.
                     let conn_state = quic_conn_state.as_ref().unwrap();
-                    let data = mbuf.data_mut();
                     match conn_state.decrypt_packet_in_place(
                         &mut data[payload_offset..payload_offset + payload_len],
                     ) {
@@ -262,8 +265,6 @@ pub fn run(
                                 let now_ns = quictun_quic::bbr::coarse_now_ns();
                                 conn_state.process_ack(ack, now_ns);
                             }
-                            // Read decrypted datagrams directly from mbuf data.
-                            let data = mbuf.data();
                             for range in &decrypted.datagrams {
                                 let abs_start = payload_offset + range.start;
                                 let abs_end = payload_offset + range.end;
@@ -312,7 +313,6 @@ pub fn run(
                     quic_rx += 1;
 
                     // Long header → quinn-proto (handshake, cold path — copy is fine).
-                    let data = mbuf.data();
                     rx_buf.clear();
                     rx_buf.extend_from_slice(&data[payload_offset..payload_offset + payload_len]);
                     let quic_data = rx_buf.split();
@@ -628,6 +628,14 @@ pub fn run(
 
         // Send pending raw frames (ARP replies, stateless QUIC responses).
         send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+
+        // ── Refresh `now` when traffic is present ─────────────────────
+        // During handshake: refreshed unconditionally at loop top (quinn-proto needs it).
+        // After handshake: skip clock_gettime on empty polls (saves ~4% CPU at 8 Gbps).
+        // When packets arrive, refresh so stats and any LongHeader processing get fresh time.
+        if quic_conn_state.is_some() && (nb_rx > 0 || nb > 0) {
+            now = Instant::now();
+        }
 
         // ── Periodic stats ───────────────────────────────────────────
 
@@ -1043,6 +1051,7 @@ pub fn run_quictun_multicore(
     // Adaptive polling state
     let mut empty_polls: u32 = 0;
     let mut delay_us: u32 = MIN_DELAY_US;
+    let mut now = Instant::now();
 
     // Pre-allocated mbuf vectors
     let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
@@ -1057,8 +1066,6 @@ pub fn run_quictun_multicore(
             break;
         }
 
-        let now = Instant::now();
-
         // ── Outer RX → decrypt → inner TX ──
         inner_tx_mbufs.clear();
 
@@ -1070,16 +1077,16 @@ pub fn run_quictun_multicore(
             let mut mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
             rx_pkts += 1;
 
-            // Phase 1: immutable parse to extract owned metadata.
-            // Scope limits the immutable borrow so we can get data_mut() below.
+            // Single data_mut() call; reborrows as &[u8] for read-only phases.
             enum RxAction {
                 ShortHeader { payload_offset: usize, payload_len: usize },
                 Arp(net::ParsedArp),
                 Skip,
             }
 
+            let data = mbuf.data_mut();
+
             let action = {
-                let data = mbuf.data();
                 match net::parse_packet(data) {
                     Some(ParsedPacket::Udp(udp)) => {
                         if udp.dst_ip != identity.local_ip
@@ -1103,10 +1110,8 @@ pub fn run_quictun_multicore(
                 }
             };
 
-            // Phase 2: mutable in-place decrypt (zero-copy).
             match action {
                 RxAction::ShortHeader { payload_offset, payload_len } => {
-                    let data = mbuf.data_mut();
                     match conn_state.decrypt_packet_in_place(
                         &mut data[payload_offset..payload_offset + payload_len],
                     ) {
@@ -1115,8 +1120,6 @@ pub fn run_quictun_multicore(
                                 let now_ns = quictun_quic::bbr::coarse_now_ns();
                                 conn_state.process_ack(ack, now_ns);
                             }
-                            // Read decrypted datagrams directly from mbuf data
-                            let data = mbuf.data();
                             for range in &decrypted.datagrams {
                                 let abs_start = payload_offset + range.start;
                                 let abs_end = payload_offset + range.end;
@@ -1279,6 +1282,11 @@ pub fn run_quictun_multicore(
             if sent < nb_tx {
                 pending_outer_tx.extend_from_slice(&outer_tx_mbufs[sent as usize..]);
             }
+        }
+
+        // Refresh `now` when traffic is present (skip clock_gettime on empty polls).
+        if nb_rx > 0 || nb > 0 {
+            now = Instant::now();
         }
 
         // Stats

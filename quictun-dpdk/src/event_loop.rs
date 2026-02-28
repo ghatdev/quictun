@@ -108,9 +108,16 @@ pub fn run(
             bail!("multi-core (--dpdk-cores > 1) is not yet supported with virtio-user mode");
         }
         let iface = dpdk_config.tunnel_iface.clone();
+        // Packed virtqueue (virtio 1.1) + in-order + non-mergeable + vectorized:
+        // enables the AVX-512 packed vectorized RX/TX path in the virtio PMD.
+        // ~10-20% faster than default split mergeable path.
         eal_args.push(format!(
-            "--vdev=net_virtio_user0,path=/dev/vhost-net,iface={iface},queues=1,queue_size=1024"
+            "--vdev=net_virtio_user0,path=/dev/vhost-net,iface={iface},\
+             queues=1,queue_size=1024,\
+             packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1"
         ));
+        // Enable AVX-512 SIMD for virtio descriptor batch processing.
+        eal_args.push("--force-max-simd-bitwidth=512".to_string());
     }
 
     let _eal = Eal::init(&eal_args)?;
@@ -287,6 +294,7 @@ pub fn run(
                 tunnel_ip,
                 dpdk_config.tunnel_prefix,
                 dpdk_config.tunnel_mtu,
+                dpdk_config.mode == "virtio",
             )?;
 
             let eth_hdr = InnerEthHeader::new(peer_mac, inner_mac);
@@ -365,6 +373,15 @@ pub fn run(
         Arc::into_raw(sig_shutdown) as usize,
         Ordering::Release,
     );
+
+    // ── 7b. Pin vhost kernel threads to non-DPDK cores ────────────
+    //
+    // vhost-net spawns kernel threads (vhost-<pid>) that service the
+    // virtio rings. Pinning them away from the DPDK polling core(s)
+    // reduces cache thrashing.
+    if dpdk_config.mode == "virtio" {
+        pin_vhost_threads(n_cores);
+    }
 
     // ── 8. Run engine(s) ──────────────────────────────────────────
 
@@ -482,11 +499,17 @@ pub fn run(
 // ── TAP interface configuration ─────────────────────────────────────
 
 /// Assign IP address, set MTU, and bring up a TAP interface created by DPDK.
+///
+/// When `disable_offload` is true (virtio-user mode), also disable kernel
+/// checksum/segmentation offload on the TAP device. This eliminates redundant
+/// `csum_partial` overhead in the vhost-net kernel threads since DPDK handles
+/// checksums directly.
 fn configure_tap_interface(
     iface: &str,
     ip: Ipv4Addr,
     prefix: u8,
     mtu: u16,
+    disable_offload: bool,
 ) -> Result<()> {
     let mtu_str = mtu.to_string();
     let addr = format!("{ip}/{prefix}");
@@ -497,6 +520,20 @@ fn configure_tap_interface(
         .context("failed to assign IP to TAP")?;
     run_cmd("ip", &["link", "set", iface, "up"])
         .context("failed to bring TAP up")?;
+
+    if disable_offload {
+        // Disable kernel checksum/segmentation offload on the TAP device.
+        // DPDK handles checksums, so kernel computation is redundant overhead.
+        if let Err(e) = run_cmd(
+            "ethtool",
+            &["-K", iface, "tx", "off", "rx", "off", "sg", "off",
+              "tso", "off", "gso", "off", "gro", "off"],
+        ) {
+            tracing::warn!(%e, iface, "failed to disable TAP offload (non-fatal)");
+        } else {
+            tracing::info!(iface, "disabled kernel checksum/offload on TAP");
+        }
+    }
 
     tracing::info!(
         iface,
@@ -603,4 +640,69 @@ fn format_mac(mac: &[u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+// ── vhost thread pinning ────────────────────────────────────────────
+
+/// Pin vhost-net kernel threads to CPU cores not used by DPDK engines.
+///
+/// vhost-net creates kernel threads named `vhost-<pid>` that service the
+/// virtio rings. By default they can run on any core, causing cache thrashing
+/// with the DPDK polling thread(s). Pinning them to separate cores improves
+/// cache locality.
+fn pin_vhost_threads(n_dpdk_cores: usize) {
+    let pid = std::process::id();
+
+    // Read /proc/<pid>/task/ to find all threads, then filter by name.
+    let task_dir = format!("/proc/{pid}/task");
+    let Ok(entries) = std::fs::read_dir(&task_dir) else {
+        tracing::warn!("cannot read {task_dir}, skipping vhost pinning");
+        return;
+    };
+
+    // Build CPU mask that excludes DPDK cores (0..n_dpdk_cores).
+    // Pin vhost threads to the remaining cores.
+    let n_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
+    if n_cpus <= n_dpdk_cores {
+        tracing::warn!(
+            n_cpus, n_dpdk_cores,
+            "not enough CPUs to pin vhost threads separately"
+        );
+        return;
+    }
+
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for cpu in n_dpdk_cores..n_cpus {
+        unsafe { libc::CPU_SET(cpu, &mut cpuset) };
+    }
+
+    for entry in entries.flatten() {
+        let tid_str = entry.file_name();
+        let tid_str = tid_str.to_string_lossy();
+        let Ok(tid) = tid_str.parse::<i32>() else {
+            continue;
+        };
+
+        // Read thread name from /proc/<pid>/task/<tid>/comm
+        let comm_path = format!("/proc/{pid}/task/{tid_str}/comm");
+        let Ok(comm) = std::fs::read_to_string(&comm_path) else {
+            continue;
+        };
+        let comm = comm.trim();
+
+        if comm.starts_with("vhost-") {
+            let ret = unsafe {
+                libc::sched_setaffinity(
+                    tid,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &cpuset,
+                )
+            };
+            if ret == 0 {
+                tracing::info!(tid, comm, cores = ?(n_dpdk_cores..n_cpus), "pinned vhost thread");
+            } else {
+                tracing::warn!(tid, comm, "failed to pin vhost thread");
+            }
+        }
+    }
 }
