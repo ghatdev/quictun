@@ -1,0 +1,114 @@
+diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
+index 38ea8fb..ff31c4d 100644
+--- a/quinn-proto/src/connection/mod.rs
++++ b/quinn-proto/src/connection/mod.rs
+@@ -3755,6 +3755,47 @@ impl Connection {
+             new_tokens.push(self.path.remote);
+         }
+     }
++
++    //
++    // quictun-quic: Key extraction for custom data-plane
++    //
++
++    /// Extract 1-RTT keys after handshake completes.
++    ///
++    /// Takes ownership of the Data space crypto keys. After this call,
++    /// the connection can no longer process 1-RTT data packets internally.
++    /// Use this to hand off AEAD/header keys to a custom data plane.
++    pub fn take_1rtt_keys(&mut self) -> Option<Keys> {
++        self.spaces[SpaceId::Data as usize].crypto.take()
++    }
++
++    /// Extract the pre-computed next 1-RTT packet keys (for key update).
++    pub fn take_next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
++        self.next_crypto.take()
++    }
++
++    /// Produce additional 1-RTT key generations for key update.
++    ///
++    /// Each call advances the key schedule and returns the next generation's
++    /// packet keys. Call multiple times to pre-compute key rotations.
++    pub fn produce_next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
++        self.crypto.next_1rtt_keys()
++    }
++
++    /// The local connection ID (used by the peer to address us in short headers).
++    pub fn local_cid(&self) -> &ConnectionId {
++        &self.handshake_cid
++    }
++
++    /// The CID length used for parsing incoming short headers.
++    pub fn local_cid_len(&self) -> usize {
++        self.local_cid_state.cid_len()
++    }
++
++    /// The active remote connection ID (used by us to address the peer).
++    pub fn remote_cid(&self) -> ConnectionId {
++        self.rem_cids.active()
++    }
+ }
+ 
+ impl fmt::Debug for Connection {
+diff --git a/quinn-proto/src/crypto.rs b/quinn-proto/src/crypto.rs
+index aebd864..8f90a82 100644
+--- a/quinn-proto/src/crypto.rs
++++ b/quinn-proto/src/crypto.rs
+@@ -155,6 +155,23 @@ pub trait PacketKey: Send + Sync {
+         header: &[u8],
+         payload: &mut BytesMut,
+     ) -> Result<(), CryptoError>;
++    /// Decrypt the packet payload in-place on a raw byte slice.
++    ///
++    /// Returns the length of the decrypted plaintext (payload without AEAD tag).
++    /// The decrypted data is in `payload[..returned_len]`.
++    fn decrypt_in_place(
++        &self,
++        packet: u64,
++        header: &[u8],
++        payload: &mut [u8],
++    ) -> Result<usize, CryptoError> {
++        // Default: delegate to decrypt() via BytesMut (suboptimal but correct).
++        let mut buf = BytesMut::from(&payload[..]);
++        self.decrypt(packet, header, &mut buf)?;
++        let len = buf.len();
++        payload[..len].copy_from_slice(&buf);
++        Ok(len)
++    }
+     /// The length of the AEAD tag appended to packets on encryption
+     fn tag_len(&self) -> usize;
+     /// Maximum number of packets that may be sent using a single key
+diff --git a/quinn-proto/src/crypto/rustls.rs b/quinn-proto/src/crypto/rustls.rs
+index 231025b..a399ab6 100644
+--- a/quinn-proto/src/crypto/rustls.rs
++++ b/quinn-proto/src/crypto/rustls.rs
+@@ -615,7 +615,9 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
+         header: &[u8],
+         payload: &mut BytesMut,
+     ) -> Result<(), CryptoError> {
+-        let plain = self
++        // (**self) disambiguates: calls rustls::quic::PacketKey::decrypt_in_place,
++        // not the quinn-proto crypto::PacketKey::decrypt_in_place we added.
++        let plain = (**self)
+             .decrypt_in_place(packet, header, payload.as_mut())
+             .map_err(|_| CryptoError)?;
+         let plain_len = plain.len();
+@@ -623,6 +625,18 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
+         Ok(())
+     }
+ 
++    fn decrypt_in_place(
++        &self,
++        packet: u64,
++        header: &[u8],
++        payload: &mut [u8],
++    ) -> Result<usize, CryptoError> {
++        let plain = (**self)
++            .decrypt_in_place(packet, header, payload)
++            .map_err(|_| CryptoError)?;
++        Ok(plain.len())
++    }
++
+     fn tag_len(&self) -> usize {
+         (**self).tag_len()
+     }

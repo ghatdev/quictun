@@ -122,6 +122,26 @@ DPDK 25.11.0 LTS built from source at `/opt/dpdk` (statically linked). See [ROAD
 PKG_CONFIG_PATH=/opt/dpdk/lib/x86_64-linux-gnu/pkgconfig cargo build --release
 ```
 
+## Third-Party Dependencies
+
+`third_party/quinn/` is a [git subtree](https://www.atlassian.com/git/tutorials/git-subtree) of [quinn-rs/quinn](https://github.com/quinn-rs/quinn) at tag `quinn-0.11.9`. Only `quinn-proto` is patched — rustls and all other dependencies are upstream from crates.io.
+
+Our patches on top of upstream:
+
+| Patch | Files | Purpose |
+|-------|-------|---------|
+| Key extraction | `quinn-proto/src/connection/mod.rs` | `take_1rtt_keys()`, CID access for quictun-quic data plane |
+| decrypt_in_place | `quinn-proto/src/crypto.rs`, `crypto/rustls.rs` | In-place AEAD decrypt without BytesMut allocation |
+
+### Updating upstream
+
+```bash
+git subtree pull --prefix=third_party/quinn \
+    https://github.com/quinn-rs/quinn.git <new-tag> --squash
+```
+
+Then resolve any conflicts in patched files and run `cargo test -p quictun-quic`.
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for the development roadmap.
