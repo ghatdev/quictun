@@ -75,6 +75,19 @@ pub struct DecryptedPacket {
     pub pn: u64,
 }
 
+/// Result of decrypting a 1-RTT packet fully in-place (zero-copy).
+///
+/// Datagram byte ranges refer to offsets within the original `packet` buffer
+/// passed to `decrypt_packet_in_place`.
+pub struct DecryptedInPlace {
+    /// Byte ranges of DATAGRAM payloads within the packet buffer.
+    pub datagrams: SmallVec<[Range<usize>; 4]>,
+    /// ACK frame if present in the packet.
+    pub ack: Option<AckFrame>,
+    /// The decoded packet number.
+    pub pn: u64,
+}
+
 /// Result of encrypting a datagram into a 1-RTT packet.
 pub struct EncryptResult {
     /// Bytes written to the output buffer.
@@ -101,6 +114,8 @@ pub struct ConnectionState {
 
     // Key update (pre-computed generations)
     next_keys: Mutex<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
+    /// New RX key saved by initiate_key_update(), applied when peer responds.
+    pending_rx_key: Mutex<Option<Box<dyn PacketKey>>>,
     key_phase: AtomicBool,
     peer_key_phase: AtomicBool,
     packets_since_key_update: AtomicU64,
@@ -169,6 +184,7 @@ impl ConnectionState {
             tx_header_key,
             tag_len,
             next_keys: Mutex::new(next_keys),
+            pending_rx_key: Mutex::new(None),
             key_phase: AtomicBool::new(false),
             peer_key_phase: AtomicBool::new(false),
             packets_since_key_update: AtomicU64::new(0),
@@ -320,36 +336,164 @@ impl ConnectionState {
         })
     }
 
+    /// Decrypt an incoming 1-RTT packet fully in-place (zero heap allocation).
+    ///
+    /// The entire decrypt happens on the provided `packet` buffer:
+    /// header unprotection, AEAD decrypt, and frame parsing all in-place.
+    /// Returns byte ranges into `packet` for each DATAGRAM payload.
+    ///
+    /// This is the fastest decrypt path — no BytesMut, no memcpy.
+    pub fn decrypt_packet_in_place(
+        &self,
+        packet: &mut [u8],
+    ) -> Result<DecryptedInPlace, ParseError> {
+        let pkt_len = packet.len();
+        if pkt_len < 1 + self.local_cid_len + 4 + self.tag_len {
+            return Err(ParseError::BufferTooShort);
+        }
+
+        let pn_offset = 1 + self.local_cid_len;
+        let sample_offset = pn_offset + 4;
+        if pkt_len < sample_offset + self.rx_header_key.sample_size() {
+            return Err(ParseError::BufferTooShort);
+        }
+
+        // Remove header protection (in-place)
+        self.rx_header_key.decrypt(pn_offset, packet);
+
+        // Parse the unprotected short header
+        let largest_pn = self.largest_rx_pn.load(Ordering::Relaxed);
+        let hdr = packet::parse_short_header(packet, self.local_cid_len, largest_pn)?;
+
+        // Key phase rotation (CAS for multi-core safety)
+        let current_peer_phase = self.peer_key_phase.load(Ordering::Acquire);
+        if hdr.key_phase != current_peer_phase {
+            if self
+                .peer_key_phase
+                .compare_exchange(
+                    current_peer_phase,
+                    hdr.key_phase,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.handle_key_update_rx(hdr.key_phase);
+            }
+        }
+
+        // AEAD decrypt in-place: header is AAD, payload+tag is decrypted in-place.
+        let payload_offset = hdr.payload_offset;
+        let plain_len = {
+            let (header, payload) = packet.split_at_mut(payload_offset);
+            let rx_key = self.rx_packet_key.read();
+            rx_key
+                .decrypt_in_place(hdr.pn, header, payload)
+                .map_err(|_| ParseError::CryptoError)?
+        };
+
+        // Update RX state
+        self.received.set(hdr.pn);
+        let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
+        if self.ack_enabled {
+            self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Parse frames from decrypted payload (in-place, return ranges).
+        let decrypted_end = payload_offset + plain_len;
+        let decrypted = &packet[payload_offset..decrypted_end];
+        let mut datagrams: SmallVec<[Range<usize>; 4]> = SmallVec::new();
+        let mut ack_frame = None;
+        let mut pos = 0;
+        let decrypted_len = decrypted.len();
+
+        while pos < decrypted_len {
+            let frame_type = decrypted[pos];
+            match frame_type {
+                0x00 => {
+                    pos += 1;
+                }
+                0x01 => {
+                    pos += 1;
+                }
+                0x02 | 0x03 => {
+                    let (ack, rest) = frame::parse_ack(&decrypted[pos..])?;
+                    ack_frame = Some(ack);
+                    pos = decrypted_len - rest.len();
+                }
+                0x30 | 0x31 => {
+                    let remaining = &decrypted[pos..];
+                    let (data, rest) = frame::parse_datagram(remaining)?;
+                    // Compute absolute offset within the original packet buffer.
+                    let data_start =
+                        payload_offset + pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
+                    let data_end = data_start + data.len();
+                    datagrams.push(data_start..data_end);
+                    pos = decrypted_len - rest.len();
+                }
+                0x1c | 0x1d => break,
+                other => {
+                    warn!(frame_type = other, "unknown frame type, skipping rest of packet");
+                    break;
+                }
+            }
+        }
+
+        Ok(DecryptedInPlace {
+            datagrams,
+            ack: ack_frame,
+            pn: hdr.pn,
+        })
+    }
+
     /// Handle a key phase change from the peer.
     ///
     /// Called after CAS on peer_key_phase succeeds — only one thread enters.
+    /// If we initiated (pending_rx_key available), use the saved RX key.
+    /// If the peer initiated, pop a new key pair from next_keys.
     fn handle_key_update_rx(&self, new_phase: bool) {
-        let mut next_keys = self.next_keys.lock();
-        if let Some((new_rx, new_tx)) = next_keys.pop_front() {
+        let pending = self.pending_rx_key.lock().take();
+        if let Some(new_rx) = pending {
+            // We initiated this key update — TX key was already rotated.
+            // Apply the saved RX key now that the peer has responded.
             *self.rx_packet_key.write() = new_rx;
-            *self.tx_packet_key.write() = new_tx;
-            self.key_phase.store(new_phase, Ordering::Release);
-            self.packets_since_key_update.store(0, Ordering::Relaxed);
-            tracing::debug!("key update: rotated to new keys (peer-initiated)");
+            tracing::debug!("key update: RX rotated (peer responded to our initiation)");
         } else {
-            warn!("key update requested but no pre-computed keys available");
+            // Peer initiated — pop a new pair and update both keys.
+            let mut next_keys = self.next_keys.lock();
+            if let Some((new_rx, new_tx)) = next_keys.pop_front() {
+                *self.rx_packet_key.write() = new_rx;
+                *self.tx_packet_key.write() = new_tx;
+                tracing::debug!("key update: rotated to new keys (peer-initiated)");
+            } else {
+                warn!("key update requested but no pre-computed keys available");
+                return;
+            }
         }
+        self.key_phase.store(new_phase, Ordering::Release);
+        self.packets_since_key_update.store(0, Ordering::Relaxed);
     }
 
     /// Initiate a key update (our side).
     ///
     /// Multi-core safety: only the thread whose fetch_add transitions
     /// pkt_count to exactly KEY_UPDATE_THRESHOLD triggers rotation.
+    ///
+    /// Only updates TX key and flips key_phase. The new RX key is saved
+    /// as pending — applied when the peer responds with the new phase.
+    /// peer_key_phase is NOT updated (the peer hasn't rotated yet).
     fn initiate_key_update(&self) {
         let mut next_keys = self.next_keys.lock();
         if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            *self.rx_packet_key.write() = new_rx;
+            // Save new RX key for when peer responds.
+            *self.pending_rx_key.lock() = Some(new_rx);
+            // Update TX key immediately — start sending with new key.
             *self.tx_packet_key.write() = new_tx;
             let old = self.key_phase.load(Ordering::Relaxed);
             self.key_phase.store(!old, Ordering::Release);
-            self.peer_key_phase.store(!old, Ordering::Release);
+            // DO NOT flip peer_key_phase — peer still sends with old phase.
             self.packets_since_key_update.store(0, Ordering::Relaxed);
-            tracing::debug!("key update: rotated to new keys (self-initiated)");
+            tracing::debug!("key update: TX rotated, awaiting peer response");
         } else {
             warn!("key update: no pre-computed keys available, cannot rotate");
         }
