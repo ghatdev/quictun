@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -87,9 +87,10 @@ pub fn run(
     let mut pkt_buf = [0u8; 2048];
     let mut deadline = Instant::now() + Duration::from_secs(1);
     let mut ip_id: u16 = 0;
-    // Reusable BytesMut for feeding quinn-proto long header RX (handshake path).
+    // Reusable BytesMut for feeding QUIC RX — avoids per-packet allocation.
     let mut rx_buf = BytesMut::with_capacity(2048);
-
+    // Reusable BytesMut scratch for quictun-quic AEAD decrypt (avoids malloc/free per packet).
+    let mut decrypt_scratch = BytesMut::with_capacity(2048);
 
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
@@ -157,200 +158,117 @@ pub fn run(
         for i in 0..nb_rx as usize {
             // SAFETY: rx_burst wrote a valid mbuf pointer into rx_mbufs[i]; we take
             // exclusive ownership. The mbuf is freed on drop at end of this iteration.
-            let mut mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let data = mbuf.data();
             rx_pkts += 1;
 
-            // Phase 1: immutable parse to extract owned metadata.
-            // Scope limits the immutable borrow so we can get data_mut() for in-place decrypt.
-            enum RxAction {
-                ShortHeader {
-                    src_mac: [u8; 6],
-                    src_ip: Ipv4Addr,
-                    src_port: u16,
-                    payload_offset: usize,
-                    payload_len: usize,
-                },
-                LongHeader {
-                    src_mac: [u8; 6],
-                    src_ip: Ipv4Addr,
-                    src_port: u16,
-                    ecn: Option<quinn_proto::EcnCodepoint>,
-                    payload_offset: usize,
-                    payload_len: usize,
-                },
-                Arp(net::ParsedArp),
-                Skip,
-            }
-
-            let action = {
-                let data = mbuf.data();
-                match net::parse_packet(data) {
-                    Some(ParsedPacket::Udp(udp)) => {
-                        if udp.dst_ip != identity.local_ip
-                            || udp.dst_port != identity.local_port
-                            || udp.payload.is_empty()
-                        {
-                            RxAction::Skip
-                        } else {
-                            let payload_offset = unsafe {
-                                udp.payload.as_ptr().offset_from(data.as_ptr()) as usize
-                            };
-                            let payload_len = udp.payload.len();
-                            let first_byte = udp.payload[0];
-                            if first_byte & 0x80 == 0 && quic_conn_state.is_some() {
-                                RxAction::ShortHeader {
-                                    src_mac: udp.src_mac,
-                                    src_ip: udp.src_ip,
-                                    src_port: udp.src_port,
-                                    payload_offset,
-                                    payload_len,
-                                }
-                            } else if first_byte & 0x80 != 0 {
-                                RxAction::LongHeader {
-                                    src_mac: udp.src_mac,
-                                    src_ip: udp.src_ip,
-                                    src_port: udp.src_port,
-                                    ecn: udp.ecn,
-                                    payload_offset,
-                                    payload_len,
-                                }
-                            } else {
-                                RxAction::Skip
-                            }
-                        }
+            match net::parse_packet(data) {
+                Some(ParsedPacket::Udp(udp)) => {
+                    // Only process packets addressed to our IP:port.
+                    if udp.dst_ip != identity.local_ip || udp.dst_port != identity.local_port {
+                        continue;
                     }
-                    Some(ParsedPacket::Arp(arp)) => RxAction::Arp(arp),
-                    None => RxAction::Skip,
-                }
-            };
 
-            // Phase 2: process with mutable access where needed.
-            match action {
-                RxAction::ShortHeader {
-                    src_mac,
-                    src_ip,
-                    src_port,
-                    payload_offset,
-                    payload_len,
-                } => {
-                    // MAC / peer learning
-                    arp_table.learn(src_ip, src_mac);
+                    // Learn peer MAC.
+                    arp_table.learn(udp.src_ip, udp.src_mac);
                     if identity.remote_mac.is_none() {
-                        identity.remote_mac = Some(src_mac);
+                        identity.remote_mac = Some(udp.src_mac);
                         tracing::info!(
-                            mac = %format_mac(&src_mac),
-                            ip = %src_ip,
+                            mac = %format_mac(&udp.src_mac),
+                            ip = %udp.src_ip,
                             "learned peer MAC"
                         );
                     }
+
+                    // Update remote_addr for listener (first packet reveals the peer).
                     if !peer_learned {
-                        state.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                        identity.remote_port = src_port;
+                        state.remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
+                        identity.remote_port = udp.src_port;
                         peer_learned = true;
                         tracing::info!(remote = %state.remote_addr, "learned peer address");
                     }
+
                     quic_rx += 1;
 
-                    // Zero-copy in-place decrypt directly in mbuf data.
-                    let conn_state = quic_conn_state.as_ref().unwrap();
-                    let data = mbuf.data_mut();
-                    match conn_state.decrypt_packet_in_place(
-                        &mut data[payload_offset..payload_offset + payload_len],
-                    ) {
-                        Ok(decrypted) => {
-                            if let Some(ref ack) = decrypted.ack {
-                                let now_ns = quictun_quic::bbr::coarse_now_ns();
-                                conn_state.process_ack(ack, now_ns);
-                            }
-                            // Read decrypted datagrams directly from mbuf data.
-                            let data = mbuf.data();
-                            for range in &decrypted.datagrams {
-                                let abs_start = payload_offset + range.start;
-                                let abs_end = payload_offset + range.end;
-                                let datagram_len = abs_end - abs_start;
-                                let frame_len = ETH_HLEN + datagram_len;
-                                if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
-                                    if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
-                                        buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                                        buf[ETH_HLEN..frame_len]
-                                            .copy_from_slice(&data[abs_start..abs_end]);
-                                        inner_tx_mbufs.push(out_mbuf.into_raw());
-                                        inner_tx += 1;
+                    // Route: short header (1-RTT) → quictun-quic, long header → quinn-proto
+                    if udp.payload.is_empty() {
+                        continue;
+                    }
+                    let first_byte = udp.payload[0];
+                    if first_byte & 0x80 == 0 && quic_conn_state.is_some() {
+                        // Short header → quictun-quic fast path
+                        let conn_state = quic_conn_state.as_ref().unwrap();
+                        // Copy into mutable scratch buffer for in-place decrypt
+                        let pkt_len = udp.payload.len();
+                        if pkt_len <= pkt_buf.len() {
+                            pkt_buf[..pkt_len].copy_from_slice(udp.payload);
+                            match conn_state.decrypt_packet_with_buf(&mut pkt_buf[..pkt_len], &mut decrypt_scratch) {
+                                Ok(decrypted) => {
+                                    // Process ACK if present
+                                    if let Some(ref ack) = decrypted.ack {
+                                        let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                        conn_state.process_ack(ack, now_ns);
+                                    }
+                                    // Collect datagrams for batched inner TX
+                                    for datagram in &decrypted.datagrams {
+                                        let frame_len = ETH_HLEN + datagram.len();
+                                        if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
+                                            if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
+                                                buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                                                buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
+                                                inner_tx_mbufs.push(out_mbuf.into_raw());
+                                                inner_tx += 1;
+                                            }
+                                        }
                                     }
                                 }
+                                Err(_e) => {
+                                    decrypt_fail += 1;
+                                }
                             }
                         }
-                        Err(_e) => {
-                            decrypt_fail += 1;
+                    } else if first_byte & 0x80 != 0 {
+                        // Long header → quinn-proto (handshake, retry, etc.)
+                        rx_buf.clear();
+                        rx_buf.extend_from_slice(udp.payload);
+                        let quic_data = rx_buf.split();
+
+                        let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
+                        if let Some(event) =
+                            state
+                                .endpoint
+                                .handle(now, remote_addr, None, udp.ecn, quic_data, &mut response_buf)
+                        {
+                            let responses =
+                                shared::handle_datagram_event(state, event, &mut response_buf);
+
+                            // Queue any stateless response transmits.
+                            for (len, buf) in responses {
+                                let dst_mac = identity
+                                    .remote_mac
+                                    .or_else(|| arp_table.lookup(identity.remote_ip))
+                                    .unwrap_or([0xff; 6]);
+
+                                ip_id = ip_id.wrapping_add(1);
+                                let frame_len = net::build_udp_packet(
+                                    &identity.local_mac,
+                                    &dst_mac,
+                                    identity.local_ip,
+                                    identity.remote_ip,
+                                    identity.local_port,
+                                    identity.remote_port,
+                                    &buf[..len],
+                                    &mut pkt_buf,
+                                    0, // no ECN for stateless responses
+                                    ip_id,
+                                    checksum_mode,
+                                );
+                                pending_frames.push(pkt_buf[..frame_len].to_vec());
+                            }
                         }
                     }
                 }
-                RxAction::LongHeader {
-                    src_mac,
-                    src_ip,
-                    src_port,
-                    ecn,
-                    payload_offset,
-                    payload_len,
-                } => {
-                    // MAC / peer learning
-                    arp_table.learn(src_ip, src_mac);
-                    if identity.remote_mac.is_none() {
-                        identity.remote_mac = Some(src_mac);
-                        tracing::info!(
-                            mac = %format_mac(&src_mac),
-                            ip = %src_ip,
-                            "learned peer MAC"
-                        );
-                    }
-                    if !peer_learned {
-                        state.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                        identity.remote_port = src_port;
-                        peer_learned = true;
-                        tracing::info!(remote = %state.remote_addr, "learned peer address");
-                    }
-                    quic_rx += 1;
-
-                    // Long header → quinn-proto (handshake, cold path — copy is fine).
-                    let data = mbuf.data();
-                    rx_buf.clear();
-                    rx_buf.extend_from_slice(&data[payload_offset..payload_offset + payload_len]);
-                    let quic_data = rx_buf.split();
-
-                    let remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                    if let Some(event) =
-                        state
-                            .endpoint
-                            .handle(now, remote_addr, None, ecn, quic_data, &mut response_buf)
-                    {
-                        let responses =
-                            shared::handle_datagram_event(state, event, &mut response_buf);
-
-                        for (len, buf) in responses {
-                            let dst_mac = identity
-                                .remote_mac
-                                .or_else(|| arp_table.lookup(identity.remote_ip))
-                                .unwrap_or([0xff; 6]);
-
-                            ip_id = ip_id.wrapping_add(1);
-                            let frame_len = net::build_udp_packet(
-                                &identity.local_mac,
-                                &dst_mac,
-                                identity.local_ip,
-                                identity.remote_ip,
-                                identity.local_port,
-                                identity.remote_port,
-                                &buf[..len],
-                                &mut pkt_buf,
-                                0, // no ECN for stateless responses
-                                ip_id,
-                                checksum_mode,
-                            );
-                            pending_frames.push(pkt_buf[..frame_len].to_vec());
-                        }
-                    }
-                }
-                RxAction::Arp(arp) => {
+                Some(ParsedPacket::Arp(arp)) => {
                     // Learn MAC from any ARP we receive.
                     arp_table.learn(arp.sender_ip, arp.sender_mac);
                     if identity.remote_mac.is_none()
@@ -371,7 +289,7 @@ pub fn run(
                         pending_frames.push(reply);
                     }
                 }
-                RxAction::Skip => {}
+                None => {}
             }
             // mbuf freed on drop
         }
@@ -1028,7 +946,9 @@ pub fn run_quictun_multicore(
     checksum_mode: ChecksumMode,
     core_id: usize,
 ) -> Result<()> {
+    let mut pkt_buf = [0u8; 2048];
     let mut ip_id: u16 = (core_id as u16).wrapping_mul(10000); // offset per core
+    let mut decrypt_scratch = BytesMut::with_capacity(2048);
 
     // Stats
     let mut rx_pkts: u64 = 0;
@@ -1067,78 +987,60 @@ pub fn run_quictun_multicore(
         let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
 
         for i in 0..nb_rx as usize {
-            let mut mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let data = mbuf.data();
             rx_pkts += 1;
 
-            // Phase 1: immutable parse to extract owned metadata.
-            // Scope limits the immutable borrow so we can get data_mut() below.
-            enum RxAction {
-                ShortHeader { payload_offset: usize, payload_len: usize },
-                Arp(net::ParsedArp),
-                Skip,
-            }
-
-            let action = {
-                let data = mbuf.data();
-                match net::parse_packet(data) {
-                    Some(ParsedPacket::Udp(udp)) => {
-                        if udp.dst_ip != identity.local_ip
-                            || udp.dst_port != identity.local_port
-                            || udp.payload.is_empty()
-                            || udp.payload[0] & 0x80 != 0
-                        {
-                            RxAction::Skip
-                        } else {
-                            let payload_offset = unsafe {
-                                udp.payload.as_ptr().offset_from(data.as_ptr()) as usize
-                            };
-                            RxAction::ShortHeader {
-                                payload_offset,
-                                payload_len: udp.payload.len(),
-                            }
-                        }
+            match net::parse_packet(data) {
+                Some(ParsedPacket::Udp(udp)) => {
+                    if udp.dst_ip != identity.local_ip
+                        || udp.dst_port != identity.local_port
+                    {
+                        continue;
                     }
-                    Some(ParsedPacket::Arp(arp)) => RxAction::Arp(arp),
-                    None => RxAction::Skip,
-                }
-            };
-
-            // Phase 2: mutable in-place decrypt (zero-copy).
-            match action {
-                RxAction::ShortHeader { payload_offset, payload_len } => {
-                    let data = mbuf.data_mut();
-                    match conn_state.decrypt_packet_in_place(
-                        &mut data[payload_offset..payload_offset + payload_len],
-                    ) {
-                        Ok(decrypted) => {
-                            if let Some(ref ack) = decrypted.ack {
-                                let now_ns = quictun_quic::bbr::coarse_now_ns();
-                                conn_state.process_ack(ack, now_ns);
-                            }
-                            // Read decrypted datagrams directly from mbuf data
-                            let data = mbuf.data();
-                            for range in &decrypted.datagrams {
-                                let abs_start = payload_offset + range.start;
-                                let abs_end = payload_offset + range.end;
-                                let datagram_len = abs_end - abs_start;
-                                let frame_len = ETH_HLEN + datagram_len;
-                                if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
-                                    if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
-                                        buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                                        buf[ETH_HLEN..frame_len]
-                                            .copy_from_slice(&data[abs_start..abs_end]);
-                                        inner_tx_mbufs.push(out_mbuf.into_raw());
-                                        inner_tx += 1;
+                    if udp.payload.is_empty() {
+                        continue;
+                    }
+                    let first_byte = udp.payload[0];
+                    if first_byte & 0x80 == 0 {
+                        // QUIC short header → quictun-quic fast path
+                        let pkt_len = udp.payload.len();
+                        if pkt_len <= pkt_buf.len() {
+                            pkt_buf[..pkt_len].copy_from_slice(udp.payload);
+                            match conn_state.decrypt_packet_with_buf(
+                                &mut pkt_buf[..pkt_len],
+                                &mut decrypt_scratch,
+                            ) {
+                                Ok(decrypted) => {
+                                    if let Some(ref ack) = decrypted.ack {
+                                        let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                        conn_state.process_ack(ack, now_ns);
                                     }
+                                    for datagram in &decrypted.datagrams {
+                                        let datagram_len = datagram.len();
+                                        let frame_len = ETH_HLEN + datagram_len;
+                                        if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
+                                            if let Ok(buf) =
+                                                out_mbuf.alloc_space(frame_len as u16)
+                                            {
+                                                buf[..ETH_HLEN]
+                                                    .copy_from_slice(&inner.eth_hdr.bytes);
+                                                buf[ETH_HLEN..frame_len]
+                                                    .copy_from_slice(datagram);
+                                                inner_tx_mbufs.push(out_mbuf.into_raw());
+                                                inner_tx += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    decrypt_fail += 1;
                                 }
                             }
                         }
-                        Err(_) => {
-                            decrypt_fail += 1;
-                        }
                     }
                 }
-                RxAction::Arp(arp) => {
+                Some(ParsedPacket::Arp(arp)) => {
                     if arp.is_request && arp.target_ip == identity.local_ip {
                         let reply =
                             net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
@@ -1155,7 +1057,7 @@ pub fn run_quictun_multicore(
                         }
                     }
                 }
-                RxAction::Skip => {}
+                None => {}
             }
         }
 
