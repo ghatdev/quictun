@@ -14,10 +14,11 @@ pub mod frame;
 pub mod ordered_queue;
 pub mod packet;
 
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::ConnectionId;
@@ -28,6 +29,40 @@ use tracing::warn;
 use ack::{AtomicBitmap, generate_ack_ranges};
 use bbr::{BbrState, SentTracker};
 use frame::AckFrame;
+
+/// UnsafeCell wrapper that implements Sync for single-threaded access.
+///
+/// Phase 1 runs on a single DPDK polling thread, so no actual concurrent access occurs.
+/// Phase 2 will need Mutex or RwLock when multiple cores share ConnectionState.
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+
+// SAFETY: Phase 1 is single-threaded. The DPDK engine loop is the only accessor.
+// Phase 2 must replace this with Mutex/RwLock for multi-core.
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+unsafe impl<T> Send for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    fn new(val: T) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+
+    /// Get a shared reference to the inner value.
+    ///
+    /// SAFETY: Caller must ensure no mutable references exist.
+    #[inline(always)]
+    unsafe fn get(&self) -> &T {
+        unsafe { &*self.0.get() }
+    }
+
+    /// Get a mutable reference to the inner value.
+    ///
+    /// SAFETY: Caller must ensure exclusive access.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
 
 /// Maximum ACK ranges to include in a single packet.
 const MAX_ACK_RANGES: usize = 8;
@@ -90,15 +125,15 @@ pub struct EncryptResult {
 /// All state is atomic or behind minimal locks — designed for `Arc`-sharing
 /// across cores in Phase 2.
 pub struct ConnectionState {
-    // Current crypto keys
-    rx_packet_key: Mutex<Box<dyn PacketKey>>,
-    tx_packet_key: Mutex<Box<dyn PacketKey>>,
+    // Current crypto keys (UnsafeCell: Phase 1 is single-threaded, no contention).
+    rx_packet_key: SyncUnsafeCell<Box<dyn PacketKey>>,
+    tx_packet_key: SyncUnsafeCell<Box<dyn PacketKey>>,
     rx_header_key: Box<dyn HeaderKey>,
     tx_header_key: Box<dyn HeaderKey>,
     tag_len: usize,
 
     // Key update (pre-computed generations)
-    next_keys: Mutex<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
+    next_keys: SyncUnsafeCell<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
     key_phase: AtomicBool,
     peer_key_phase: AtomicBool,
     packets_since_key_update: AtomicU64,
@@ -157,12 +192,12 @@ impl ConnectionState {
         let _ = is_server;
 
         Arc::new(Self {
-            rx_packet_key: Mutex::new(rx_packet_key),
-            tx_packet_key: Mutex::new(tx_packet_key),
+            rx_packet_key: SyncUnsafeCell::new(rx_packet_key),
+            tx_packet_key: SyncUnsafeCell::new(tx_packet_key),
             rx_header_key,
             tx_header_key,
             tag_len,
-            next_keys: Mutex::new(next_keys),
+            next_keys: SyncUnsafeCell::new(next_keys),
             key_phase: AtomicBool::new(false),
             peer_key_phase: AtomicBool::new(false),
             packets_since_key_update: AtomicU64::new(0),
@@ -218,12 +253,11 @@ impl ConnectionState {
         let header_bytes = &packet[..hdr.payload_offset];
         let mut payload = BytesMut::from(&packet[hdr.payload_offset..]);
 
-        {
-            let rx_key = self.rx_packet_key.lock().unwrap();
-            rx_key
-                .decrypt(hdr.pn, header_bytes, &mut payload)
-                .map_err(|_| ParseError::CryptoError)?;
-        }
+        // SAFETY: Phase 1 is single-threaded (single DPDK polling loop).
+        let rx_key = unsafe { self.rx_packet_key.get() };
+        rx_key
+            .decrypt(hdr.pn, header_bytes, &mut payload)
+            .map_err(|_| ParseError::CryptoError)?;
 
         // Update RX state
         self.received.set(hdr.pn);
@@ -231,33 +265,41 @@ impl ConnectionState {
         let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
         self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
 
+        // Convert to Bytes for zero-copy slicing of datagram payloads.
+        let decrypted = payload.freeze();
+
         // Parse frames from decrypted payload
         let mut datagrams: SmallVec<[Bytes; 4]> = SmallVec::new();
         let mut ack_frame = None;
-        let mut remaining = &payload[..];
+        let mut pos = 0;
+        let decrypted_len = decrypted.len();
 
-        while !remaining.is_empty() {
-            let frame_type = remaining[0];
+        while pos < decrypted_len {
+            let frame_type = decrypted[pos];
             match frame_type {
                 // PADDING (0x00) — skip
                 0x00 => {
-                    remaining = &remaining[1..];
+                    pos += 1;
                 }
                 // PING (0x01) — no payload
                 0x01 => {
-                    remaining = &remaining[1..];
+                    pos += 1;
                 }
                 // ACK (0x02 or 0x03)
                 0x02 | 0x03 => {
-                    let (ack, rest) = frame::parse_ack(remaining)?;
+                    let (ack, rest) = frame::parse_ack(&decrypted[pos..])?;
                     ack_frame = Some(ack);
-                    remaining = rest;
+                    pos = decrypted_len - rest.len();
                 }
                 // DATAGRAM (0x30 no len, 0x31 with len)
                 0x30 | 0x31 => {
+                    let remaining = &decrypted[pos..];
                     let (data, rest) = frame::parse_datagram(remaining)?;
-                    datagrams.push(Bytes::copy_from_slice(data));
-                    remaining = rest;
+                    // Zero-copy: slice into the frozen Bytes (no heap allocation).
+                    let data_start = pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
+                    let data_end = data_start + data.len();
+                    datagrams.push(decrypted.slice(data_start..data_end));
+                    pos = decrypted_len - rest.len();
                 }
                 // CONNECTION_CLOSE (0x1c, 0x1d) — just stop parsing
                 0x1c | 0x1d => break,
@@ -278,15 +320,12 @@ impl ConnectionState {
 
     /// Handle a key phase change from the peer.
     fn handle_key_update_rx(&self, new_phase: bool) {
-        let mut next_keys = self.next_keys.lock().unwrap();
+        // SAFETY: Phase 1 is single-threaded.
+        let next_keys = unsafe { self.next_keys.get_mut() };
         if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            {
-                let mut rx_key = self.rx_packet_key.lock().unwrap();
-                *rx_key = new_rx;
-            }
-            {
-                let mut tx_key = self.tx_packet_key.lock().unwrap();
-                *tx_key = new_tx;
+            unsafe {
+                *self.rx_packet_key.get_mut() = new_rx;
+                *self.tx_packet_key.get_mut() = new_tx;
             }
             self.peer_key_phase.store(new_phase, Ordering::Relaxed);
             self.key_phase.store(new_phase, Ordering::Relaxed);
@@ -299,15 +338,12 @@ impl ConnectionState {
 
     /// Initiate a key update (our side).
     fn initiate_key_update(&self) {
-        let mut next_keys = self.next_keys.lock().unwrap();
+        // SAFETY: Phase 1 is single-threaded.
+        let next_keys = unsafe { self.next_keys.get_mut() };
         if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            {
-                let mut rx_key = self.rx_packet_key.lock().unwrap();
-                *rx_key = new_rx;
-            }
-            {
-                let mut tx_key = self.tx_packet_key.lock().unwrap();
-                *tx_key = new_tx;
+            unsafe {
+                *self.rx_packet_key.get_mut() = new_rx;
+                *self.tx_packet_key.get_mut() = new_tx;
             }
             let old = self.key_phase.load(Ordering::Relaxed);
             self.key_phase.store(!old, Ordering::Relaxed);
@@ -362,9 +398,16 @@ impl ConnectionState {
             }
         }
 
-        // DATAGRAM frame (no length field — last frame in packet)
-        let dg_len = frame::build_datagram_no_len(payload, &mut buf[frame_pos..]);
-        frame_pos += dg_len;
+        // DATAGRAM frame (no length field — last frame in packet).
+        // Skip if payload is empty (ACK-only packet).
+        if !payload.is_empty() {
+            let dg_len = frame::build_datagram_no_len(payload, &mut buf[frame_pos..]);
+            frame_pos += dg_len;
+        } else if frame_pos == header_len {
+            // No ACK and no datagram — add PING frame so packet isn't empty
+            buf[frame_pos] = 0x01; // PING
+            frame_pos += 1;
+        }
 
         // Total plaintext = header + frames
         // AEAD encrypt in-place: encrypts buf[header_len..frame_pos] and appends tag
@@ -376,17 +419,16 @@ impl ConnectionState {
         // Zero the tag area (encrypt writes into it)
         buf[frame_pos..total_with_tag].fill(0);
 
-        {
-            let tx_key = self.tx_packet_key.lock().unwrap();
-            tx_key.encrypt(pn, &mut buf[..total_with_tag], header_len);
-        }
+        // SAFETY: Phase 1 is single-threaded.
+        let tx_key = unsafe { self.tx_packet_key.get() };
+        tx_key.encrypt(pn, &mut buf[..total_with_tag], header_len);
 
         // Apply header protection (must be done AFTER AEAD encryption)
         let pn_offset = 1 + self.remote_cid.len();
         self.tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
 
-        // Track sent packet for CC
-        self.bbr.on_sent(&self.sent, pn, total_with_tag as u16);
+        // Note: BBR tracking disabled in Phase 1. Inner TCP has its own CC.
+        // Re-enable for Phase 2 multi-core.
 
         Ok(EncryptResult {
             len: total_with_tag,
@@ -405,12 +447,23 @@ impl ConnectionState {
         let ranges = generate_ack_ranges(&self.received, largest, MAX_ACK_RANGES);
         // Reset the counter after generating ACK
         self.rx_since_last_ack.store(0, Ordering::Relaxed);
+        // Advance bitmap base to the start of the oldest range we reported.
+        // All PNs below this are implicitly acknowledged and don't need scanning.
+        if let Some(last_range) = ranges.last() {
+            if last_range.start > 0 {
+                self.received.advance_base(last_range.start);
+            }
+        }
         ranges
     }
 
-    /// Check if CC allows sending (inflight < cwnd).
+    /// Check if CC allows sending.
+    ///
+    /// Phase 1: always true — inner TCP handles its own congestion control.
+    /// BBR CC is reserved for Phase 2 multi-core where it prevents head-of-line
+    /// blocking across competing connections.
     pub fn can_send(&self) -> bool {
-        self.bbr.can_send()
+        true
     }
 
     /// Update the largest acknowledged PN (called when processing our sent ACKs).
@@ -419,9 +472,9 @@ impl ConnectionState {
     }
 
     /// Process an ACK frame received from the peer.
-    pub fn process_ack(&self, ack: &AckFrame, now_ns: u64) {
+    pub fn process_ack(&self, ack: &AckFrame, _now_ns: u64) {
         self.update_largest_acked(ack.largest_acked);
-        self.bbr.on_ack(&self.sent, ack, now_ns);
+        // Note: BBR tracking disabled in Phase 1.
     }
 
     /// Get the local CID (for CID matching on incoming packets).

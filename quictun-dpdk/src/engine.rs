@@ -16,6 +16,11 @@ use quictun_quic::ConnectionState;
 /// Maximum burst size for rx/tx.
 const BURST_SIZE: usize = 32;
 
+/// Smaller burst size for inner→outer pipeline in quictun-quic mode.
+/// Limits the outer TX burst to prevent virtio TX ring overflow during peaks.
+/// quinn-proto's CC naturally paces sends; without CC we need to limit bursts.
+const INNER_BURST_SIZE: u16 = 16;
+
 /// Maximum number of GSO segments per poll_transmit call.
 /// quinn-proto will pack up to this many QUIC packets into one transmit buffer.
 const MAX_GSO_SEGMENTS: usize = 10;
@@ -96,6 +101,9 @@ pub fn run(
     let mut quic_rx: u64 = 0;
     let mut inner_rx: u64 = 0;
     let mut inner_tx: u64 = 0;
+    let mut inner_tx_drop: u64 = 0;
+    let mut outer_tx_drop: u64 = 0;
+    let mut decrypt_fail: u64 = 0;
     let mut last_stats = Instant::now();
 
     // Adaptive polling state.
@@ -104,8 +112,12 @@ pub fn run(
 
     // quictun-quic: fast data plane state (set after handshake completes).
     let mut quic_conn_state: Option<Arc<ConnectionState>> = None;
-    // Scratch buffer for quictun-quic encrypted packets.
-    let mut quic_tx_buf = [0u8; 2048];
+    // Pre-allocated mbuf vectors for batched TX (reused across loop iterations).
+    let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+    let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+
+    // Pending mbufs from a failed outer tx_burst (retry next iteration instead of dropping).
+    let mut pending_outer_tx: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
 
     // If connector, drain initial handshake transmits.
     drain_and_send(
@@ -133,6 +145,9 @@ pub fn run(
         let now = Instant::now();
 
         // ── Phase 1a: RX burst from outer port → parse → feed QUIC ──
+
+        // Reuse pre-allocated vectors for this iteration.
+        inner_tx_mbufs.clear();
 
         let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
@@ -179,33 +194,39 @@ pub fn run(
                         continue;
                     }
                     let first_byte = udp.payload[0];
-                    if first_byte & 0x80 == 0 {
+                    if first_byte & 0x80 == 0 && quic_conn_state.is_some() {
                         // Short header → quictun-quic fast path
-                        if let Some(ref conn_state) = quic_conn_state {
-                            // Copy into mutable scratch buffer for in-place decrypt
-                            let pkt_len = udp.payload.len();
-                            if pkt_len <= pkt_buf.len() {
-                                pkt_buf[..pkt_len].copy_from_slice(udp.payload);
-                                match conn_state.decrypt_packet(&mut pkt_buf[..pkt_len]) {
-                                    Ok(decrypted) => {
-                                        // Process ACK if present
-                                        if let Some(ref ack) = decrypted.ack {
-                                            let now_ns = quictun_quic::bbr::coarse_now_ns();
-                                            conn_state.process_ack(ack, now_ns);
-                                        }
-                                        // Deliver datagrams to inner interface
-                                        for datagram in &decrypted.datagrams {
-                                            drive_result.datagrams.push(datagram.clone());
+                        let conn_state = quic_conn_state.as_ref().unwrap();
+                        // Copy into mutable scratch buffer for in-place decrypt
+                        let pkt_len = udp.payload.len();
+                        if pkt_len <= pkt_buf.len() {
+                            pkt_buf[..pkt_len].copy_from_slice(udp.payload);
+                            match conn_state.decrypt_packet(&mut pkt_buf[..pkt_len]) {
+                                Ok(decrypted) => {
+                                    // Process ACK if present
+                                    if let Some(ref ack) = decrypted.ack {
+                                        let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                        conn_state.process_ack(ack, now_ns);
+                                    }
+                                    // Collect datagrams for batched inner TX
+                                    for datagram in &decrypted.datagrams {
+                                        let frame_len = ETH_HLEN + datagram.len();
+                                        if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                                            if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                                                buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                                                buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
+                                                inner_tx_mbufs.push(mbuf.into_raw());
+                                                inner_tx += 1;
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::trace!(error = %e, "quictun-quic decrypt failed");
-                                    }
+                                }
+                                Err(_e) => {
+                                    decrypt_fail += 1;
                                 }
                             }
                         }
-                        // else: short header before handshake complete, drop
-                    } else {
+                    } else if first_byte & 0x80 != 0 {
                         // Long header → quinn-proto (handshake, retry, etc.)
                         rx_buf.clear();
                         rx_buf.extend_from_slice(udp.payload);
@@ -272,18 +293,46 @@ pub fn run(
             // mbuf freed on drop
         }
 
+        // Batch send decrypted datagrams to inner port (retry once on partial send).
+        if !inner_tx_mbufs.is_empty() {
+            let nb = inner_tx_mbufs.len() as u16;
+            let mut sent = port::tx_burst(inner.port_id, 0, &mut inner_tx_mbufs, nb);
+            if sent < nb {
+                let remaining = &mut inner_tx_mbufs[sent as usize..];
+                let nb_remain = remaining.len() as u16;
+                sent += port::tx_burst(inner.port_id, 0, remaining, nb_remain);
+            }
+            if sent < nb {
+                inner_tx_drop += (nb - sent) as u64;
+                for raw in &inner_tx_mbufs[sent as usize..] {
+                    unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+                }
+            }
+        }
+
         // ── Phase 1b: Read from inner port → send_datagram ──
+        //
+        // Back-pressure: if the outer TX ring was full last iteration,
+        // skip inner RX to let the TX queue drain. ARP is always handled.
+        // This prevents sustained queue overflow that causes TCP retransmits.
         //
         // rx_burst handles ARP regardless of connection state,
         // then send IP packets via QUIC if connection exists.
-
+        //
         let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
-        let nb = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
+        // Use smaller burst for quictun-quic mode to prevent outer TX ring overflow.
+        // Back-pressure: if we have pending unsent mbufs, skip inner RX and drain first.
+        let inner_burst = if quic_conn_state.is_some() { INNER_BURST_SIZE } else { BURST_SIZE as u16 };
+        let nb = if !pending_outer_tx.is_empty() {
+            0 // back-pressure: drain pending mbufs first
+        } else {
+            port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, inner_burst)
+        };
 
         let mut inner_ip_count: usize = 0;
-        // Collect quictun-quic TX mbufs for batch send
-        let mut pending_frames_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
+        // Reuse pre-allocated vector for quictun-quic TX batch.
+        outer_tx_mbufs.clear();
 
         for i in 0..nb as usize {
             // SAFETY: inner rx_burst wrote a valid mbuf pointer; exclusive ownership taken.
@@ -297,57 +346,59 @@ pub fn run(
                 0x0800 => {
                     // IPv4: strip Ethernet header, send via QUIC.
                     if let Some(ref conn_state) = quic_conn_state {
-                        // quictun-quic fast path: encrypt and collect mbufs for batch TX
+                        // quictun-quic fast path: encrypt directly into outer mbuf.
+                        // Eliminates the quic_tx_buf intermediate copy.
                         inner_rx += 1;
                         let ip_payload = &data[ETH_HLEN..];
+                        // Max QUIC packet: header(1+cid+4) + DATAGRAM(1+payload) + AEAD tag
+                        let max_quic_len = 1 + conn_state.remote_cid().len() + 4
+                            + 1 + ip_payload.len() + conn_state.tag_len();
+                        let max_frame_len = net::HEADER_SIZE + max_quic_len;
 
-                        if conn_state.can_send() {
-                            // Piggyback ACK on first packet if needed
-                            let ack_ranges = if inner_ip_count == 0 && conn_state.needs_ack() {
-                                Some(conn_state.generate_ack_ranges())
-                            } else {
-                                None
-                            };
-                            let ack_ref = ack_ranges.as_deref();
+                        if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
+                            if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
+                                // Encrypt QUIC packet directly at buf[HEADER_SIZE..]
+                                match conn_state.encrypt_datagram(
+                                    ip_payload,
+                                    None,
+                                    &mut buf[net::HEADER_SIZE..],
+                                ) {
+                                    Ok(result) => {
+                                        let dst_mac = identity
+                                            .remote_mac
+                                            .or_else(|| arp_table.lookup(identity.remote_ip))
+                                            .unwrap_or([0xff; 6]);
+                                        ip_id = ip_id.wrapping_add(1);
 
-                            match conn_state.encrypt_datagram(ip_payload, ack_ref, &mut quic_tx_buf) {
-                                Ok(result) => {
-                                    let dst_mac = identity
-                                        .remote_mac
-                                        .or_else(|| arp_table.lookup(identity.remote_ip))
-                                        .unwrap_or([0xff; 6]);
-                                    ip_id = ip_id.wrapping_add(1);
-
-                                    let frame_len = net::HEADER_SIZE + result.len;
-                                    if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
-                                        if let Ok(buf) = tx_mbuf.alloc_space(frame_len as u16) {
-                                            net::build_udp_packet(
-                                                &identity.local_mac,
-                                                &dst_mac,
-                                                identity.local_ip,
-                                                identity.remote_ip,
-                                                identity.local_port,
-                                                identity.remote_port,
-                                                &quic_tx_buf[..result.len],
-                                                buf,
-                                                0, // ECN: could pass from CC
-                                                ip_id,
-                                                checksum_mode,
-                                            );
-                                            if checksum_mode == ChecksumMode::HardwareOffload {
-                                                tx_mbuf.set_tx_checksum_offload();
-                                            }
-                                            pending_frames_mbufs.push(tx_mbuf.into_raw());
+                                        // Write headers around the already-placed payload.
+                                        let actual_len = net::build_udp_packet_inplace(
+                                            &identity.local_mac,
+                                            &dst_mac,
+                                            identity.local_ip,
+                                            identity.remote_ip,
+                                            identity.local_port,
+                                            identity.remote_port,
+                                            result.len,
+                                            buf,
+                                            0,
+                                            ip_id,
+                                            checksum_mode,
+                                        );
+                                        // Trim mbuf to actual frame size.
+                                        tx_mbuf.truncate(actual_len as u16);
+                                        if checksum_mode == ChecksumMode::HardwareOffload {
+                                            tx_mbuf.set_tx_checksum_offload();
                                         }
+                                        outer_tx_mbufs.push(tx_mbuf.into_raw());
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::trace!(error = %e, "quictun-quic encrypt failed");
+                                    Err(e) => {
+                                        tracing::trace!(error = %e, "quictun-quic encrypt failed");
+                                        // mbuf freed on drop (encrypt failed)
+                                    }
                                 }
                             }
                         }
                         inner_ip_count += 1;
-                        // mbuf freed on drop (we copied the payload, not zero-copy for now)
                     } else if let Some(conn) = state.connection.as_mut() {
                         // Handshake still in progress: use quinn-proto path
                         inner_rx += 1;
@@ -387,107 +438,126 @@ pub fn run(
         }
         let _ = inner_ip_count;
 
-        // Batch TX for quictun-quic encrypted packets
-        if !pending_frames_mbufs.is_empty() {
-            let nb_tx = pending_frames_mbufs.len() as u16;
-            let sent = port::tx_burst(outer_port_id, queue_id, &mut pending_frames_mbufs, nb_tx);
+        // Drain pending mbufs from previous iteration first.
+        if !pending_outer_tx.is_empty() {
+            let nb_pend = pending_outer_tx.len() as u16;
+            let sent = port::tx_burst(outer_port_id, queue_id, &mut pending_outer_tx, nb_pend);
             tx_pkts += sent as u64;
-            for raw in &pending_frames_mbufs[sent as usize..] {
-                unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+            if sent < nb_pend {
+                // Still can't drain — keep the unsent ones, drop oldest to prevent unbounded growth.
+                if pending_outer_tx.len() > 64 {
+                    outer_tx_drop += (pending_outer_tx.len() - 64) as u64;
+                    for raw in &pending_outer_tx[64..] {
+                        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+                    }
+                    pending_outer_tx.truncate(64);
+                }
+                // Shift unsent to the front.
+                let unsent: Vec<_> = pending_outer_tx[sent as usize..].to_vec();
+                pending_outer_tx.clear();
+                pending_outer_tx.extend(unsent);
+            } else {
+                pending_outer_tx.clear();
             }
         }
 
-        // ── Phase 1c: Timer check ───────────────────────────────────
-
-        if now >= deadline {
-            if let Some(conn) = state.connection.as_mut() {
-                conn.handle_timeout(now);
+        // Batch TX for quictun-quic encrypted packets.
+        if !outer_tx_mbufs.is_empty() {
+            let nb_tx = outer_tx_mbufs.len() as u16;
+            let sent = port::tx_burst(outer_port_id, queue_id, &mut outer_tx_mbufs, nb_tx);
+            tx_pkts += sent as u64;
+            if sent < nb_tx {
+                // Save unsent mbufs for next iteration instead of dropping.
+                pending_outer_tx.extend_from_slice(&outer_tx_mbufs[sent as usize..]);
             }
         }
 
-        // ── Phase 2: Process QUIC events → write to inner port ──
+        // ── Phase 1c-3: quinn-proto processing ────────────────────
 
-        shared::process_events(state, &mut drive_result);
+        if quic_conn_state.is_none() {
+            // Handshake in progress — run quinn-proto state machine
 
-        {
-            let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
-            for datagram in &drive_result.datagrams {
-                // Build Ethernet frame directly into mbuf (zero-copy).
-                let frame_len = ETH_HLEN + datagram.len();
-                if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
-                    if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
-                        buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                        buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
-                        tx_mbufs.push(mbuf.into_raw());
-                        inner_tx += 1;
+            if now >= deadline {
+                if let Some(conn) = state.connection.as_mut() {
+                    conn.handle_timeout(now);
+                }
+            }
+
+            shared::process_events(state, &mut drive_result);
+
+            {
+                let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
+                for datagram in &drive_result.datagrams {
+                    let frame_len = ETH_HLEN + datagram.len();
+                    if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                        if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                            buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                            buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
+                            tx_mbufs.push(mbuf.into_raw());
+                            inner_tx += 1;
+                        }
+                    }
+                }
+                if !tx_mbufs.is_empty() {
+                    let nb = tx_mbufs.len() as u16;
+                    let sent = port::tx_burst(inner.port_id, 0, &mut tx_mbufs, nb);
+                    for raw in &tx_mbufs[sent as usize..] {
+                        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
                     }
                 }
             }
-            if !tx_mbufs.is_empty() {
-                let nb = tx_mbufs.len() as u16;
-                let sent = port::tx_burst(inner.port_id, 0, &mut tx_mbufs, nb);
-                for raw in &tx_mbufs[sent as usize..] {
-                    // SAFETY: unsent mbufs are still owned by us.
-                    unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+
+            // Capture quictun-quic state on first Connected event
+            if drive_result.connected {
+                if let Some(cs) = drive_result.connection_state.take() {
+                    tracing::info!("tunnel established via DPDK (quictun-quic data plane active)");
+                    quic_conn_state = Some(cs);
+                } else {
+                    tracing::info!("tunnel established via DPDK");
                 }
             }
-        }
-
-        // Capture quictun-quic state on first Connected event
-        if drive_result.connected {
-            if let Some(cs) = drive_result.connection_state.take() {
-                tracing::info!("tunnel established via DPDK (quictun-quic data plane active)");
-                quic_conn_state = Some(cs);
-            } else {
-                tracing::info!("tunnel established via DPDK");
+            if drive_result.connection_lost {
+                tracing::info!("connection lost, engine exiting");
+                break;
             }
-        }
-        if drive_result.connection_lost {
-            tracing::info!("connection lost, engine exiting");
-            break;
-        }
 
-        // ── Phase 3: Drain transmits → build packets → TX burst ──────
-        //
-        // When quictun-quic is active, quinn-proto's Data space keys are gone,
-        // so poll_transmit only produces handshake/control packets (if any).
-        // We still call it to handle keepalives and connection close frames.
+            drain_and_send(
+                state,
+                now,
+                outer_port_id,
+                queue_id,
+                mempool,
+                identity,
+                arp_table,
+                &mut transmit_buf,
+                &mut tx_pkts,
+                &mut ip_id,
+                checksum_mode,
+            )?;
 
-        drain_and_send(
-            state,
-            now,
-            outer_port_id,
-            queue_id,
-            mempool,
-            identity,
-            arp_table,
-            &mut transmit_buf,
-            &mut tx_pkts,
-            &mut ip_id,
-            checksum_mode,
-        )?;
+            deadline = if let Some(conn) = state.connection.as_mut() {
+                conn.poll_timeout()
+                    .unwrap_or(now + Duration::from_secs(1))
+            } else {
+                now + Duration::from_secs(1)
+            };
+        }
 
         // Send pending raw frames (ARP replies, stateless QUIC responses).
         send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
 
-        // ── Update timer deadline ────────────────────────────────────
-
-        deadline = if let Some(conn) = state.connection.as_mut() {
-            conn.poll_timeout()
-                .unwrap_or(now + Duration::from_secs(1))
-        } else {
-            now + Duration::from_secs(1)
-        };
-
         // ── Periodic stats ───────────────────────────────────────────
 
         if now.duration_since(last_stats).as_secs() >= 2 {
-            tracing::debug!(
+            tracing::info!(
                 rx_pkts,
                 tx_pkts,
                 quic_rx,
                 inner_rx,
                 inner_tx,
+                inner_tx_drop,
+                outer_tx_drop,
+                decrypt_fail,
                 "dpdk engine stats"
             );
             last_stats = now;

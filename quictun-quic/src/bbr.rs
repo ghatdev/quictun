@@ -141,6 +141,15 @@ impl BbrState {
         // Loss detection (RFC 9002 §6.1)
         self.detect_losses(tracker, ack.largest_acked);
 
+        // Advance bitmap bases to prevent growing scans.
+        // All packets below loss_boundary are either acked or lost.
+        if ack.largest_acked >= REORDER_THRESHOLD {
+            let new_base = ack.largest_acked - REORDER_THRESHOLD;
+            tracker.sent_bitmap.advance_base(new_base);
+            tracker.acked_bitmap.advance_base(new_base);
+            tracker.lost_bitmap.advance_base(new_base);
+        }
+
         // Phase transitions + cwnd update
         self.update_phase();
     }

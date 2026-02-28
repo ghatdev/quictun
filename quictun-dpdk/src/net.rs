@@ -292,6 +292,77 @@ pub fn build_udp_packet(
     total_len
 }
 
+/// Write Eth/IP/UDP headers for a packet whose payload is already at `buf[HEADER_SIZE..]`.
+///
+/// Unlike `build_udp_packet`, this does NOT copy the payload — it only writes the
+/// 42-byte header and computes checksums. The caller must ensure the QUIC payload
+/// is already at `buf[HEADER_SIZE..HEADER_SIZE + payload_len]`.
+pub fn build_udp_packet_inplace(
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload_len: usize,
+    buf: &mut [u8],
+    ecn: u8,
+    ip_id: u16,
+    checksum_mode: ChecksumMode,
+) -> usize {
+    let total_len = HEADER_SIZE + payload_len;
+    debug_assert!(buf.len() >= total_len);
+
+    // ── Ethernet header (14 bytes) ──
+    buf[0..6].copy_from_slice(dst_mac);
+    buf[6..12].copy_from_slice(src_mac);
+    buf[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+
+    // ── IPv4 header (20 bytes) ──
+    let ip = &mut buf[ETH_HLEN..ETH_HLEN + IPV4_HLEN];
+    let ip_total_len = (IPV4_HLEN + UDP_HLEN + payload_len) as u16;
+
+    ip[0] = 0x45;
+    ip[1] = ecn & 0x03;
+    ip[2..4].copy_from_slice(&ip_total_len.to_be_bytes());
+    ip[4..6].copy_from_slice(&ip_id.to_be_bytes());
+    ip[6..8].copy_from_slice(&[0x40, 0x00]);
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[10..12].copy_from_slice(&[0x00, 0x00]);
+    ip[12..16].copy_from_slice(&src_ip.octets());
+    ip[16..20].copy_from_slice(&dst_ip.octets());
+
+    if checksum_mode != ChecksumMode::HardwareOffload {
+        let cksum = ipv4_checksum(ip);
+        ip[10..12].copy_from_slice(&cksum.to_be_bytes());
+    }
+
+    // ── UDP header (8 bytes) ──
+    let udp_offset = ETH_HLEN + IPV4_HLEN;
+    let udp_len = (UDP_HLEN + payload_len) as u16;
+
+    buf[udp_offset..udp_offset + 2].copy_from_slice(&src_port.to_be_bytes());
+    buf[udp_offset + 2..udp_offset + 4].copy_from_slice(&dst_port.to_be_bytes());
+    buf[udp_offset + 4..udp_offset + 6].copy_from_slice(&udp_len.to_be_bytes());
+    buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&[0x00, 0x00]);
+
+    // ── UDP checksum (payload already at buf[HEADER_SIZE..total_len]) ──
+    match checksum_mode {
+        ChecksumMode::None => {}
+        ChecksumMode::Software => {
+            let cksum = checksum::udp_checksum(src_ip, dst_ip, &buf[udp_offset..total_len]);
+            buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&cksum.to_be_bytes());
+        }
+        ChecksumMode::HardwareOffload => {
+            let seed = checksum::udp_pseudo_header_checksum(src_ip, dst_ip, udp_len);
+            buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&seed.to_be_bytes());
+        }
+    }
+
+    total_len
+}
+
 /// Build an ARP reply Ethernet frame.
 ///
 /// Returns the complete frame as a `Vec<u8>`.

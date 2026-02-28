@@ -124,6 +124,18 @@ impl Mbuf {
         unsafe { ffi::shim_rte_pktmbuf_data_len(self.raw) as usize }
     }
 
+    /// Truncate the mbuf's data to exactly `new_len` bytes.
+    ///
+    /// Trims bytes from the end. `new_len` must be ≤ current data_len.
+    pub fn truncate(&mut self, new_len: u16) {
+        let current = unsafe { ffi::shim_rte_pktmbuf_data_len(self.raw) };
+        if new_len < current {
+            unsafe {
+                ffi::shim_rte_pktmbuf_trim(self.raw, current - new_len);
+            }
+        }
+    }
+
     /// Set TX checksum offload flags for IPv4/UDP.
     ///
     /// Configures the mbuf so the NIC computes both the IPv4 header checksum
