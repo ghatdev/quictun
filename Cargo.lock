@@ -1131,6 +1131,7 @@ name = "quictun-quic"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "parking_lot",
  "quinn-proto",
  "smallvec",
  "tracing",

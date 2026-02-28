@@ -42,6 +42,7 @@ pub enum ChecksumMode {
 // ── Identity & ARP table ──────────────────────────────────────────
 
 /// Network identity for this DPDK port.
+#[derive(Clone)]
 pub struct NetIdentity {
     pub local_mac: [u8; 6],
     pub remote_mac: Option<[u8; 6]>,
@@ -52,6 +53,7 @@ pub struct NetIdentity {
 }
 
 /// Simple ARP table mapping IPv4 → MAC.
+#[derive(Clone)]
 pub struct ArpTable {
     entries: HashMap<Ipv4Addr, [u8; 6]>,
 }

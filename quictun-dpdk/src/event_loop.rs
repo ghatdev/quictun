@@ -182,8 +182,6 @@ pub fn run(
         EndpointSetup::Listener { server_config } => Some(server_config.clone()),
         EndpointSetup::Connector { .. } => None,
     };
-    // Clone for multi-core path (each thread builds its own QuicState).
-    let server_config_for_multicore = server_config.clone();
     let mut quic_state = QuicState::new(quic_remote_addr, server_config);
 
     // For connector: initiate QUIC connection.
@@ -386,52 +384,49 @@ pub fn run(
             checksum_mode,
         )
     } else {
-        // Multi-core: N engine threads, each with own QUIC state + inner port.
-        // Each thread uses outer queue i and its own TAP PMD inner port.
-        // Connector: core i connects to remote port + i.
-        // Listener: core i listens on local_port + i.
+        // Multi-core: handshake on core 0 via queue 0 + inner port 0,
+        // then spawn N worker threads sharing Arc<ConnectionState>.
 
         let outer_port_id = dpdk_config.port_id;
         let adaptive_poll = dpdk_config.adaptive_poll;
-        let base_local_port = local_port;
 
-        // Extract setup info for cloning into threads.
-        let remote_addr_base = quic_remote_addr;
-        let server_config_arc = server_config_for_multicore;
-        let saved_setup_is_connector = is_connector;
+        // Phase 1: Handshake on core 0
+        let handshake_inner = &inner_ports[0];
+        let hs_result = engine::run_handshake_only(
+            outer_port_id,
+            0, // queue 0
+            mempool,
+            &mut quic_state,
+            &mut identity,
+            &mut arp_table,
+            handshake_inner,
+            &shutdown,
+            checksum_mode,
+        )?;
 
-        // We need the client config for multi-core connectors.
-        // Unfortunately setup was already consumed above for the single quic_state.
-        // For multi-core, we don't use the pre-built quic_state — each thread builds its own.
-        // The pre-built quic_state/setup was consumed, so for multi-core connector
-        // we need the client_config to have been saved. This requires a small refactor:
-        // we bail if multi-core + connector since we consumed the setup.
-        // Actually, the `setup` was moved into `quic_state` already. For multi-core,
-        // we need to rebuild QUIC state per-thread. The client_config was moved.
-        //
-        // Simplification: for now, multi-core only works for listener mode.
-        // TODO: support multi-core connector by cloning client configs.
-        if saved_setup_is_connector {
-            bail!("multi-core (--dpdk-cores > 1) is currently only supported for listener mode");
-        }
+        let conn_state = hs_result.conn_state;
+        let learned_identity = hs_result.identity;
+        let learned_arp = hs_result.arp_table;
 
+        tracing::info!(
+            n_cores,
+            "handshake complete, spawning {n_cores} worker threads"
+        );
+
+        // Phase 2: Spawn N worker threads
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n_cores);
 
-            for (core_idx, inner) in inner_ports.into_iter().enumerate() {
+            for (core_idx, inner) in inner_ports.iter().enumerate() {
                 let shutdown = shutdown.clone();
-                let server_config = server_config_arc.clone();
-                let core_local_port = base_local_port + core_idx as u16;
+                let conn_state = conn_state.clone();
+                let worker_identity = learned_identity.clone();
+                let worker_arp = learned_arp.clone();
                 let mempool = SendPtr(mempool);
-
-                let core_remote_addr = SocketAddr::new(
-                    remote_addr_base.ip(),
-                    remote_addr_base.port() + core_idx as u16,
-                );
 
                 handles.push(s.spawn(move || -> Result<()> {
                     let mempool = mempool.as_ptr();
-                    // Pin thread to CPU core_idx.
+                    // Pin thread to CPU core_idx
                     #[cfg(target_os = "linux")]
                     {
                         let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
@@ -440,50 +435,24 @@ pub fn run(
                             libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
                         };
                         if ret == 0 {
-                            tracing::info!(core = core_idx, "pinned engine thread to CPU");
+                            tracing::info!(core = core_idx, "pinned worker thread to CPU");
                         } else {
-                            tracing::warn!(core = core_idx, "failed to pin thread to CPU");
+                            tracing::warn!(core = core_idx, "failed to pin worker thread to CPU");
                         }
                     }
 
-                    let mut core_identity = NetIdentity {
-                        local_mac,
-                        remote_mac: identity.remote_mac,
-                        local_ip: dpdk_config.local_ip,
-                        remote_ip: dpdk_config.remote_ip,
-                        local_port: core_local_port,
-                        remote_port: 0, // learned from first packet
-                    };
-
-                    let mut core_arp_table = ArpTable::new();
-                    if let Some(mac) = dpdk_config.gateway_mac {
-                        core_arp_table.insert(dpdk_config.remote_ip, mac);
-                    }
-                    // Copy learned MAC.
-                    if let Some(mac) = identity.remote_mac {
-                        core_arp_table.insert(dpdk_config.remote_ip, mac);
-                    }
-
-                    let mut core_quic_state = QuicState::new(core_remote_addr, server_config);
-
-                    tracing::info!(
-                        core = core_idx,
-                        queue = core_idx,
-                        local_port = core_local_port,
-                        "engine thread starting"
-                    );
-
-                    engine::run(
+                    engine::run_quictun_multicore(
                         outer_port_id,
                         core_idx as u16,
                         mempool,
-                        &mut core_quic_state,
-                        &mut core_identity,
-                        &mut core_arp_table,
+                        &conn_state,
+                        &worker_identity,
+                        &worker_arp,
                         inner,
-                        shutdown,
+                        &shutdown,
                         adaptive_poll,
                         checksum_mode,
+                        core_idx,
                     )
                 }));
             }
@@ -491,7 +460,7 @@ pub fn run(
             // Wait for all threads. Return first error if any.
             let mut result: Result<()> = Ok(());
             for handle in handles {
-                if let Err(e) = handle.join().expect("engine thread panicked") {
+                if let Err(e) = handle.join().expect("worker thread panicked") {
                     if result.is_ok() {
                         result = Err(e);
                     }

@@ -1,8 +1,8 @@
 //! quictun-quic: Optimized QUIC 1-RTT data plane for DATAGRAM tunneling.
 //!
 //! Replaces quinn-proto for 1-RTT short header packets after handshake.
-//! Designed for multi-core (all atomic state, `Arc`-shared) but tested
-//! single-threaded first (Phase 1).
+//! Thread-safe: all state is atomic or behind `parking_lot` locks for
+//! `Arc`-sharing across cores in multi-core mode.
 //!
 //! quinn-proto still handles handshake (long headers). Once `Event::Connected`
 //! fires, keys are extracted via `Connection::take_1rtt_keys()` and handed to
@@ -14,13 +14,13 @@ pub mod frame;
 pub mod ordered_queue;
 pub mod packet;
 
-use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use parking_lot::{Mutex, RwLock};
 use quinn_proto::ConnectionId;
 use quinn_proto::crypto::{self, HeaderKey, PacketKey};
 use smallvec::SmallVec;
@@ -29,40 +29,6 @@ use tracing::warn;
 use ack::{AtomicBitmap, generate_ack_ranges};
 use bbr::{BbrState, SentTracker};
 use frame::AckFrame;
-
-/// UnsafeCell wrapper that implements Sync for single-threaded access.
-///
-/// Phase 1 runs on a single DPDK polling thread, so no actual concurrent access occurs.
-/// Phase 2 will need Mutex or RwLock when multiple cores share ConnectionState.
-struct SyncUnsafeCell<T>(UnsafeCell<T>);
-
-// SAFETY: Phase 1 is single-threaded. The DPDK engine loop is the only accessor.
-// Phase 2 must replace this with Mutex/RwLock for multi-core.
-unsafe impl<T> Sync for SyncUnsafeCell<T> {}
-unsafe impl<T> Send for SyncUnsafeCell<T> {}
-
-impl<T> SyncUnsafeCell<T> {
-    fn new(val: T) -> Self {
-        Self(UnsafeCell::new(val))
-    }
-
-    /// Get a shared reference to the inner value.
-    ///
-    /// SAFETY: Caller must ensure no mutable references exist.
-    #[inline(always)]
-    unsafe fn get(&self) -> &T {
-        unsafe { &*self.0.get() }
-    }
-
-    /// Get a mutable reference to the inner value.
-    ///
-    /// SAFETY: Caller must ensure exclusive access.
-    #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn get_mut(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
-    }
-}
 
 /// Maximum ACK ranges to include in a single packet.
 const MAX_ACK_RANGES: usize = 8;
@@ -122,18 +88,19 @@ pub struct EncryptResult {
 /// Created from quinn-proto keys after handshake completes. Handles
 /// encrypt/decrypt/ACK/CC for DATAGRAM-only tunnel traffic.
 ///
-/// All state is atomic or behind minimal locks — designed for `Arc`-sharing
-/// across cores in Phase 2.
+/// Thread-safe: packet keys use `RwLock` (read-heavy, ~3.4M reads/sec,
+/// write every 7M packets for key rotation). Pre-computed keys use `Mutex`.
+/// All counters are atomic. Designed for `Arc`-sharing across cores.
 pub struct ConnectionState {
-    // Current crypto keys (UnsafeCell: Phase 1 is single-threaded, no contention).
-    rx_packet_key: SyncUnsafeCell<Box<dyn PacketKey>>,
-    tx_packet_key: SyncUnsafeCell<Box<dyn PacketKey>>,
+    // Current crypto keys (RwLock: read-heavy, write only on key rotation).
+    rx_packet_key: RwLock<Box<dyn PacketKey>>,
+    tx_packet_key: RwLock<Box<dyn PacketKey>>,
     rx_header_key: Box<dyn HeaderKey>,
     tx_header_key: Box<dyn HeaderKey>,
     tag_len: usize,
 
     // Key update (pre-computed generations)
-    next_keys: SyncUnsafeCell<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
+    next_keys: Mutex<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
     key_phase: AtomicBool,
     peer_key_phase: AtomicBool,
     packets_since_key_update: AtomicU64,
@@ -159,6 +126,10 @@ pub struct ConnectionState {
     // ACK generation
     rx_since_last_ack: AtomicU32,
     ack_interval: u32,
+
+    /// Whether ACK tracking is enabled. Phase 1: false (CC disabled, no consumer).
+    /// Phase 2: true (multi-core BBR needs ACK feedback).
+    ack_enabled: bool,
 }
 
 impl ConnectionState {
@@ -192,12 +163,12 @@ impl ConnectionState {
         let _ = is_server;
 
         Arc::new(Self {
-            rx_packet_key: SyncUnsafeCell::new(rx_packet_key),
-            tx_packet_key: SyncUnsafeCell::new(tx_packet_key),
+            rx_packet_key: RwLock::new(rx_packet_key),
+            tx_packet_key: RwLock::new(tx_packet_key),
             rx_header_key,
             tx_header_key,
             tag_len,
-            next_keys: SyncUnsafeCell::new(next_keys),
+            next_keys: Mutex::new(next_keys),
             key_phase: AtomicBool::new(false),
             peer_key_phase: AtomicBool::new(false),
             packets_since_key_update: AtomicU64::new(0),
@@ -212,16 +183,30 @@ impl ConnectionState {
             sent: SentTracker::new(),
             rx_since_last_ack: AtomicU32::new(0),
             ack_interval: DEFAULT_ACK_INTERVAL,
+            ack_enabled: false,
         })
     }
 
-    /// Decrypt an incoming 1-RTT packet.
+    /// Decrypt an incoming 1-RTT packet (allocates a new BytesMut per call).
+    ///
+    /// Prefer `decrypt_packet_with_buf` in hot paths to reuse a scratch buffer.
+    pub fn decrypt_packet(&self, packet: &mut [u8]) -> Result<DecryptedPacket, ParseError> {
+        let mut scratch = BytesMut::with_capacity(packet.len());
+        self.decrypt_packet_with_buf(packet, &mut scratch)
+    }
+
+    /// Decrypt an incoming 1-RTT packet, reusing a caller-provided BytesMut.
     ///
     /// Performs: header unprotection → PN decode → AEAD decrypt → frame parse.
     /// Handles key phase changes (key update detection).
     ///
     /// `packet` is modified in-place (header unprotection + decryption).
-    pub fn decrypt_packet(&self, packet: &mut [u8]) -> Result<DecryptedPacket, ParseError> {
+    /// `scratch` is cleared and reused (O(1) reset, avoids malloc/free per packet).
+    pub fn decrypt_packet_with_buf(
+        &self,
+        packet: &mut [u8],
+        scratch: &mut BytesMut,
+    ) -> Result<DecryptedPacket, ParseError> {
         let pkt_len = packet.len();
         if pkt_len < 1 + self.local_cid_len + 4 + self.tag_len {
             return Err(ParseError::BufferTooShort);
@@ -243,30 +228,47 @@ impl ConnectionState {
         let largest_pn = self.largest_rx_pn.load(Ordering::Relaxed);
         let hdr = packet::parse_short_header(packet, self.local_cid_len, largest_pn)?;
 
-        // Check key phase and potentially rotate keys
-        let current_peer_phase = self.peer_key_phase.load(Ordering::Relaxed);
+        // Check key phase and potentially rotate keys.
+        // CAS ensures only one thread triggers rotation in multi-core.
+        let current_peer_phase = self.peer_key_phase.load(Ordering::Acquire);
         if hdr.key_phase != current_peer_phase {
-            self.handle_key_update_rx(hdr.key_phase);
+            if self
+                .peer_key_phase
+                .compare_exchange(
+                    current_peer_phase,
+                    hdr.key_phase,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.handle_key_update_rx(hdr.key_phase);
+            }
+            // If CAS failed, another thread already rotated — use new keys.
         }
 
-        // AEAD decrypt: header is AAD, payload includes the AEAD tag
+        // AEAD decrypt: reuse scratch buffer (clear + extend reuses allocation).
         let header_bytes = &packet[..hdr.payload_offset];
-        let mut payload = BytesMut::from(&packet[hdr.payload_offset..]);
+        scratch.clear();
+        scratch.extend_from_slice(&packet[hdr.payload_offset..]);
 
-        // SAFETY: Phase 1 is single-threaded (single DPDK polling loop).
-        let rx_key = unsafe { self.rx_packet_key.get() };
-        rx_key
-            .decrypt(hdr.pn, header_bytes, &mut payload)
-            .map_err(|_| ParseError::CryptoError)?;
+        {
+            let rx_key = self.rx_packet_key.read();
+            rx_key
+                .decrypt(hdr.pn, header_bytes, scratch)
+                .map_err(|_| ParseError::CryptoError)?;
+        }
 
         // Update RX state
         self.received.set(hdr.pn);
         // Update largest_rx_pn atomically (fetch_max)
         let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
-        self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
+        if self.ack_enabled {
+            self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Convert to Bytes for zero-copy slicing of datagram payloads.
-        let decrypted = payload.freeze();
+        let decrypted = scratch.split().freeze();
 
         // Parse frames from decrypted payload
         let mut datagrams: SmallVec<[Bytes; 4]> = SmallVec::new();
@@ -319,16 +321,14 @@ impl ConnectionState {
     }
 
     /// Handle a key phase change from the peer.
+    ///
+    /// Called after CAS on peer_key_phase succeeds — only one thread enters.
     fn handle_key_update_rx(&self, new_phase: bool) {
-        // SAFETY: Phase 1 is single-threaded.
-        let next_keys = unsafe { self.next_keys.get_mut() };
+        let mut next_keys = self.next_keys.lock();
         if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            unsafe {
-                *self.rx_packet_key.get_mut() = new_rx;
-                *self.tx_packet_key.get_mut() = new_tx;
-            }
-            self.peer_key_phase.store(new_phase, Ordering::Relaxed);
-            self.key_phase.store(new_phase, Ordering::Relaxed);
+            *self.rx_packet_key.write() = new_rx;
+            *self.tx_packet_key.write() = new_tx;
+            self.key_phase.store(new_phase, Ordering::Release);
             self.packets_since_key_update.store(0, Ordering::Relaxed);
             tracing::debug!("key update: rotated to new keys (peer-initiated)");
         } else {
@@ -337,17 +337,17 @@ impl ConnectionState {
     }
 
     /// Initiate a key update (our side).
+    ///
+    /// Multi-core safety: only the thread whose fetch_add transitions
+    /// pkt_count to exactly KEY_UPDATE_THRESHOLD triggers rotation.
     fn initiate_key_update(&self) {
-        // SAFETY: Phase 1 is single-threaded.
-        let next_keys = unsafe { self.next_keys.get_mut() };
+        let mut next_keys = self.next_keys.lock();
         if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            unsafe {
-                *self.rx_packet_key.get_mut() = new_rx;
-                *self.tx_packet_key.get_mut() = new_tx;
-            }
+            *self.rx_packet_key.write() = new_rx;
+            *self.tx_packet_key.write() = new_tx;
             let old = self.key_phase.load(Ordering::Relaxed);
-            self.key_phase.store(!old, Ordering::Relaxed);
-            self.peer_key_phase.store(!old, Ordering::Relaxed);
+            self.key_phase.store(!old, Ordering::Release);
+            self.peer_key_phase.store(!old, Ordering::Release);
             self.packets_since_key_update.store(0, Ordering::Relaxed);
             tracing::debug!("key update: rotated to new keys (self-initiated)");
         } else {
@@ -367,15 +367,16 @@ impl ConnectionState {
         ack_ranges: Option<&[Range<u64>]>,
         buf: &mut [u8],
     ) -> Result<EncryptResult, ParseError> {
-        // Check key update threshold
+        // Check key update threshold.
+        // Multi-core: exact equality ensures only one thread triggers rotation.
         let pkt_count = self.packets_since_key_update.fetch_add(1, Ordering::Relaxed);
-        if pkt_count >= KEY_UPDATE_THRESHOLD {
+        if pkt_count == KEY_UPDATE_THRESHOLD {
             self.initiate_key_update();
         }
 
         let pn = self.pn_counter.fetch_add(1, Ordering::Relaxed);
         let largest_acked = self.largest_acked.load(Ordering::Relaxed);
-        let key_phase = self.key_phase.load(Ordering::Relaxed);
+        let key_phase = self.key_phase.load(Ordering::Acquire);
 
         // Build short header
         let (header_len, _pn_len) = packet::build_short_header(
@@ -416,19 +417,15 @@ impl ConnectionState {
         if buf.len() < total_with_tag {
             return Err(ParseError::BufferTooShort);
         }
-        // Zero the tag area (encrypt writes into it)
-        buf[frame_pos..total_with_tag].fill(0);
 
-        // SAFETY: Phase 1 is single-threaded.
-        let tx_key = unsafe { self.tx_packet_key.get() };
-        tx_key.encrypt(pn, &mut buf[..total_with_tag], header_len);
+        {
+            let tx_key = self.tx_packet_key.read();
+            tx_key.encrypt(pn, &mut buf[..total_with_tag], header_len);
+        }
 
         // Apply header protection (must be done AFTER AEAD encryption)
         let pn_offset = 1 + self.remote_cid.len();
         self.tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
-
-        // Note: BBR tracking disabled in Phase 1. Inner TCP has its own CC.
-        // Re-enable for Phase 2 multi-core.
 
         Ok(EncryptResult {
             len: total_with_tag,

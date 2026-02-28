@@ -17,9 +17,8 @@ use quictun_quic::ConnectionState;
 const BURST_SIZE: usize = 32;
 
 /// Smaller burst size for inner→outer pipeline in quictun-quic mode.
-/// Limits the outer TX burst to prevent virtio TX ring overflow during peaks.
-/// quinn-proto's CC naturally paces sends; without CC we need to limit bursts.
-const INNER_BURST_SIZE: u16 = 16;
+/// Pending mbuf retry + back-pressure handle TX ring overflow; safe to raise.
+const INNER_BURST_SIZE: u16 = 24;
 
 /// Maximum number of GSO segments per poll_transmit call.
 /// quinn-proto will pack up to this many QUIC packets into one transmit buffer.
@@ -90,6 +89,8 @@ pub fn run(
     let mut ip_id: u16 = 0;
     // Reusable BytesMut for feeding QUIC RX — avoids per-packet allocation.
     let mut rx_buf = BytesMut::with_capacity(2048);
+    // Reusable BytesMut scratch for quictun-quic AEAD decrypt (avoids malloc/free per packet).
+    let mut decrypt_scratch = BytesMut::with_capacity(2048);
 
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
@@ -201,7 +202,7 @@ pub fn run(
                         let pkt_len = udp.payload.len();
                         if pkt_len <= pkt_buf.len() {
                             pkt_buf[..pkt_len].copy_from_slice(udp.payload);
-                            match conn_state.decrypt_packet(&mut pkt_buf[..pkt_len]) {
+                            match conn_state.decrypt_packet_with_buf(&mut pkt_buf[..pkt_len], &mut decrypt_scratch) {
                                 Ok(decrypted) => {
                                     // Process ACK if present
                                     if let Some(ref ack) = decrypted.ack {
@@ -703,6 +704,506 @@ fn send_raw_frames(
     }
 
     frames.clear();
+    Ok(())
+}
+
+/// Result from handshake-only phase.
+pub struct HandshakeResult {
+    /// quictun-quic connection state for the data plane.
+    pub conn_state: Arc<ConnectionState>,
+    /// Learned network identity (peer MAC, ports, etc.).
+    pub identity: NetIdentity,
+    /// Learned ARP entries.
+    pub arp_table: ArpTable,
+}
+
+/// Run only the QUIC handshake on core 0, then return.
+///
+/// Handles ARP resolution, quinn-proto state machine, and key extraction.
+/// Returns `HandshakeResult` on success — caller spawns worker threads.
+#[allow(clippy::too_many_arguments)]
+pub fn run_handshake_only(
+    outer_port_id: u16,
+    queue_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    state: &mut QuicState,
+    identity: &mut NetIdentity,
+    arp_table: &mut ArpTable,
+    inner: &InnerPort,
+    shutdown: &AtomicBool,
+    checksum_mode: ChecksumMode,
+) -> Result<HandshakeResult> {
+    let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    let mut drive_result = DriveResult::new();
+    let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    let mut pkt_buf = [0u8; 2048];
+    let mut deadline = Instant::now() + Duration::from_secs(1);
+    let mut ip_id: u16 = 0;
+    let mut rx_buf = BytesMut::with_capacity(2048);
+    let mut pending_frames: Vec<Vec<u8>> = Vec::new();
+    let mut peer_learned = identity.remote_port != 0;
+    let mut tx_pkts: u64 = 0;
+
+    // If connector, drain initial handshake transmits.
+    drain_and_send(
+        state, Instant::now(), outer_port_id, queue_id, mempool,
+        identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+        checksum_mode,
+    )?;
+
+    tracing::info!("handshake phase started (core 0)");
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            anyhow::bail!("shutdown during handshake");
+        }
+
+        let now = Instant::now();
+
+        // RX burst: process ARP + QUIC long headers
+        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+            [std::ptr::null_mut(); BURST_SIZE];
+        let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
+
+        for i in 0..nb_rx as usize {
+            let mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let data = mbuf.data();
+
+            match net::parse_packet(data) {
+                Some(ParsedPacket::Udp(udp)) => {
+                    if udp.dst_ip != identity.local_ip || udp.dst_port != identity.local_port {
+                        continue;
+                    }
+                    arp_table.learn(udp.src_ip, udp.src_mac);
+                    if identity.remote_mac.is_none() {
+                        identity.remote_mac = Some(udp.src_mac);
+                        tracing::info!(
+                            mac = %format_mac(&udp.src_mac),
+                            ip = %udp.src_ip,
+                            "learned peer MAC"
+                        );
+                    }
+                    if !peer_learned {
+                        state.remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
+                        identity.remote_port = udp.src_port;
+                        peer_learned = true;
+                        tracing::info!(remote = %state.remote_addr, "learned peer address");
+                    }
+
+                    if udp.payload.is_empty() {
+                        continue;
+                    }
+                    let first_byte = udp.payload[0];
+                    if first_byte & 0x80 != 0 {
+                        // Long header → quinn-proto
+                        rx_buf.clear();
+                        rx_buf.extend_from_slice(udp.payload);
+                        let quic_data = rx_buf.split();
+                        let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
+                        if let Some(event) =
+                            state.endpoint.handle(now, remote_addr, None, udp.ecn, quic_data, &mut response_buf)
+                        {
+                            let responses =
+                                shared::handle_datagram_event(state, event, &mut response_buf);
+                            for (len, buf) in responses {
+                                let dst_mac = identity
+                                    .remote_mac
+                                    .or_else(|| arp_table.lookup(identity.remote_ip))
+                                    .unwrap_or([0xff; 6]);
+                                ip_id = ip_id.wrapping_add(1);
+                                let frame_len = net::build_udp_packet(
+                                    &identity.local_mac, &dst_mac,
+                                    identity.local_ip, identity.remote_ip,
+                                    identity.local_port, identity.remote_port,
+                                    &buf[..len], &mut pkt_buf,
+                                    0, ip_id, checksum_mode,
+                                );
+                                pending_frames.push(pkt_buf[..frame_len].to_vec());
+                            }
+                        }
+                    }
+                }
+                Some(ParsedPacket::Arp(arp)) => {
+                    arp_table.learn(arp.sender_ip, arp.sender_mac);
+                    if identity.remote_mac.is_none() && arp.sender_ip == identity.remote_ip {
+                        identity.remote_mac = Some(arp.sender_mac);
+                        tracing::info!(
+                            mac = %format_mac(&arp.sender_mac),
+                            ip = %arp.sender_ip,
+                            "learned peer MAC via ARP"
+                        );
+                    }
+                    if arp.is_request && arp.target_ip == identity.local_ip {
+                        let reply = net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
+                        pending_frames.push(reply);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // Handle inner ARP during handshake
+        let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; 8] = [std::ptr::null_mut(); 8];
+        let nb_inner = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, 8);
+        for i in 0..nb_inner as usize {
+            let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
+            let data = mbuf.data();
+            if data.len() >= ETH_HLEN {
+                let ethertype = u16::from_be_bytes([data[12], data[13]]);
+                if ethertype == 0x0806 {
+                    if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
+                        if arp.is_request {
+                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
+                            let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
+                            if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
+                                if reply_mbuf.write_packet(&reply).is_ok() {
+                                    let raw = reply_mbuf.into_raw();
+                                    let mut tx = [raw];
+                                    let sent = port::tx_burst(inner.port_id, 0, &mut tx, 1);
+                                    if sent == 0 {
+                                        unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // quinn-proto state machine
+        if now >= deadline {
+            if let Some(conn) = state.connection.as_mut() {
+                conn.handle_timeout(now);
+            }
+        }
+
+        shared::process_events(state, &mut drive_result);
+
+        // Check for connected
+        if drive_result.connected {
+            if let Some(cs) = drive_result.connection_state.take() {
+                tracing::info!("handshake complete (quictun-quic data plane ready)");
+                // Drain any remaining handshake transmits
+                drain_and_send(
+                    state, now, outer_port_id, queue_id, mempool,
+                    identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+                    checksum_mode,
+                )?;
+                send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+                return Ok(HandshakeResult {
+                    conn_state: cs,
+                    identity: identity.clone(),
+                    arp_table: arp_table.clone(),
+                });
+            }
+            tracing::info!("tunnel established but no quictun-quic keys — cannot use multi-core");
+            anyhow::bail!("multi-core requires quictun-quic keys");
+        }
+        if drive_result.connection_lost {
+            anyhow::bail!("connection lost during handshake");
+        }
+
+        drain_and_send(
+            state, now, outer_port_id, queue_id, mempool,
+            identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+            checksum_mode,
+        )?;
+
+        send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+
+        deadline = if let Some(conn) = state.connection.as_mut() {
+            conn.poll_timeout().unwrap_or(now + Duration::from_secs(1))
+        } else {
+            now + Duration::from_secs(1)
+        };
+    }
+}
+
+/// Run the quictun-quic data plane on a single worker core.
+///
+/// This is the multi-core hot loop: no quinn-proto, no handshake logic.
+/// All workers share the same `Arc<ConnectionState>` for encrypt/decrypt.
+///
+/// Each worker has its own:
+/// - outer queue_id (RSS distributes outer RX, or software distributor later)
+/// - inner TAP port (for inner RX → encrypt → outer TX)
+///
+/// For Phase 2 MVP, all outer TX goes through the worker directly (no ordered
+/// queue yet — that requires core 0 drainer coordination). When outer RX
+/// multi-core is added (Step 2D), the ordered queue will be integrated.
+#[allow(clippy::too_many_arguments)]
+pub fn run_quictun_multicore(
+    outer_port_id: u16,
+    queue_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    conn_state: &Arc<ConnectionState>,
+    identity: &NetIdentity,
+    arp_table: &ArpTable,
+    inner: &InnerPort,
+    shutdown: &AtomicBool,
+    adaptive_poll: bool,
+    checksum_mode: ChecksumMode,
+    core_id: usize,
+) -> Result<()> {
+    let mut pkt_buf = [0u8; 2048];
+    let mut ip_id: u16 = (core_id as u16).wrapping_mul(10000); // offset per core
+    let mut decrypt_scratch = BytesMut::with_capacity(2048);
+
+    // Stats
+    let mut rx_pkts: u64 = 0;
+    let mut tx_pkts: u64 = 0;
+    let mut inner_rx: u64 = 0;
+    let mut inner_tx: u64 = 0;
+    let mut inner_tx_drop: u64 = 0;
+    let mut outer_tx_drop: u64 = 0;
+    let mut decrypt_fail: u64 = 0;
+    let mut last_stats = Instant::now();
+
+    // Adaptive polling state
+    let mut empty_polls: u32 = 0;
+    let mut delay_us: u32 = MIN_DELAY_US;
+
+    // Pre-allocated mbuf vectors
+    let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+    let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+    let mut pending_outer_tx: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+
+    tracing::info!(core = core_id, queue = queue_id, "quictun-quic worker started");
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!(core = core_id, "shutdown signal received");
+            break;
+        }
+
+        let now = Instant::now();
+
+        // ── Outer RX → decrypt → inner TX ──
+        inner_tx_mbufs.clear();
+
+        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+            [std::ptr::null_mut(); BURST_SIZE];
+        let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
+
+        for i in 0..nb_rx as usize {
+            let mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let data = mbuf.data();
+            rx_pkts += 1;
+
+            match net::parse_packet(data) {
+                Some(ParsedPacket::Udp(udp)) => {
+                    if udp.dst_ip != identity.local_ip || udp.dst_port != identity.local_port {
+                        continue;
+                    }
+                    if udp.payload.is_empty() {
+                        continue;
+                    }
+                    let first_byte = udp.payload[0];
+                    if first_byte & 0x80 == 0 {
+                        // Short header → quictun-quic decrypt
+                        let pkt_len = udp.payload.len();
+                        if pkt_len <= pkt_buf.len() {
+                            pkt_buf[..pkt_len].copy_from_slice(udp.payload);
+                            match conn_state.decrypt_packet_with_buf(&mut pkt_buf[..pkt_len], &mut decrypt_scratch) {
+                                Ok(decrypted) => {
+                                    if let Some(ref ack) = decrypted.ack {
+                                        let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                        conn_state.process_ack(ack, now_ns);
+                                    }
+                                    for datagram in &decrypted.datagrams {
+                                        let frame_len = ETH_HLEN + datagram.len();
+                                        if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                                            if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                                                buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                                                buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
+                                                inner_tx_mbufs.push(mbuf.into_raw());
+                                                inner_tx += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    decrypt_fail += 1;
+                                }
+                            }
+                        }
+                    }
+                    // Long headers are ignored in data plane — handshake is done
+                }
+                Some(ParsedPacket::Arp(arp)) => {
+                    // Reply to ARP requests for our IP
+                    if arp.is_request && arp.target_ip == identity.local_ip {
+                        let reply = net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
+                        if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
+                            if reply_mbuf.write_packet(&reply).is_ok() {
+                                let raw = reply_mbuf.into_raw();
+                                let mut tx = [raw];
+                                let sent = port::tx_burst(outer_port_id, queue_id, &mut tx, 1);
+                                if sent == 0 {
+                                    unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // Batch send to inner
+        if !inner_tx_mbufs.is_empty() {
+            let nb = inner_tx_mbufs.len() as u16;
+            let mut sent = port::tx_burst(inner.port_id, 0, &mut inner_tx_mbufs, nb);
+            if sent < nb {
+                let remaining = &mut inner_tx_mbufs[sent as usize..];
+                sent += port::tx_burst(inner.port_id, 0, remaining, remaining.len() as u16);
+            }
+            if sent < nb {
+                inner_tx_drop += (nb - sent) as u64;
+                for raw in &inner_tx_mbufs[sent as usize..] {
+                    unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+                }
+            }
+        }
+
+        // ── Inner RX → encrypt → outer TX ──
+        let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+            [std::ptr::null_mut(); BURST_SIZE];
+        let inner_burst = if !pending_outer_tx.is_empty() { 0 } else { INNER_BURST_SIZE };
+        let nb = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, inner_burst);
+
+        outer_tx_mbufs.clear();
+
+        for i in 0..nb as usize {
+            let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
+            let data = mbuf.data();
+            if data.len() < ETH_HLEN {
+                continue;
+            }
+            let ethertype = u16::from_be_bytes([data[12], data[13]]);
+            match ethertype {
+                0x0800 => {
+                    inner_rx += 1;
+                    let ip_payload = &data[ETH_HLEN..];
+                    let max_quic_len = 1 + conn_state.remote_cid().len() + 4
+                        + 1 + ip_payload.len() + conn_state.tag_len();
+                    let max_frame_len = net::HEADER_SIZE + max_quic_len;
+
+                    if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
+                        if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
+                            match conn_state.encrypt_datagram(
+                                ip_payload, None, &mut buf[net::HEADER_SIZE..],
+                            ) {
+                                Ok(result) => {
+                                    let dst_mac = identity.remote_mac
+                                        .or_else(|| arp_table.lookup(identity.remote_ip))
+                                        .unwrap_or([0xff; 6]);
+                                    ip_id = ip_id.wrapping_add(1);
+                                    let actual_len = net::build_udp_packet_inplace(
+                                        &identity.local_mac, &dst_mac,
+                                        identity.local_ip, identity.remote_ip,
+                                        identity.local_port, identity.remote_port,
+                                        result.len, buf, 0, ip_id, checksum_mode,
+                                    );
+                                    tx_mbuf.truncate(actual_len as u16);
+                                    if checksum_mode == ChecksumMode::HardwareOffload {
+                                        tx_mbuf.set_tx_checksum_offload();
+                                    }
+                                    outer_tx_mbufs.push(tx_mbuf.into_raw());
+                                }
+                                Err(e) => {
+                                    tracing::trace!(core = core_id, error = %e, "encrypt failed");
+                                }
+                            }
+                        }
+                    }
+                }
+                0x0806 => {
+                    // Inner ARP reply
+                    if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
+                        if arp.is_request {
+                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
+                            let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
+                            if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
+                                if reply_mbuf.write_packet(&reply).is_ok() {
+                                    let raw = reply_mbuf.into_raw();
+                                    let mut tx = [raw];
+                                    let sent = port::tx_burst(inner.port_id, 0, &mut tx, 1);
+                                    if sent == 0 {
+                                        unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Drain pending outer TX
+        if !pending_outer_tx.is_empty() {
+            let nb_pend = pending_outer_tx.len() as u16;
+            let sent = port::tx_burst(outer_port_id, queue_id, &mut pending_outer_tx, nb_pend);
+            tx_pkts += sent as u64;
+            if sent < nb_pend {
+                if pending_outer_tx.len() > 64 {
+                    outer_tx_drop += (pending_outer_tx.len() - 64) as u64;
+                    for raw in &pending_outer_tx[64..] {
+                        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+                    }
+                    pending_outer_tx.truncate(64);
+                }
+                let unsent: Vec<_> = pending_outer_tx[sent as usize..].to_vec();
+                pending_outer_tx.clear();
+                pending_outer_tx.extend(unsent);
+            } else {
+                pending_outer_tx.clear();
+            }
+        }
+
+        // Batch outer TX
+        if !outer_tx_mbufs.is_empty() {
+            let nb_tx = outer_tx_mbufs.len() as u16;
+            let sent = port::tx_burst(outer_port_id, queue_id, &mut outer_tx_mbufs, nb_tx);
+            tx_pkts += sent as u64;
+            if sent < nb_tx {
+                pending_outer_tx.extend_from_slice(&outer_tx_mbufs[sent as usize..]);
+            }
+        }
+
+        // Stats
+        if now.duration_since(last_stats).as_secs() >= 2 {
+            tracing::info!(
+                core = core_id,
+                rx_pkts, tx_pkts, inner_rx, inner_tx,
+                inner_tx_drop, outer_tx_drop, decrypt_fail,
+                "worker stats"
+            );
+            last_stats = now;
+        }
+
+        // Adaptive polling
+        if adaptive_poll {
+            if nb_rx == 0 && nb == 0 {
+                empty_polls += 1;
+                if empty_polls > EMPTY_POLL_THRESHOLD {
+                    std::thread::sleep(Duration::from_micros(delay_us as u64));
+                    delay_us = delay_us.saturating_mul(2).min(MAX_DELAY_US);
+                }
+            } else {
+                empty_polls = 0;
+                delay_us = MIN_DELAY_US;
+            }
+        }
+    }
+
+    // Free any remaining pending mbufs
+    for raw in &pending_outer_tx {
+        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+    }
+
     Ok(())
 }
 

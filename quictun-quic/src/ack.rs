@@ -42,8 +42,8 @@ impl AtomicBitmap {
         if offset >= BITMAP_CAPACITY {
             return false; // above window
         }
-        let word_idx = (offset / 64) as usize % BITMAP_WORDS;
-        let bit_idx = offset % 64;
+        let word_idx = (offset >> 6) as usize & (BITMAP_WORDS - 1);
+        let bit_idx = offset & 63;
         self.words[word_idx].fetch_or(1u64 << bit_idx, Ordering::Relaxed);
         true
     }
@@ -58,8 +58,8 @@ impl AtomicBitmap {
         if offset >= BITMAP_CAPACITY {
             return false; // above window
         }
-        let word_idx = (offset / 64) as usize % BITMAP_WORDS;
-        let bit_idx = offset % 64;
+        let word_idx = (offset >> 6) as usize & (BITMAP_WORDS - 1);
+        let bit_idx = offset & 63;
         (self.words[word_idx].load(Ordering::Relaxed) >> bit_idx) & 1 == 1
     }
 
@@ -73,8 +73,8 @@ impl AtomicBitmap {
         if offset >= BITMAP_CAPACITY {
             return false;
         }
-        let word_idx = (offset / 64) as usize % BITMAP_WORDS;
-        let bit_idx = offset % 64;
+        let word_idx = (offset >> 6) as usize & (BITMAP_WORDS - 1);
+        let bit_idx = offset & 63;
         let mask = 1u64 << bit_idx;
         let prev = self.words[word_idx].fetch_or(mask, Ordering::Relaxed);
         (prev & mask) != 0
@@ -95,9 +95,9 @@ impl AtomicBitmap {
             }
         } else {
             // Clear only the words that rotated out
-            let old_word_start = (old_base / 64) as usize % BITMAP_WORDS;
-            let new_word_start = (new_base / 64) as usize % BITMAP_WORDS;
-            let words_to_clear = ((advance + 63) / 64) as usize;
+            let old_word_start = (old_base >> 6) as usize & (BITMAP_WORDS - 1);
+            let new_word_start = (new_base >> 6) as usize & (BITMAP_WORDS - 1);
+            let words_to_clear = ((advance + 63) >> 6) as usize;
             for i in 0..words_to_clear.min(BITMAP_WORDS) {
                 let idx = (old_word_start + i) % BITMAP_WORDS;
                 if idx != new_word_start || words_to_clear > BITMAP_WORDS {

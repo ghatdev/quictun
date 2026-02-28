@@ -9,3 +9,4 @@ quinn-proto = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
+parking_lot = "0.12"
