@@ -615,12 +615,26 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        let plain = self
+        // (**self) disambiguates: calls rustls::quic::PacketKey::decrypt_in_place,
+        // not the quinn-proto crypto::PacketKey::decrypt_in_place we added.
+        let plain = (**self)
             .decrypt_in_place(packet, header, payload.as_mut())
             .map_err(|_| CryptoError)?;
         let plain_len = plain.len();
         payload.truncate(plain_len);
         Ok(())
+    }
+
+    fn decrypt_in_place(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        let plain = (**self)
+            .decrypt_in_place(packet, header, payload)
+            .map_err(|_| CryptoError)?;
+        Ok(plain.len())
     }
 
     fn tag_len(&self) -> usize {

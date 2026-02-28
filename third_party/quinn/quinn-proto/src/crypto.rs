@@ -155,6 +155,23 @@ pub trait PacketKey: Send + Sync {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError>;
+    /// Decrypt the packet payload in-place on a raw byte slice.
+    ///
+    /// Returns the length of the decrypted plaintext (payload without AEAD tag).
+    /// The decrypted data is in `payload[..returned_len]`.
+    fn decrypt_in_place(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        // Default: delegate to decrypt() via BytesMut (suboptimal but correct).
+        let mut buf = BytesMut::from(&payload[..]);
+        self.decrypt(packet, header, &mut buf)?;
+        let len = buf.len();
+        payload[..len].copy_from_slice(&buf);
+        Ok(len)
+    }
     /// The length of the AEAD tag appended to packets on encryption
     fn tag_len(&self) -> usize;
     /// Maximum number of packets that may be sent using a single key
