@@ -159,6 +159,7 @@ impl ConnectionState {
         local_cid: ConnectionId,
         remote_cid: ConnectionId,
         is_server: bool,
+        ack_enabled: bool,
     ) -> Arc<Self> {
         let tag_len = keys.packet.local.tag_len();
 
@@ -199,7 +200,7 @@ impl ConnectionState {
             sent: SentTracker::new(),
             rx_since_last_ack: AtomicU32::new(0),
             ack_interval: DEFAULT_ACK_INTERVAL,
-            ack_enabled: false,
+            ack_enabled,
         })
     }
 
@@ -583,6 +584,10 @@ impl ConnectionState {
         // Apply header protection (must be done AFTER AEAD encryption)
         self.tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
 
+        if self.ack_enabled {
+            self.bbr.on_sent(&self.sent, pn, total_with_tag as u16);
+        }
+
         Ok(EncryptResult {
             len: total_with_tag,
             pn,
@@ -612,11 +617,10 @@ impl ConnectionState {
 
     /// Check if CC allows sending.
     ///
-    /// Phase 1: always true — inner TCP handles its own congestion control.
-    /// BBR CC is reserved for Phase 2 multi-core where it prevents head-of-line
-    /// blocking across competing connections.
+    /// When `ack_enabled`, delegates to BBR congestion window check.
+    /// Otherwise always true (inner TCP handles its own CC).
     pub fn can_send(&self) -> bool {
-        true
+        if self.ack_enabled { self.bbr.can_send() } else { true }
     }
 
     /// Update the largest acknowledged PN (called when processing our sent ACKs).
@@ -625,9 +629,11 @@ impl ConnectionState {
     }
 
     /// Process an ACK frame received from the peer.
-    pub fn process_ack(&self, ack: &AckFrame, _now_ns: u64) {
+    pub fn process_ack(&self, ack: &AckFrame, now_ns: u64) {
         self.update_largest_acked(ack.largest_acked);
-        // Note: BBR tracking disabled in Phase 1.
+        if self.ack_enabled {
+            self.bbr.on_ack(&self.sent, ack, now_ns);
+        }
     }
 
     /// Get the local CID (for CID matching on incoming packets).

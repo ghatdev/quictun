@@ -201,7 +201,7 @@ pub async fn run_handshake(
                         );
 
                         let connection_state = quictun_quic::ConnectionState::new(
-                            keys, key_gens, local_cid, remote_cid, is_server,
+                            keys, key_gens, local_cid, remote_cid, is_server, true,
                         );
 
                         // Drain any remaining transmits after Connected.
