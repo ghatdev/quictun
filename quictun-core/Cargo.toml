@@ -26,6 +26,7 @@ bytes = { workspace = true }
 smallvec = { workspace = true }
 aws-lc-rs = { workspace = true }
 rustls-pemfile = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

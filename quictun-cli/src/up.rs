@@ -97,6 +97,7 @@ pub fn run(
             send_window,
             initial_rtt,
             pin_mtu,
+            offload,
         ));
     }
 
@@ -857,6 +858,7 @@ async fn run_async_fast(
     send_window: u64,
     initial_rtt: u64,
     pin_mtu: bool,
+    offload: bool,
 ) -> Result<()> {
     use quictun_core::tunnel::TunnelResult;
 
@@ -894,12 +896,18 @@ async fn run_async_fast(
 
     let parallel = !serial;
 
+    #[cfg(not(target_os = "linux"))]
+    if offload {
+        tracing::warn!("--offload is only supported on Linux, ignoring");
+    }
+
     tracing::info!(
         role = ?role,
         address = %addr,
         mtu = config.mtu(),
         peer_fingerprint = %peer_pubkey.fingerprint(),
         parallel,
+        offload,
         cc = %cc,
         recv_buf,
         send_buf,
@@ -913,8 +921,13 @@ async fn run_async_fast(
 
     // Create TUN device.
     let tun_opts = {
+        #[allow(unused_mut)]
         let mut opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
         opts.name = Some(iface_name.clone());
+        #[cfg(target_os = "linux")]
+        {
+            opts.offload = offload;
+        }
         opts
     };
 
@@ -1016,7 +1029,23 @@ async fn run_async_fast(
         );
 
         // Phase 2: Fast forwarding loop.
-        let result = if parallel {
+        let result = if cfg!(target_os = "linux") && offload && parallel {
+            #[cfg(target_os = "linux")]
+            {
+                fast_tunnel::run_fast_forwarding_loop_offload(
+                    handshake_result.connection_state,
+                    udp.clone(),
+                    tun.clone(),
+                    handshake_result.remote_addr,
+                    idle_timeout,
+                    keepalive,
+                    shutdown_rx.clone(),
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!()
+        } else if parallel {
             fast_tunnel::run_fast_forwarding_loop_parallel(
                 handshake_result.connection_state,
                 udp.clone(),

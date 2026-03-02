@@ -1080,6 +1080,7 @@ dependencies = [
  "base64",
  "bytes",
  "ipnet",
+ "libc",
  "quictun-crypto",
  "quictun-quic",
  "quictun-tun",
