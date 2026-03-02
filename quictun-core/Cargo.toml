@@ -20,7 +20,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 quictun-tun = { workspace = true }
+quinn-proto = { workspace = true }
+quictun-quic = { workspace = true }
 bytes = { workspace = true }
+smallvec = { workspace = true }
 aws-lc-rs = { workspace = true }
 rustls-pemfile = { workspace = true }
 

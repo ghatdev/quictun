@@ -101,6 +101,9 @@ enum Command {
         /// Enable TUN GSO/GRO offload for batched I/O (Linux only, kernel 6.2+)
         #[arg(long)]
         offload: bool,
+        /// Use quictun-quic fast data plane (bypass quinn high-level API after handshake)
+        #[arg(long)]
+        fast: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -142,11 +145,13 @@ fn main() -> anyhow::Result<()> {
             dpdk_cores,
             no_udp_checksum,
             offload,
+            fast,
         } => up::run(
             &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
             sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
             dpdk, dpdk_local_ip, dpdk_remote_ip, dpdk_local_port, dpdk_gateway_mac,
             dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores, no_udp_checksum, offload,
+            fast,
         ),
         Command::Down { config } => down::run(&config),
     }

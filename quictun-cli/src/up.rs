@@ -8,7 +8,7 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 use quictun_core::config::{Config, Role};
 use quictun_core::connection::{self, CongestionControl, TransportTuning};
-use quictun_core::tunnel;
+use quictun_core::{fast_tunnel, proto_config, proto_driver, tunnel};
 use quictun_crypto::{PrivateKey, PublicKey};
 use quictun_tun::{TunDevice, TunOptions};
 use tokio::signal;
@@ -44,6 +44,7 @@ pub fn run(
     dpdk_cores: usize,
     no_udp_checksum: bool,
     offload: bool,
+    fast: bool,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -85,6 +86,20 @@ pub fn run(
     }
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    if fast {
+        return rt.block_on(run_async_fast(
+            config_path,
+            serial,
+            cc,
+            recv_buf,
+            send_buf,
+            send_window,
+            initial_rtt,
+            pin_mtu,
+        ));
+    }
+
     rt.block_on(run_async(
         config_path,
         serial,
@@ -794,6 +809,235 @@ async fn run_async(
             .await
         } else {
             tunnel::run_forwarding_loop(connection, &tun_queues[0], shutdown_rx.clone()).await
+        };
+
+        match result {
+            TunnelResult::Shutdown => {
+                tracing::info!("tunnel closed (shutdown)");
+                break;
+            }
+            TunnelResult::ConnectionLost(e) => {
+                if reconnect_interval.is_some() {
+                    tracing::warn!(error = %e, "connection lost, will reconnect");
+                    let jitter_ms = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos()
+                        % 1000) as u64;
+                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                    tokio::time::sleep(delay).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+                tracing::info!(error = %e, "connection lost, exiting (no reconnect configured)");
+                break;
+            }
+            TunnelResult::Fatal(e) => {
+                return Err(e).context("fatal tunnel error");
+            }
+        }
+    }
+
+    tracing::info!("tunnel closed");
+    Ok(())
+}
+
+/// Run the fast data plane: quinn-proto handshake + quictun-quic forwarding.
+///
+/// Uses quinn-proto directly (not quinn high-level API) for the handshake,
+/// then switches to quictun-quic for the 1-RTT data plane.
+#[allow(clippy::too_many_arguments)]
+async fn run_async_fast(
+    config_path: &str,
+    serial: bool,
+    cc: CongestionControl,
+    recv_buf: usize,
+    send_buf: usize,
+    send_window: u64,
+    initial_rtt: u64,
+    pin_mtu: bool,
+) -> Result<()> {
+    use quictun_core::tunnel::TunnelResult;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
+    let role = config.role();
+    let addr = config.parse_address()?;
+
+    let private_key = PrivateKey::from_base64(&config.interface.private_key)
+        .context("invalid interface private_key")?;
+
+    let peer = &config.peer[0];
+    let peer_pubkey =
+        PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
+
+    let keepalive = peer.keepalive.map(Duration::from_secs);
+    let reconnect_interval = peer.reconnect_interval;
+
+    let tuning = TransportTuning {
+        datagram_recv_buffer: recv_buf,
+        datagram_send_buffer: send_buf,
+        send_window,
+        cc,
+        max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
+        initial_rtt_ms: initial_rtt,
+        pin_mtu,
+        ..Default::default()
+    };
+
+    let parallel = !serial;
+
+    tracing::info!(
+        role = ?role,
+        address = %addr,
+        mtu = config.mtu(),
+        peer_fingerprint = %peer_pubkey.fingerprint(),
+        parallel,
+        cc = %cc,
+        recv_buf,
+        send_buf,
+        send_window,
+        reconnect = reconnect_interval.is_some(),
+        "starting quictun (fast data plane)"
+    );
+
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
+    // Create TUN device.
+    let tun_opts = {
+        let mut opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
+        opts.name = Some(iface_name.clone());
+        opts
+    };
+
+    let tun = TunDevice::create_with_options(&tun_opts)
+        .context("failed to create TUN device")?;
+    let tun = Arc::new(tun);
+
+    // Write PID file.
+    state::write_pid_file(&iface_name)?;
+    let _pid_guard = state::PidFileGuard::new(iface_name);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.ok();
+        tracing::info!("received SIGINT, shutting down");
+        let _ = shutdown_tx.send(true);
+    });
+
+    // Build quinn-proto configs.
+    let setup = match role {
+        Role::Connector => {
+            let client_config = proto_config::build_proto_client_config(
+                &private_key,
+                &peer_pubkey,
+                keepalive,
+                &tuning,
+            )?;
+            let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+            proto_driver::HandshakeSetup::Connector {
+                remote_addr,
+                client_config,
+            }
+        }
+        Role::Listener => {
+            let server_config = proto_config::build_proto_server_config(
+                &private_key,
+                &[peer_pubkey],
+                keepalive,
+                &tuning,
+            )?;
+            proto_driver::HandshakeSetup::Listener { server_config }
+        }
+    };
+
+    // Bind UDP socket.
+    let listen_port = config.interface.listen_port.unwrap_or(0);
+    let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
+    let udp = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .context("failed to bind UDP socket")?;
+    let udp = Arc::new(udp);
+
+    tracing::info!(local_addr = %udp.local_addr()?, "UDP socket bound");
+
+    // Idle timeout: use config value or default to 30s.
+    let idle_timeout = if config.interface.max_idle_timeout_ms > 0 {
+        Duration::from_millis(config.interface.max_idle_timeout_ms)
+    } else {
+        Duration::from_secs(30)
+    };
+
+    // Backoff state for reconnection.
+    let mut backoff_secs: u64 = 1;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        // Phase 1: Handshake.
+        let handshake_result = match proto_driver::run_handshake(&udp, &setup, &shutdown_rx).await {
+            Ok(r) => {
+                backoff_secs = 1;
+                r
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "handshake failed");
+                if reconnect_interval.is_some() {
+                    let jitter_ms = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos()
+                        % 1000) as u64;
+                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                    tokio::time::sleep(delay).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+                return Err(e).context("handshake failed");
+            }
+        };
+
+        tracing::info!(
+            remote = %handshake_result.remote_addr,
+            "connection established, switching to fast data plane"
+        );
+
+        // Phase 2: Fast forwarding loop.
+        let result = if parallel {
+            fast_tunnel::run_fast_forwarding_loop_parallel(
+                handshake_result.connection_state,
+                udp.clone(),
+                tun.clone(),
+                handshake_result.remote_addr,
+                idle_timeout,
+                keepalive,
+                shutdown_rx.clone(),
+            )
+            .await
+        } else {
+            fast_tunnel::run_fast_forwarding_loop(
+                &handshake_result.connection_state,
+                &udp,
+                &tun,
+                handshake_result.remote_addr,
+                idle_timeout,
+                keepalive,
+                shutdown_rx.clone(),
+            )
+            .await
         };
 
         match result {
