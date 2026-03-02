@@ -262,7 +262,7 @@ pub fn run(
                     ) {
                         Ok(decrypted) => {
                             if let Some(ref ack) = decrypted.ack {
-                                let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                let now_ns = quictun_quic::cc::coarse_now_ns();
                                 conn_state.process_ack(ack, now_ns);
                             }
                             for range in &decrypted.datagrams {
@@ -1117,7 +1117,7 @@ pub fn run_quictun_multicore(
                     ) {
                         Ok(decrypted) => {
                             if let Some(ref ack) = decrypted.ack {
-                                let now_ns = quictun_quic::bbr::coarse_now_ns();
+                                let now_ns = quictun_quic::cc::coarse_now_ns();
                                 conn_state.process_ack(ack, now_ns);
                             }
                             for range in &decrypted.datagrams {

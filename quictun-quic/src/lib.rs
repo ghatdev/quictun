@@ -9,7 +9,7 @@
 //! `ConnectionState` for the data plane.
 
 pub mod ack;
-pub mod bbr;
+pub mod cc;
 pub mod frame;
 pub mod ordered_queue;
 pub mod packet;
@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 use tracing::warn;
 
 use ack::{AtomicBitmap, generate_ack_ranges};
-use bbr::{BbrState, SentTracker};
+use cc::{CongestionControl, SentPacketRing};
 use frame::AckFrame;
 
 /// Maximum ACK ranges to include in a single packet.
@@ -135,8 +135,8 @@ pub struct ConnectionState {
     received: AtomicBitmap,
 
     // Congestion control + loss detection
-    pub bbr: BbrState,
-    pub sent: SentTracker,
+    pub cc: CongestionControl,
+    sent_ring: SentPacketRing,
 
     // ACK generation
     rx_since_last_ack: AtomicU32,
@@ -196,8 +196,8 @@ impl ConnectionState {
             largest_acked: AtomicU64::new(0),
             largest_rx_pn: AtomicU64::new(0),
             received: AtomicBitmap::new(),
-            bbr: BbrState::new(),
-            sent: SentTracker::new(),
+            cc: CongestionControl::new(),
+            sent_ring: SentPacketRing::new(),
             rx_since_last_ack: AtomicU32::new(0),
             ack_interval: DEFAULT_ACK_INTERVAL,
             ack_enabled,
@@ -584,8 +584,15 @@ impl ConnectionState {
         // Apply header protection (must be done AFTER AEAD encryption)
         self.tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
 
+        // Track packets for congestion control.
         if self.ack_enabled {
-            self.bbr.on_sent(&self.sent, pn, total_with_tag as u16);
+            if !payload.is_empty() {
+                // Data packets: full CC tracking (inflight, size, timestamp).
+                self.cc.on_sent(&self.sent_ring, pn, total_with_tag as u16);
+            } else {
+                // ACK-only packets: register with size=0 so on_ack skips them.
+                self.cc.register_ack_only(&self.sent_ring, pn);
+            }
         }
 
         Ok(EncryptResult {
@@ -617,10 +624,10 @@ impl ConnectionState {
 
     /// Check if CC allows sending.
     ///
-    /// When `ack_enabled`, delegates to BBR congestion window check.
+    /// When `ack_enabled`, delegates to AIMD congestion window check.
     /// Otherwise always true (inner TCP handles its own CC).
     pub fn can_send(&self) -> bool {
-        if self.ack_enabled { self.bbr.can_send() } else { true }
+        if self.ack_enabled { self.cc.can_send() } else { true }
     }
 
     /// Update the largest acknowledged PN (called when processing our sent ACKs).
@@ -632,7 +639,7 @@ impl ConnectionState {
     pub fn process_ack(&self, ack: &AckFrame, now_ns: u64) {
         self.update_largest_acked(ack.largest_acked);
         if self.ack_enabled {
-            self.bbr.on_ack(&self.sent, ack, now_ns);
+            self.cc.on_ack(&self.sent_ring, ack, now_ns);
         }
     }
 

@@ -69,12 +69,33 @@ pub async fn run_fast_forwarding_loop_parallel(
                         let mut gso_pos = 0usize;
                         let mut gso_segment_size = 0usize;
                         let mut gso_count = 0usize;
+                        let mut sent_ack_only = false;
+
+                        // When CC-blocked, send ACK unconditionally to maintain
+                        // feedback loop. Without this, both sides double-gate on
+                        // needs_ack() thresholds, making ACK feedback too slow to
+                        // ever drain inflight.
+                        if !conn_tx.can_send() {
+                            let ack_ranges = conn_tx.generate_ack_ranges();
+                            if !ack_ranges.is_empty() {
+                                if let Ok(result) = conn_tx.encrypt_datagram(
+                                    &[],
+                                    Some(&ack_ranges),
+                                    &mut encrypt_buf,
+                                ) {
+                                    let _ = udp_tx
+                                        .send_to(&encrypt_buf[..result.len], remote_addr)
+                                        .await;
+                                    sent_ack_only = true;
+                                }
+                            }
+                        }
 
                         loop {
                             if gso_count >= max_segs {
                                 break; // GSO segment limit
                             }
-                            // CC check: stop sending if congestion window is full.
+                            // CC check: stop sending data if congestion window is full.
                             if !conn_tx.can_send() {
                                 break;
                             }
@@ -163,11 +184,42 @@ pub async fn run_fast_forwarding_loop_parallel(
                                     }
                                 }
                             }
+                        } else if !sent_ack_only {
+                            // CC blocked all data and no ACK-only was sent. Sleep
+                            // briefly to let the QUIC→TUN task process incoming ACKs
+                            // that will open the congestion window. Without this,
+                            // readable() returns immediately (edge-triggered, no data
+                            // consumed) creating a hot spin loop that starves the RX task.
+                            debug!(
+                                inflight = conn_tx.cc.inflight(),
+                                cwnd = conn_tx.cc.cwnd(),
+                                "CC blocked, waiting for ACKs"
+                            );
+                            tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                     }
 
                     #[cfg(not(target_os = "linux"))]
                     {
+                        let mut sent_anything = false;
+
+                        // When CC-blocked, send ACK unconditionally.
+                        if !conn_tx.can_send() {
+                            let ack_ranges = conn_tx.generate_ack_ranges();
+                            if !ack_ranges.is_empty() {
+                                if let Ok(result) = conn_tx.encrypt_datagram(
+                                    &[],
+                                    Some(&ack_ranges),
+                                    &mut encrypt_buf,
+                                ) {
+                                    let _ = udp_tx
+                                        .send_to(&encrypt_buf[..result.len], remote_addr)
+                                        .await;
+                                    sent_anything = true;
+                                }
+                            }
+                        }
+
                         loop {
                             if !conn_tx.can_send() {
                                 break;
@@ -197,6 +249,7 @@ pub async fn run_fast_forwarding_loop_parallel(
                                                 return TunnelResult::Fatal(e.into());
                                             }
                                             last_tx = Instant::now();
+                                            sent_anything = true;
                                             debug!(size = n, pn = result.pn, "TUN -> QUIC (fast)");
                                         }
                                         Err(e) => {
@@ -210,6 +263,9 @@ pub async fn run_fast_forwarding_loop_parallel(
                                     return TunnelResult::Fatal(e.into());
                                 }
                             }
+                        }
+                        if !sent_anything {
+                            tokio::task::yield_now().await;
                         }
                     }
                 }
@@ -244,6 +300,7 @@ pub async fn run_fast_forwarding_loop_parallel(
     let conn_rx = conn_state.clone();
     let udp_rx = udp.clone();
     let tun_tx = tun.clone();
+    let rx_remote_addr = remote_addr;
 
     // QUIC -> TUN task: receive UDP, decrypt with quictun-quic, write to TUN.
     let quic_to_tun = tokio::spawn(async move {
@@ -257,6 +314,7 @@ pub async fn run_fast_forwarding_loop_parallel(
         #[cfg(not(target_os = "linux"))]
         let mut recv_buf = vec![0u8; MAX_PACKET];
         let mut scratch = BytesMut::with_capacity(MAX_PACKET);
+        let mut ack_buf = vec![0u8; MAX_PACKET];
         let mut last_rx = Instant::now();
 
         loop {
@@ -309,7 +367,7 @@ pub async fn run_fast_forwarding_loop_parallel(
                         Ok(decrypted) => {
                             got_data = true;
                             if let Some(ref ack) = decrypted.ack {
-                                conn_rx.process_ack(ack, quictun_quic::bbr::coarse_now_ns());
+                                conn_rx.process_ack(ack, quictun_quic::cc::coarse_now_ns());
                             }
                             for datagram in &decrypted.datagrams {
                                 if datagram.is_empty() {
@@ -329,6 +387,24 @@ pub async fn run_fast_forwarding_loop_parallel(
                 }
                 if got_data {
                     last_rx = Instant::now();
+                    // Send ACK-only packet back to peer if enough packets received.
+                    // Critical for unidirectional flows: the TX task only piggybacks
+                    // ACKs on TUN data, but if the peer is CC-blocked and we're the
+                    // receiver, there may be no reverse TUN data to carry ACKs.
+                    if conn_rx.needs_ack() {
+                        let ack_ranges = conn_rx.generate_ack_ranges();
+                        if !ack_ranges.is_empty() {
+                            if let Ok(result) = conn_rx.encrypt_datagram(
+                                &[],
+                                Some(&ack_ranges),
+                                &mut ack_buf,
+                            ) {
+                                let _ = udp_rx
+                                    .send_to(&ack_buf[..result.len], rx_remote_addr)
+                                    .await;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -344,7 +420,7 @@ pub async fn run_fast_forwarding_loop_parallel(
                             Ok(decrypted) => {
                                 last_rx = Instant::now();
                                 if let Some(ref ack) = decrypted.ack {
-                                    conn_rx.process_ack(ack, quictun_quic::bbr::coarse_now_ns());
+                                    conn_rx.process_ack(ack, quictun_quic::cc::coarse_now_ns());
                                 }
                                 for datagram in &decrypted.datagrams {
                                     if datagram.is_empty() {
@@ -354,6 +430,21 @@ pub async fn run_fast_forwarding_loop_parallel(
                                     if let Err(e) = tun_tx.send(datagram).await {
                                         tracing::error!(error = %e, "TUN send failed");
                                         return TunnelResult::Fatal(e.into());
+                                    }
+                                }
+                                // Send ACK-only packet back to peer if needed.
+                                if conn_rx.needs_ack() {
+                                    let ack_ranges = conn_rx.generate_ack_ranges();
+                                    if !ack_ranges.is_empty() {
+                                        if let Ok(result) = conn_rx.encrypt_datagram(
+                                            &[],
+                                            Some(&ack_ranges),
+                                            &mut ack_buf,
+                                        ) {
+                                            let _ = udp_rx
+                                                .send_to(&ack_buf[..result.len], rx_remote_addr)
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -452,6 +543,22 @@ pub async fn run_fast_forwarding_loop_offload(
             .await
             {
                 Ok(Ok(n_pkts)) => {
+                    // When CC-blocked, send ACK unconditionally.
+                    if !conn_tx.can_send() {
+                        let ack_ranges = conn_tx.generate_ack_ranges();
+                        if !ack_ranges.is_empty() {
+                            if let Ok(result) = conn_tx.encrypt_datagram(
+                                &[],
+                                Some(&ack_ranges),
+                                &mut keepalive_buf,
+                            ) {
+                                let _ = udp_tx
+                                    .send_to(&keepalive_buf[..result.len], remote_addr)
+                                    .await;
+                            }
+                        }
+                    }
+
                     // Encrypt all packets into batch buffers.
                     let mut batch_count = 0;
                     for i in 0..n_pkts {
@@ -551,6 +658,7 @@ pub async fn run_fast_forwarding_loop_offload(
     let conn_rx = conn_state.clone();
     let udp_rx = udp.clone();
     let tun_tx = tun.clone();
+    let rx_remote_addr = remote_addr;
 
     // QUIC → TUN task: recvmmsg batch recv → decrypt → send_multiple GRO.
     let quic_to_tun = tokio::spawn(async move {
@@ -558,6 +666,7 @@ pub async fn run_fast_forwarding_loop_offload(
             (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET]).collect();
         let mut recv_lens = vec![0usize; BATCH_SIZE];
         let mut scratch = BytesMut::with_capacity(MAX_PACKET);
+        let mut ack_buf = vec![0u8; MAX_PACKET];
         let mut last_rx = Instant::now();
         let mut gro_table = GROTable::new();
 
@@ -616,7 +725,7 @@ pub async fn run_fast_forwarding_loop_offload(
                     Ok(decrypted) => {
                         got_data = true;
                         if let Some(ref ack) = decrypted.ack {
-                            conn_rx.process_ack(ack, quictun_quic::bbr::coarse_now_ns());
+                            conn_rx.process_ack(ack, quictun_quic::cc::coarse_now_ns());
                         }
                         for datagram in &decrypted.datagrams {
                             if datagram.is_empty() {
@@ -636,6 +745,21 @@ pub async fn run_fast_forwarding_loop_offload(
 
             if got_data {
                 last_rx = Instant::now();
+                // Send ACK-only packet back to peer if enough packets received.
+                if conn_rx.needs_ack() {
+                    let ack_ranges = conn_rx.generate_ack_ranges();
+                    if !ack_ranges.is_empty() {
+                        if let Ok(result) = conn_rx.encrypt_datagram(
+                            &[],
+                            Some(&ack_ranges),
+                            &mut ack_buf,
+                        ) {
+                            let _ = udp_rx
+                                .send_to(&ack_buf[..result.len], rx_remote_addr)
+                                .await;
+                        }
+                    }
+                }
             }
 
             if !tun_batch.is_empty() {
@@ -740,6 +864,14 @@ pub async fn run_fast_forwarding_loop(
                             warn!(error = %e, "encrypt failed, dropping packet");
                         }
                     }
+                } else {
+                    // CC-blocked: send ACK unconditionally.
+                    let ack_ranges = conn_state.generate_ack_ranges();
+                    if !ack_ranges.is_empty() {
+                        if let Ok(result) = conn_state.encrypt_datagram(&[], Some(&ack_ranges), &mut encrypt_buf) {
+                            let _ = udp.send_to(&encrypt_buf[..result.len], remote_addr).await;
+                        }
+                    }
                 }
             }
             result = udp.recv_from(&mut recv_buf) => {
@@ -755,7 +887,7 @@ pub async fn run_fast_forwarding_loop(
                     Ok(decrypted) => {
                         last_rx = Instant::now();
                         if let Some(ref ack) = decrypted.ack {
-                            conn_state.process_ack(ack, quictun_quic::bbr::coarse_now_ns());
+                            conn_state.process_ack(ack, quictun_quic::cc::coarse_now_ns());
                         }
                         for datagram in &decrypted.datagrams {
                             if datagram.is_empty() {
