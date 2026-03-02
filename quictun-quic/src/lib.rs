@@ -639,7 +639,8 @@ impl ConnectionState {
     pub fn process_ack(&self, ack: &AckFrame, now_ns: u64) {
         self.update_largest_acked(ack.largest_acked);
         if self.ack_enabled {
-            self.cc.on_ack(&self.sent_ring, ack, now_ns);
+            let largest_sent = self.pn_counter.load(Ordering::Relaxed);
+            self.cc.on_ack(&self.sent_ring, ack, now_ns, largest_sent);
         }
     }
 

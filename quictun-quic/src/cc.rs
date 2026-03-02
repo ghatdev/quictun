@@ -12,7 +12,21 @@ use std::sync::atomic::{AtomicU64, AtomicU16, Ordering};
 use crate::frame::AckFrame;
 
 /// Reorder threshold for loss detection (RFC 9002 §6.1.1).
-const REORDER_THRESHOLD: u64 = 3;
+///
+/// Standard QUIC uses 3, but quictun has concurrent TX/RX tasks sharing a PN
+/// counter. GSO batches (44 pkts) + interleaved ACK-only PNs from the RX task
+/// create large apparent PN gaps. 128 tolerates 2-3 full GSO batches of
+/// reordering without false loss detection.
+const REORDER_THRESHOLD: u64 = 128;
+
+/// Time-based loss threshold multiplier (RFC 9002 §6.1.2).
+/// Packets sent more than 9/8 * max(srtt, latest_rtt) ago are eligible for
+/// loss detection. This prevents false loss from reordered ACKs.
+const TIME_THRESHOLD_NUM: u64 = 9;
+const TIME_THRESHOLD_DEN: u64 = 8;
+
+/// Minimum time threshold (1 ms in nanoseconds) per RFC 9002 kGranularity.
+const MIN_TIME_THRESHOLD_NS: u64 = 1_000_000;
 
 /// Size of the sent-packet tracking ring (must be power of 2).
 const RING_SIZE: usize = 65536;
@@ -84,7 +98,10 @@ impl CongestionControl {
     }
 
     /// Process an ACK frame: consume acked packets, update RTT, detect losses, grow cwnd.
-    pub fn on_ack(&self, ring: &SentPacketRing, ack: &AckFrame, now_ns: u64) {
+    ///
+    /// `largest_sent_pn` is the highest PN allocated by pn_counter at call time.
+    /// Used by detect_loss to set recovery_pn correctly (RFC 9002 §7.3.2).
+    pub fn on_ack(&self, ring: &SentPacketRing, ack: &AckFrame, now_ns: u64, largest_sent_pn: u64) {
         let mut newly_acked_bytes: u64 = 0;
         let mut min_rtt_sample: u64 = u64::MAX;
         let mut acked_count: u64 = 0;
@@ -131,7 +148,7 @@ impl CongestionControl {
         }
 
         // Loss detection (RFC 9002 §6.1). Returns true if cwnd was reduced.
-        let cwnd_reduced = self.detect_loss(ring, ack.largest_acked);
+        let cwnd_reduced = self.detect_loss(ring, ack.largest_acked, now_ns, largest_sent_pn);
 
         // Grow cwnd if we acked new data and loss didn't just reduce cwnd.
         // During recovery (largest_acked <= recovery_pn), skip growth to let
@@ -146,11 +163,13 @@ impl CongestionControl {
 
     /// Detect lost packets: scan [loss_scan_base, largest_acked - REORDER_THRESHOLD].
     ///
-    /// Any ring slot with size > 0 in this range is considered lost.
-    /// swap(0) consumes it (no double-counting).
+    /// Dual criteria (RFC 9002 §6.1): a packet is lost if it is BOTH
+    /// (1) more than REORDER_THRESHOLD PNs below largest_acked, AND
+    /// (2) sent more than 9/8 * srtt ago (time-based guard).
     ///
+    /// swap(0) consumes each lost slot (no double-counting).
     /// Returns `true` if cwnd was reduced (new loss event).
-    fn detect_loss(&self, ring: &SentPacketRing, largest_acked: u64) -> bool {
+    fn detect_loss(&self, ring: &SentPacketRing, largest_acked: u64, now_ns: u64, largest_sent_pn: u64) -> bool {
         if largest_acked < REORDER_THRESHOLD {
             return false;
         }
@@ -161,27 +180,51 @@ impl CongestionControl {
             return false;
         }
 
+        // Time-based loss threshold: 9/8 * max(srtt, MIN_TIME_THRESHOLD).
+        let srtt = self.smoothed_rtt_ns.load(Ordering::Relaxed);
+        let time_threshold = (srtt.max(MIN_TIME_THRESHOLD_NS) * TIME_THRESHOLD_NUM) / TIME_THRESHOLD_DEN;
+
         let mut total_lost_bytes: u64 = 0;
+        let mut new_scan_base = scan_base;
 
         for pn in scan_base..=loss_boundary {
             let idx = (pn as usize) & RING_MASK;
+            let sent_time = ring.sent_times[idx].load(Ordering::Relaxed);
+
+            // Time guard: only declare loss if enough time has passed.
+            // If sent_time is 0 (ACK-only or already consumed), skip.
+            if sent_time > 0 && now_ns.saturating_sub(sent_time) < time_threshold {
+                // Not enough time has passed — could be reordered, not lost.
+                // Stop advancing scan_base here; revisit on next ACK.
+                break;
+            }
+
             let size = ring.sent_sizes[idx].swap(0, Ordering::Relaxed) as u64;
             if size > 0 {
                 total_lost_bytes += size;
                 self.saturating_sub_inflight(size);
             }
+            // Also clear timestamp for consumed slots.
+            if sent_time > 0 {
+                ring.sent_times[idx].store(0, Ordering::Relaxed);
+            }
+            new_scan_base = pn + 1;
         }
 
-        // Advance scan cursor past the boundary.
-        self.loss_scan_base.store(loss_boundary + 1, Ordering::Relaxed);
+        // Advance scan cursor.
+        if new_scan_base > scan_base {
+            self.loss_scan_base.store(new_scan_base, Ordering::Relaxed);
+        }
 
         // Halve cwnd on loss (once per loss event via recovery_pn dedup).
         if total_lost_bytes > 0 {
             let recovery = self.recovery_pn.load(Ordering::Relaxed);
             if largest_acked > recovery {
-                // Enter recovery: set recovery_pn so subsequent losses in this
-                // flight don't cause additional reductions.
-                self.recovery_pn.store(largest_acked, Ordering::Relaxed);
+                // Enter recovery: set recovery_pn to highest PN sent (RFC 9002
+                // §7.3.2). Recovery lasts until packets sent AFTER this point
+                // are acknowledged, ensuring the pipe fully drains before we
+                // can detect a new loss event.
+                self.recovery_pn.store(largest_sent_pn, Ordering::Relaxed);
                 let cwnd = self.cwnd.load(Ordering::Relaxed);
                 let new_cwnd = (cwnd / 2).max(MIN_CWND);
                 self.cwnd.store(new_cwnd, Ordering::Relaxed);
@@ -343,7 +386,7 @@ mod tests {
         };
 
         let now = coarse_now_ns() + 10_000_000; // +10ms
-        cc.on_ack(&ring, &ack, now);
+        cc.on_ack(&ring, &ack, now, 1);
         assert_eq!(cc.inflight(), 0);
     }
 
@@ -361,11 +404,11 @@ mod tests {
         };
 
         let now = coarse_now_ns() + 10_000_000;
-        cc.on_ack(&ring, &ack, now);
+        cc.on_ack(&ring, &ack, now, 0);
         assert_eq!(cc.inflight(), 0);
 
         // Second ACK for same PN — swap returns 0, inflight stays 0.
-        cc.on_ack(&ring, &ack, now + 1_000_000);
+        cc.on_ack(&ring, &ack, now + 1_000_000, 0);
         assert_eq!(cc.inflight(), 0);
     }
 
@@ -385,8 +428,16 @@ mod tests {
             ack_delay: 0,
             ranges: smallvec::smallvec![0..3],
         };
-        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000);
+        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000, 2);
         assert_eq!(cc.inflight(), 0);
+    }
+
+    /// Helper: set sent_times for a PN range to simulate packets sent long ago.
+    fn make_old(ring: &SentPacketRing, pn_range: std::ops::RangeInclusive<u64>, old_time: u64) {
+        for pn in pn_range {
+            let idx = (pn as usize) & RING_MASK;
+            ring.sent_times[idx].store(old_time, Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -394,28 +445,32 @@ mod tests {
         let cc = CongestionControl::new();
         let ring = SentPacketRing::new();
 
-        // Send packets 0-10.
-        for pn in 0..=10 {
+        // Send 200 packets (PNs 0-199). REORDER_THRESHOLD=128.
+        for pn in 0..200u64 {
             cc.on_sent(&ring, pn, 1200);
         }
-        let total_inflight = 11 * 1200u64;
-        assert_eq!(cc.inflight(), total_inflight);
+        assert_eq!(cc.inflight(), 200 * 1200);
 
-        // ACK only packets 5-10 (0-4 should be detected as lost via reorder threshold).
-        // Loss boundary = 10 - 3 = 7, so PNs 0..=7 are scanned.
-        // PNs 5-7 are acked (swap returns 0 in detect_loss), PNs 0-4 are lost.
+        // Make PNs 0-70 appear old (100ms before "now") so they pass the
+        // time-based loss guard. Acked packets stay at their real sent_time.
+        let now = coarse_now_ns() + 10_000_000; // 10ms from now
+        let old_time = now.saturating_sub(100_000_000); // 100ms before now
+        make_old(&ring, 0..=70, old_time);
+
+        // ACK only PNs 150-199 (largest_acked=199).
+        // Loss boundary = 199 - 128 = 71, scan [0..71].
+        // PNs 0-70 are old enough → detected as lost (71 packets, 85200 bytes).
         let ack = AckFrame {
-            largest_acked: 10,
+            largest_acked: 199,
             ack_delay: 0,
-            ranges: smallvec::smallvec![5..11],
+            ranges: smallvec::smallvec![150..200],
         };
-        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000);
+        cc.on_ack(&ring, &ack, now, 199);
 
-        // Acked: 5,6,7,8,9,10 = 6 packets (7200 bytes)
-        // Lost: 0,1,2,3,4 = 5 packets (6000 bytes) — detected because
-        //   scan_base=0, loss_boundary=7, and PNs 5-7 were already consumed by on_ack.
-        // Remaining inflight: 0
-        assert_eq!(cc.inflight(), 0);
+        // Acked: 150-199 = 50 packets (60000 bytes)
+        // Lost: 0-70 = 71 packets (85200 bytes)
+        // Remaining: PNs 71-149 = 79 packets still in flight
+        assert_eq!(cc.inflight(), 79 * 1200);
     }
 
     #[test]
@@ -423,23 +478,27 @@ mod tests {
         let cc = CongestionControl::new();
         let ring = SentPacketRing::new();
 
-        // Artificially set cwnd high so we can observe the halving.
-        cc.cwnd.store(100_000, Ordering::Relaxed);
+        cc.cwnd.store(500_000, Ordering::Relaxed);
 
-        for pn in 0..=10 {
+        for pn in 0..200u64 {
             cc.on_sent(&ring, pn, 1200);
         }
 
-        // ACK only 5-10, causing loss of 0-4 (below boundary=7).
-        let ack = AckFrame {
-            largest_acked: 10,
-            ack_delay: 0,
-            ranges: smallvec::smallvec![5..11],
-        };
-        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000);
+        // Make early PNs old enough for time-based loss detection.
+        let now = coarse_now_ns() + 10_000_000;
+        let old_time = now.saturating_sub(100_000_000);
+        make_old(&ring, 0..=70, old_time);
 
-        // cwnd should be halved (100_000 / 2 = 50_000).
-        assert_eq!(cc.cwnd(), 50_000);
+        // ACK 150-199, loss boundary = 71, PNs 0-70 detected as lost.
+        let ack = AckFrame {
+            largest_acked: 199,
+            ack_delay: 0,
+            ranges: smallvec::smallvec![150..200],
+        };
+        cc.on_ack(&ring, &ack, now, 199);
+
+        // cwnd should be halved (500_000 / 2 = 250_000).
+        assert_eq!(cc.cwnd(), 250_000);
     }
 
     #[test]
@@ -449,35 +508,39 @@ mod tests {
         let cc = CongestionControl::new();
         let ring = SentPacketRing::new();
 
-        cc.cwnd.store(100_000, Ordering::Relaxed);
+        cc.cwnd.store(1_000_000, Ordering::Relaxed);
 
-        for pn in 0..=20 {
+        for pn in 0..400u64 {
             cc.on_sent(&ring, pn, 1200);
         }
 
-        // ACK 10-15 (largest=15): detect_loss scans [0..12].
-        // PNs 0-9 are lost (10-12 consumed by ACK ranges). cwnd halved.
+        let now = coarse_now_ns() + 10_000_000;
+        let old_time = now.saturating_sub(100_000_000);
+        make_old(&ring, 0..=70, old_time);
+
+        // First ACK: ack PNs 71-299 (everything except old 0-70).
+        // Loss boundary = 299-128 = 171, scan [0..171].
+        // PNs 0-70 are old → lost. PNs 71-171 consumed by ACK → no loss.
         let ack1 = AckFrame {
-            largest_acked: 15,
+            largest_acked: 299,
             ack_delay: 0,
-            ranges: smallvec::smallvec![10..16],
+            ranges: smallvec::smallvec![71..300],
         };
-        cc.on_ack(&ring, &ack1, coarse_now_ns() + 10_000_000);
-        assert_eq!(cc.cwnd(), 50_000); // halved once
+        cc.on_ack(&ring, &ack1, now, 399);
+        assert_eq!(cc.cwnd(), 500_000); // halved once
 
-        // ACK 16-20 (largest=20): detect_loss scans [13..17].
-        // PNs 13-15 were consumed by first ACK (ranges [10..16]).
-        // PNs 16-17 consumed by this ACK. No lost bytes found → no second halving.
+        // Second ACK: ack 300-399 (largest=399). Loss boundary = 399-128 = 271.
+        // scan [172..271]: all consumed by first ACK → no lost packets.
+        // Recovery_pn was set to 399 (largest_sent), so largest_acked=399 is NOT > 399.
         let ack2 = AckFrame {
-            largest_acked: 20,
+            largest_acked: 399,
             ack_delay: 0,
-            ranges: smallvec::smallvec![16..21],
+            ranges: smallvec::smallvec![300..400],
         };
-        cc.on_ack(&ring, &ack2, coarse_now_ns() + 20_000_000);
+        cc.on_ack(&ring, &ack2, now + 10_000_000, 399);
 
-        // cwnd should NOT be halved again (no lost packets found).
-        // It grows slightly from congestion avoidance.
-        assert!(cc.cwnd() >= 50_000, "cwnd should not decrease: {}", cc.cwnd());
+        // cwnd should NOT be halved again.
+        assert!(cc.cwnd() >= 500_000, "cwnd should not decrease: {}", cc.cwnd());
     }
 
     #[test]
@@ -494,7 +557,7 @@ mod tests {
             ack_delay: 0,
             ranges: smallvec::smallvec![0..1],
         };
-        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000);
+        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000, 0);
 
         // cwnd should grow by the full packet size in slow start.
         assert!(cc.cwnd() > initial_cwnd);
@@ -516,7 +579,7 @@ mod tests {
             ack_delay: 0,
             ranges: smallvec::smallvec![0..1],
         };
-        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000);
+        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000, 0);
 
         // Congestion avoidance: increment = MSS * acked / cwnd ≈ 1200*1200/14720 ≈ 97.
         // Much less than slow start's 1200.
@@ -536,7 +599,7 @@ mod tests {
             ack_delay: 0,
             ranges: smallvec::smallvec![0..1],
         };
-        cc.on_ack(&ring, &ack, now);
+        cc.on_ack(&ring, &ack, now, 0);
 
         // First sample: srtt = rtt.
         let srtt = cc.srtt_ns();
@@ -571,16 +634,20 @@ mod tests {
         // Set cwnd to minimum, then trigger loss.
         cc.cwnd.store(MIN_CWND, Ordering::Relaxed);
 
-        for pn in 0..=10 {
+        for pn in 0..200u64 {
             cc.on_sent(&ring, pn, 1200);
         }
 
+        let now = coarse_now_ns() + 10_000_000;
+        let old_time = now.saturating_sub(100_000_000);
+        make_old(&ring, 0..=70, old_time);
+
         let ack = AckFrame {
-            largest_acked: 10,
+            largest_acked: 199,
             ack_delay: 0,
-            ranges: smallvec::smallvec![5..11],
+            ranges: smallvec::smallvec![150..200],
         };
-        cc.on_ack(&ring, &ack, coarse_now_ns() + 10_000_000);
+        cc.on_ack(&ring, &ack, now, 199);
 
         // cwnd should not go below MIN_CWND.
         assert!(cc.cwnd() >= MIN_CWND);
