@@ -554,7 +554,20 @@ impl ConnectionState {
             frame_pos += 1;
         }
 
-        // Total plaintext = header + frames
+        // Ensure minimum packet size for header protection sample.
+        // Header protection needs sample_size() bytes starting at pn_offset + 4.
+        // After AEAD, total = frame_pos + tag_len. Must be >= pn_offset + 4 + sample_size.
+        let pn_offset = 1 + self.remote_cid.len();
+        let min_total = pn_offset + 4 + self.tx_header_key.sample_size();
+        let total_with_tag = frame_pos + self.tag_len;
+        if total_with_tag < min_total {
+            let pad_needed = min_total - total_with_tag;
+            // PADDING frames are 0x00 bytes (RFC 9000 §19.1).
+            buf[frame_pos..frame_pos + pad_needed].fill(0x00);
+            frame_pos += pad_needed;
+        }
+
+        // Total plaintext = header + frames (+ padding)
         // AEAD encrypt in-place: encrypts buf[header_len..frame_pos] and appends tag
         let total_with_tag = frame_pos + self.tag_len;
         // Ensure buf is large enough
@@ -568,7 +581,6 @@ impl ConnectionState {
         }
 
         // Apply header protection (must be done AFTER AEAD encryption)
-        let pn_offset = 1 + self.remote_cid.len();
         self.tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
 
         Ok(EncryptResult {
