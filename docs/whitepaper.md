@@ -182,7 +182,9 @@ The following are explicitly out of scope for the tunnel primitive:
 
 ### 4.1 System Architecture
 
-QuicTun is a point-to-point tunnel primitive with a split-plane architecture: a **control plane** using QUIC streams for reliable, ordered signaling, and a **data plane** using QUIC DATAGRAM frames for unreliable, low-overhead IP packet transport.
+QuicTun is a point-to-point tunnel primitive with a **data-plane-only** architecture: all tunnel traffic uses QUIC DATAGRAM frames (RFC 9221) for unreliable, low-overhead IP packet transport. Management and configuration are handled out-of-band (static configuration, local CLI/API), following WireGuard's proven model of zero in-band control plane.
+
+This separation provides security benefits: the data path only parses DATAGRAM, ACK, and PING frames — no stream state machine, no flow control complexity, no stream-related attack surface. Configuration changes require local OS-level access (CLI or Unix socket), never over the wire.
 
 **Figure 1: System Architecture**
 
@@ -193,11 +195,10 @@ graph TB
         TUN["TUN Interface"]
 
         subgraph "QuicTun Process"
-            CP["Control Plane<br/>(QUIC Streams)"]
             DP["Data Plane<br/>(QUIC Datagrams)"]
-            CC["Congestion Control<br/>(BBR/CUBIC)"]
-            CM["Connection Migration<br/>Manager"]
+            CC["Congestion Control"]
             KM["Key Manager<br/>(aws-lc-rs FIPS)"]
+            MGMT["Management API<br/>(Unix Socket / CLI)"]
         end
 
         QUIC["QUIC Stack<br/>(quinn + rustls)"]
@@ -212,10 +213,8 @@ graph TB
 
     App --> TUN
     TUN --> DP
-    CP --> QUIC
     DP --> QUIC
     CC --> QUIC
-    CM --> QUIC
     KM --> QUIC
     QUIC --> UDP
     QUIC -.-> XDP
@@ -223,16 +222,17 @@ graph TB
     UDP --> NET
 ```
 
-### 4.2 Control Plane
+### 4.2 Management (Out-of-Band)
 
-The control plane uses bidirectional QUIC streams for:
+Following WireGuard's design philosophy, QuicTun has **no in-band control plane**. All management is local and out-of-band:
 
-- **Peer configuration exchange** — IP address assignment, allowed-IP ranges, MTU negotiation
-- **Keepalive signaling** — Application-level keepalives supplementing QUIC's built-in idle timeout
-- **Key rotation coordination** — Signaling for rekeying events beyond TLS 1.3's automatic key updates
-- **Graceful shutdown** — Coordinated connection teardown
+- **Peer configuration** — Static `tunnel.toml` loaded at startup (IP assignment, allowed-IPs, MTU, peers)
+- **Runtime management** — Local CLI (`quictun up/down`) and future Unix socket API for daemon mode
+- **Keepalive** — PING frames in the data path (no separate signaling)
+- **Key rotation** — Automatic via TLS 1.3 key_phase bit with pre-computed key generations; exhaustion triggers full rehandshake via quinn-proto
+- **Graceful shutdown** — CONNECTION_CLOSE frame in the data path
 
-Using QUIC streams for control messages provides automatic reliability, ordering, and flow control without implementing a separate reliable transport.
+**Security rationale:** Separating management from the data path ensures that an attacker who can influence tunnel traffic (inner IP packets) cannot reach management logic. The data path parses only DATAGRAM/ACK/PING/CONNECTION_CLOSE frames — no stream reassembly, no flow control state, minimal attack surface.
 
 ### 4.3 Data Plane
 
@@ -249,12 +249,10 @@ Key properties of DATAGRAM frames for VPN use:
 ```
 1. Client sends QUIC Initial (ClientHello with RPK)
 2. Server responds with Handshake (ServerHello with RPK)
-3. TLS 1.3 handshake completes (1-RTT)
-4. Client opens control stream, sends configuration
-5. Server responds with IP assignment and parameters
-6. Data plane begins: IP packets sent as DATAGRAM frames
-7. Connection migration handled transparently by QUIC
-8. Graceful shutdown via control stream + CONNECTION_CLOSE
+3. TLS 1.3 handshake completes (1-RTT), 1-RTT keys extracted
+4. Data plane begins: IP packets sent as DATAGRAM frames
+5. Connection migration handled transparently via QUIC CIDs
+6. Shutdown via CONNECTION_CLOSE or idle timeout
 ```
 
 ---
@@ -284,11 +282,7 @@ sequenceDiagram
 
     Note over C,S: 1-RTT Handshake Complete
 
-    C->>S: Control Stream: PeerConfig{<br/>  requested_ip: 10.0.0.2/24,<br/>  allowed_ips: [0.0.0.0/0],<br/>  mtu: 1400<br/>}
-
-    S->>C: Control Stream: PeerConfig{<br/>  assigned_ip: 10.0.0.2/24,<br/>  server_ip: 10.0.0.1/24,<br/>  dns: [10.0.0.1],<br/>  mtu: 1380<br/>}
-
-    Note over C,S: Data Plane Active
+    Note over C,S: 1-RTT Keys Extracted, Data Plane Active
 
     C->>S: DATAGRAM[IP Packet]
     S->>C: DATAGRAM[IP Packet]
@@ -710,10 +704,9 @@ Rust was chosen for:
 ```
 quictun/
 ├── quictun-core/          # Protocol logic, packet handling
-│   ├── control.rs         # Control plane (QUIC streams)
 │   ├── data.rs            # Data plane (QUIC datagrams)
 │   ├── config.rs          # Configuration model
-│   └── migration.rs       # Connection migration manager
+│   └── cc.rs              # Congestion control
 ├── quictun-crypto/        # FIPS crypto abstraction
 │   ├── fips.rs            # aws-lc-rs FIPS module wrapper
 │   └── rpk.rs             # Raw Public Key handling
