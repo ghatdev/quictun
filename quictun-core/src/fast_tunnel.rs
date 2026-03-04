@@ -27,6 +27,22 @@ const MAX_PACKET: usize = 2048;
 /// Buffer size for quinn-proto handshake response.
 const HANDSHAKE_BUF_SIZE: usize = 2048;
 
+/// Write a packet to TUN without async overhead.
+///
+/// Uses non-blocking `try_send` first. Only falls back to async `writable().await`
+/// when the TUN fd would block, avoiding tokio readiness polling on every write.
+async fn tun_try_send(tun: &TunDevice, buf: &[u8]) -> std::io::Result<()> {
+    match tun.try_send(buf) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            tun.writable().await?;
+            tun.try_send(buf)?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ── Per-connection entry in the connection table ─────────────────────
 
 /// Per-connection state for the unified multi-connection loop.
@@ -491,7 +507,7 @@ async fn handle_udp_readable_linux(
                     }
                     for datagram in &decrypted.datagrams {
                         if datagram.is_empty() { continue; }
-                        if let Err(e) = tun.send(datagram).await {
+                        if let Err(e) = tun_try_send(tun, datagram).await {
                             return Some(TunnelResult::Fatal(e.into()));
                         }
                     }
@@ -552,7 +568,7 @@ async fn handle_udp_readable_nonlinux(
                                     }
                                     for datagram in &decrypted.datagrams {
                                         if datagram.is_empty() { continue; }
-                                        if let Err(e) = tun.send(datagram).await {
+                                        if let Err(e) = tun_try_send(tun, datagram).await {
                                             return Some(TunnelResult::Fatal(e.into()));
                                         }
                                     }
@@ -1052,7 +1068,7 @@ pub async fn run_fast_loop(
                                 }
                                 for datagram in &decrypted.datagrams {
                                     if datagram.is_empty() { continue; }
-                                    if let Err(e) = tun.send(datagram).await {
+                                    if let Err(e) = tun_try_send(tun, datagram).await {
                                         return TunnelResult::Fatal(e.into());
                                     }
                                 }
@@ -1080,7 +1096,7 @@ pub async fn run_fast_loop(
                                     }
                                     for datagram in &decrypted.datagrams {
                                         if datagram.is_empty() { continue; }
-                                        if let Err(e) = tun.send(datagram).await {
+                                        if let Err(e) = tun_try_send(tun, datagram).await {
                                             return TunnelResult::Fatal(e.into());
                                         }
                                     }
