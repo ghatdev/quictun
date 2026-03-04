@@ -111,8 +111,8 @@ pub fn run(
 fn run_net(
     config_path: &str,
     cc: CongestionControl,
-    _recv_buf: usize,
-    _send_buf: usize,
+    recv_buf: usize,
+    send_buf: usize,
     _send_window: u64,
     _initial_rtt: u64,
     _pin_mtu: bool,
@@ -143,8 +143,8 @@ fn run_net(
         .collect::<Result<_>>()?;
 
     let tuning = TransportTuning {
-        datagram_recv_buffer: _recv_buf,
-        datagram_send_buffer: _send_buf,
+        datagram_recv_buffer: recv_buf,
+        datagram_send_buffer: send_buf,
         send_window: _send_window,
         cc,
         max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
@@ -217,6 +217,8 @@ fn run_net(
         cid_len,
         peers: resolved_peers,
         reconnect,
+        recv_buf,
+        send_buf,
     };
 
     // Backoff state for reconnection.

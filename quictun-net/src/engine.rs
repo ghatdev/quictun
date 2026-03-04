@@ -55,6 +55,8 @@ pub struct NetConfig {
     pub cid_len: usize,
     pub peers: Vec<PeerConfig>,
     pub reconnect: bool,
+    pub recv_buf: usize,
+    pub send_buf: usize,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -84,8 +86,12 @@ pub fn run(
     config: NetConfig,
 ) -> Result<RunResult> {
     // 1. Create UDP socket (non-blocking).
-    let udp_socket = create_udp_socket(local_addr)?;
+    let udp_socket = create_udp_socket(local_addr, config.recv_buf, config.send_buf)?;
     info!(local_addr = %udp_socket.local_addr()?, "UDP socket bound");
+
+    // NOTE: UDP GRO is NOT enabled because recvmmsg uses fixed 2048-byte buffers.
+    // GRO would coalesce packets into buffers larger than 2048, causing truncation.
+    // recvmmsg already provides batching (up to 64 packets per syscall).
 
     // 2. Create sync TUN device.
     let mut tun_opts = TunOptions::new(config.tunnel_ip, config.tunnel_prefix, config.tunnel_mtu);
@@ -256,7 +262,7 @@ pub fn run(
 
 // ── UDP socket creation ──────────────────────────────────────────────────
 
-fn create_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+fn create_udp_socket(addr: SocketAddr, recv_buf: usize, send_buf: usize) -> Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -267,8 +273,8 @@ fn create_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
 
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
-    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
-    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(send_buf);
+    let _ = sock.set_recv_buffer_size(recv_buf);
 
     sock.bind(&addr.into())
         .with_context(|| format!("failed to bind UDP to {addr}"))?;
@@ -401,54 +407,61 @@ fn handle_udp_rx_linux(
     scratch: &mut BytesMut,
     response_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
-        udp, recv_bufs, recv_lens, recv_addrs, quictun_core::batch_io::BATCH_SIZE,
-    ) {
-        Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-        Err(e) => return Err(e).context("recvmmsg failed"),
-    };
+    // Loop recvmmsg until WouldBlock — required for edge-triggered epoll (mio).
+    loop {
+        let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
+            udp, recv_bufs, recv_lens, recv_addrs, quictun_core::batch_io::BATCH_SIZE,
+        ) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e).context("recvmmsg failed"),
+        };
 
-    for i in 0..n_msgs {
-        let n = recv_lens[i];
-        if n == 0 { continue; }
-        let first_byte = recv_bufs[i][0];
+        for i in 0..n_msgs {
+            let n = recv_lens[i];
+            if n == 0 { continue; }
+            let first_byte = recv_bufs[i][0];
 
-        if first_byte & 0x80 != 0 {
-            // Long header → handshake.
-            let from = recv_addrs[i];
-            let mut data = BytesMut::with_capacity(n);
-            data.extend_from_slice(&recv_bufs[i][..n]);
-            let now = Instant::now();
-            let responses = multi_state.handle_incoming(now, from, None, data, response_buf);
-            send_responses(udp, &responses, from)?;
-            continue;
-        }
+            if first_byte & 0x80 != 0 {
+                // Long header → handshake.
+                let from = recv_addrs[i];
+                let mut data = BytesMut::with_capacity(n);
+                data.extend_from_slice(&recv_bufs[i][..n]);
+                let now = Instant::now();
+                let responses = multi_state.handle_incoming(now, from, None, data, response_buf);
+                send_responses(udp, &responses, from)?;
+                continue;
+            }
 
-        // Short header → CID routing.
-        if cid_len == 0 || n < 1 + cid_len { continue; }
-        let cid_bytes = &recv_bufs[i][1..1 + cid_len];
+            // Short header → CID routing.
+            if cid_len == 0 || n < 1 + cid_len { continue; }
+            let cid_bytes = &recv_bufs[i][1..1 + cid_len];
 
-        if let Some(entry) = connections.get_mut(cid_bytes) {
-            match entry.conn.decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch) {
-                Ok(decrypted) => {
-                    entry.last_rx = Instant::now();
-                    if let Some(ref ack) = decrypted.ack {
-                        entry.conn.process_ack(ack);
+            if let Some(entry) = connections.get_mut(cid_bytes) {
+                match entry.conn.decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch) {
+                    Ok(decrypted) => {
+                        entry.last_rx = Instant::now();
+                        if let Some(ref ack) = decrypted.ack {
+                            entry.conn.process_ack(ack);
+                        }
+                        for datagram in &decrypted.datagrams {
+                            if datagram.is_empty() { continue; }
+                            tun_write_sync(tun, datagram);
+                        }
                     }
-                    for datagram in &decrypted.datagrams {
-                        if datagram.is_empty() { continue; }
-                        tun_write_sync(tun, datagram);
+                    Err(e) => {
+                        debug!(error = %e, "decrypt failed, dropping");
                     }
-                }
-                Err(e) => {
-                    debug!(error = %e, "decrypt failed, dropping");
                 }
             }
         }
-    }
 
-    Ok(())
+        // If we got fewer than BATCH_SIZE, the socket is drained.
+        if n_msgs < quictun_core::batch_io::BATCH_SIZE {
+            return Ok(());
+        }
+    }
 }
 
 // ── UDP RX (non-Linux — per-packet recv_from) ────────────────────────────
@@ -622,13 +635,32 @@ fn flush_gso_sync(
     gso_segment_size: usize,
     remote_addr: SocketAddr,
 ) -> Result<()> {
-    quictun_core::batch_io::send_gso(
-        udp,
-        &gso_buf[..gso_pos],
-        gso_segment_size as u16,
-        remote_addr,
-    ).context("send_gso failed")?;
-    Ok(())
+    loop {
+        match quictun_core::batch_io::send_gso(
+            udp,
+            &gso_buf[..gso_pos],
+            gso_segment_size as u16,
+            remote_addr,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Wait for socket to become writable via poll(2).
+                wait_writable(udp.as_raw_fd());
+            }
+            Err(e) => return Err(e).context("send_gso failed"),
+        }
+    }
+}
+
+/// Block until fd is writable using poll(2). Short timeout to avoid stalling.
+#[cfg(target_os = "linux")]
+fn wait_writable(fd: i32) {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut pfd, 1, 5) }; // 5ms max
 }
 
 // ── TUN RX (non-Linux — per-packet send) ─────────────────────────────────
