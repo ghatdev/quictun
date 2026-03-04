@@ -112,12 +112,18 @@ impl AtomicBitmap {
     pub fn base(&self) -> u64 {
         self.base_pn.load(Ordering::Relaxed)
     }
+
+    /// Load a word by offset-based index (for word-level scanning).
+    #[inline]
+    pub fn word_at(&self, word_idx: usize) -> u64 {
+        self.words[word_idx & (BITMAP_WORDS - 1)].load(Ordering::Relaxed)
+    }
 }
 
-/// Generate ACK ranges from a received bitmap.
+/// Generate ACK ranges from a received bitmap using word-level scanning.
 ///
-/// Scans from `largest_pn` downward, emitting contiguous ranges.
-/// Returns ranges sorted descending (largest first), each as `start..end` (exclusive end).
+/// Scans 64 bits at a time instead of bit-by-bit. For nearly-contiguous bitmaps
+/// (common in VPN tunnels), most words are all-ones and are skipped in one comparison.
 pub fn generate_ack_ranges(
     bitmap: &AtomicBitmap,
     largest_pn: u64,
@@ -129,31 +135,73 @@ pub fn generate_ack_ranges(
         return ranges;
     }
 
-    let mut pn = largest_pn;
+    let largest_offset = largest_pn - base;
+    let mut word_idx = (largest_offset >> 6) as usize;
+    let top_bit = (largest_offset & 63) as u32;
+    let top_mask = if top_bit == 63 { u64::MAX } else { (1u64 << (top_bit + 1)) - 1 };
+
     let mut in_range = false;
     let mut range_end = 0u64;
+    let mut first_word = true;
+    let total_words = word_idx + 1;
 
-    loop {
-        if bitmap.test(pn) {
+    for _i in 0..total_words {
+        let mut word = bitmap.word_at(word_idx);
+
+        if first_word {
+            word &= top_mask;
+            first_word = false;
+        }
+
+        let word_base_pn = base + (word_idx as u64) * 64;
+
+        if word == u64::MAX {
+            let block_end = word_base_pn + 64;
             if !in_range {
-                range_end = pn + 1;
+                range_end = block_end.min(largest_pn + 1);
                 in_range = true;
             }
-        } else if in_range {
-            ranges.push(pn + 1..range_end);
-            in_range = false;
+        } else if word == 0 {
+            if in_range {
+                let block_end = word_base_pn + 64;
+                ranges.push(block_end..range_end);
+                in_range = false;
+                if ranges.len() >= max_ranges {
+                    break;
+                }
+            }
+        } else {
+            for bit in (0..64).rev() {
+                let pn = word_base_pn + bit;
+                if pn > largest_pn || pn < base {
+                    continue;
+                }
+                if (word >> bit) & 1 == 1 {
+                    if !in_range {
+                        range_end = pn + 1;
+                        in_range = true;
+                    }
+                } else if in_range {
+                    ranges.push(pn + 1..range_end);
+                    in_range = false;
+                    if ranges.len() >= max_ranges {
+                        break;
+                    }
+                }
+            }
             if ranges.len() >= max_ranges {
                 break;
             }
         }
 
-        if pn == base {
-            if in_range {
-                ranges.push(pn..range_end);
-            }
+        if word_idx == 0 {
             break;
         }
-        pn -= 1;
+        word_idx -= 1;
+    }
+
+    if in_range && ranges.len() < max_ranges {
+        ranges.push(base..range_end);
     }
 
     ranges

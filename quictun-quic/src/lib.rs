@@ -594,9 +594,11 @@ impl ConnectionState {
         let largest = self.largest_rx_pn.load(Ordering::Relaxed);
         let ranges = generate_ack_ranges(&self.received, largest, MAX_ACK_RANGES);
         self.rx_since_last_ack.store(0, Ordering::Relaxed);
-        if let Some(last_range) = ranges.last() {
-            if last_range.start > 0 {
-                self.received.advance_base(last_range.start);
+        // Advance base past fully-ACKed regions to keep the scan window small.
+        if let Some(first_range) = ranges.first() {
+            let new_base = first_range.start.saturating_sub(256);
+            if new_base > self.received.base() {
+                self.received.advance_base(new_base);
             }
         }
         ranges

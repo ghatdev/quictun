@@ -163,9 +163,14 @@ impl LocalConnectionState {
     pub fn generate_ack_ranges(&mut self) -> SmallVec<[Range<u64>; 8]> {
         let ranges = generate_ack_ranges_from_bitmap(&self.received, self.largest_rx_pn);
         self.rx_since_last_ack = 0;
-        if let Some(last_range) = ranges.last() {
-            if last_range.start > 0 {
-                self.received.advance_base(last_range.start);
+        // Advance base past fully-ACKed regions to keep the scan window small.
+        // With contiguous delivery (common in VPN), a single range [base..largest+1]
+        // means base never advances. Use the first (largest) range's start instead,
+        // keeping a margin of 256 PNs for late reorderings.
+        if let Some(first_range) = ranges.first() {
+            let new_base = first_range.start.saturating_sub(256);
+            if new_base > self.received.base() {
+                self.received.advance_base(new_base);
             }
         }
         ranges
@@ -223,7 +228,11 @@ impl LocalConnectionState {
     }
 }
 
-/// Generate ACK ranges from a non-atomic Bitmap.
+/// Generate ACK ranges from a non-atomic Bitmap using word-level scanning.
+///
+/// Scans 64 bits at a time instead of bit-by-bit. For nearly-contiguous bitmaps
+/// (common in VPN tunnels with in-order delivery), most words are 0xFFFF...
+/// and are skipped in one comparison.
 fn generate_ack_ranges_from_bitmap(
     bitmap: &Bitmap,
     largest_pn: u64,
@@ -234,31 +243,88 @@ fn generate_ack_ranges_from_bitmap(
         return ranges;
     }
 
-    let mut pn = largest_pn;
+    // Which word (and bit within it) does largest_pn map to?
+    let largest_offset = largest_pn - base;
+    let mut word_idx = (largest_offset >> 6) as usize;
+    // Mask: only bits <= largest_pn's bit position in the top word.
+    let top_bit = (largest_offset & 63) as u32;
+    let top_mask = if top_bit == 63 { u64::MAX } else { (1u64 << (top_bit + 1)) - 1 };
+
+    let bitmap_word_count = bitmap.word_count();
+
     let mut in_range = false;
     let mut range_end = 0u64;
+    let mut first_word = true;
 
-    loop {
-        if bitmap.test(pn) {
+    // Number of words to scan.
+    let total_words = word_idx + 1;
+
+    for _i in 0..total_words {
+        // Bitmap uses offset-based indexing: word_idx = (offset >> 6) & mask.
+        let actual_word_idx = word_idx & (bitmap_word_count - 1);
+        let mut word = bitmap.word_at(actual_word_idx);
+
+        // Mask the top word to only include bits up to largest_pn.
+        if first_word {
+            word &= top_mask;
+            first_word = false;
+        }
+
+        let word_base_pn = base + (word_idx as u64) * 64;
+
+        if word == u64::MAX {
+            // All 64 bits set — extend or start range.
+            let block_end = word_base_pn + 64;
             if !in_range {
-                range_end = pn + 1;
+                range_end = block_end.min(largest_pn + 1);
                 in_range = true;
             }
-        } else if in_range {
-            ranges.push(pn + 1..range_end);
-            in_range = false;
+            // Range continues.
+        } else if word == 0 {
+            // No bits set — close range if open.
+            if in_range {
+                let block_end = word_base_pn + 64;
+                ranges.push(block_end..range_end);
+                in_range = false;
+                if ranges.len() >= MAX_ACK_RANGES {
+                    break;
+                }
+            }
+        } else {
+            // Partial word — scan bits from high to low.
+            for bit in (0..64).rev() {
+                let pn = word_base_pn + bit;
+                if pn > largest_pn || pn < base {
+                    continue;
+                }
+                if (word >> bit) & 1 == 1 {
+                    if !in_range {
+                        range_end = pn + 1;
+                        in_range = true;
+                    }
+                } else if in_range {
+                    ranges.push(pn + 1..range_end);
+                    in_range = false;
+                    if ranges.len() >= MAX_ACK_RANGES {
+                        break;
+                    }
+                }
+            }
             if ranges.len() >= MAX_ACK_RANGES {
                 break;
             }
         }
 
-        if pn == base {
-            if in_range {
-                ranges.push(pn..range_end);
-            }
+        if word_idx == 0 {
             break;
         }
-        pn -= 1;
+        word_idx -= 1;
+    }
+
+    // Close final range.
+    if in_range && ranges.len() < MAX_ACK_RANGES {
+        let final_start = base;
+        ranges.push(final_start..range_end);
     }
 
     ranges
@@ -292,5 +358,147 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0], 7..10);
         assert_eq!(ranges[1], 0..5);
+    }
+
+    #[test]
+    fn generate_ranges_large_contiguous() {
+        // Simulate VPN scenario: 1000 contiguous packets.
+        let mut bm = Bitmap::new();
+        for pn in 0..1000 {
+            bm.set(pn);
+        }
+        let ranges = generate_ack_ranges_from_bitmap(&bm, 999);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..1000);
+    }
+
+    #[test]
+    fn generate_ranges_cross_word_boundary() {
+        // Gap right at a word boundary (64).
+        let mut bm = Bitmap::new();
+        for pn in 0..63 {
+            bm.set(pn);
+        }
+        // Skip 63
+        for pn in 64..128 {
+            bm.set(pn);
+        }
+        let ranges = generate_ack_ranges_from_bitmap(&bm, 127);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], 64..128);
+        assert_eq!(ranges[1], 0..63);
+    }
+
+    #[test]
+    fn generate_ranges_after_advance() {
+        // Test with advanced base.
+        let mut bm = Bitmap::new();
+        for pn in 0..200 {
+            bm.set(pn);
+        }
+        bm.advance_base(100);
+        for pn in 100..300 {
+            bm.set(pn);
+        }
+        let ranges = generate_ack_ranges_from_bitmap(&bm, 299);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 100..300);
+    }
+
+    /// Compare word-level scan against bit-by-bit reference implementation.
+    #[test]
+    fn generate_ranges_matches_reference() {
+        fn reference_scan(bitmap: &Bitmap, largest_pn: u64) -> SmallVec<[Range<u64>; 8]> {
+            let mut ranges: SmallVec<[Range<u64>; 8]> = SmallVec::new();
+            let base = bitmap.base();
+            if largest_pn < base { return ranges; }
+            let mut pn = largest_pn;
+            let mut in_range = false;
+            let mut range_end = 0u64;
+            loop {
+                if bitmap.test(pn) {
+                    if !in_range { range_end = pn + 1; in_range = true; }
+                } else if in_range {
+                    ranges.push(pn + 1..range_end);
+                    in_range = false;
+                    if ranges.len() >= MAX_ACK_RANGES { break; }
+                }
+                if pn == base {
+                    if in_range { ranges.push(pn..range_end); }
+                    break;
+                }
+                pn -= 1;
+            }
+            ranges
+        }
+
+        // Test 1: Large contiguous block.
+        let mut bm = Bitmap::new();
+        for pn in 0..5000 {
+            bm.set(pn);
+        }
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 4999),
+            reference_scan(&bm, 4999),
+            "test 1: large contiguous"
+        );
+
+        // Test 2: Periodic gaps (every 100th packet missing).
+        let mut bm = Bitmap::new();
+        for pn in 0..2000 {
+            if pn % 100 != 50 { bm.set(pn); }
+        }
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 1999),
+            reference_scan(&bm, 1999),
+            "test 2: periodic gaps"
+        );
+
+        // Test 3: Gap at word boundary.
+        let mut bm = Bitmap::new();
+        for pn in 0..500 {
+            if pn != 64 && pn != 128 && pn != 192 { bm.set(pn); }
+        }
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 499),
+            reference_scan(&bm, 499),
+            "test 3: gaps at word boundaries"
+        );
+
+        // Test 4: Only every other packet.
+        let mut bm = Bitmap::new();
+        for pn in (0..200).step_by(2) {
+            bm.set(pn);
+        }
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 199),
+            reference_scan(&bm, 199),
+            "test 4: every other packet (largest not set)"
+        );
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 198),
+            reference_scan(&bm, 198),
+            "test 4b: every other packet (largest set)"
+        );
+
+        // Test 5: Single packet.
+        let mut bm = Bitmap::new();
+        bm.set(42);
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 42),
+            reference_scan(&bm, 42),
+            "test 5: single packet"
+        );
+
+        // Test 6: Empty range at start, packets at end.
+        let mut bm = Bitmap::new();
+        for pn in 900..1000 {
+            bm.set(pn);
+        }
+        assert_eq!(
+            generate_ack_ranges_from_bitmap(&bm, 999),
+            reference_scan(&bm, 999),
+            "test 6: gap at start"
+        );
     }
 }

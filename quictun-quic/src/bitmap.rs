@@ -81,6 +81,22 @@ impl Bitmap {
     pub fn base(&self) -> u64 {
         self.base_pn
     }
+
+    /// Direct access to internal words and capacity for word-level scanning.
+    #[inline]
+    pub fn word_at(&self, word_idx: usize) -> u64 {
+        self.words[word_idx & (BITMAP_WORDS - 1)]
+    }
+
+    /// Number of words in the bitmap.
+    pub const fn word_count(&self) -> usize {
+        BITMAP_WORDS
+    }
+
+    /// Bitmap capacity in PNs.
+    pub const fn capacity(&self) -> u64 {
+        BITMAP_CAPACITY
+    }
 }
 
 #[cfg(test)]
