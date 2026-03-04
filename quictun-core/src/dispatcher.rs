@@ -132,8 +132,8 @@ pub fn new_connection_channels(
 /// UDP dispatcher task: receive from the shared UDP socket and route packets
 /// to per-connection tasks (short header) or the handshake channel (long header).
 ///
-/// Uses `readable()` + `try_recv_from()` drain loop to capture source addresses
-/// (needed for handshake packets). Per-connection data packets are routed by CID.
+/// Uses `readable()` + `try_recv_from()` drain loop. Source addresses are needed
+/// for handshake packets. Per-connection data packets are routed by CID.
 pub async fn run_udp_dispatcher(
     udp: Arc<UdpSocket>,
     table: Arc<RwLock<DispatchTable>>,
@@ -179,6 +179,10 @@ pub async fn run_udp_dispatcher(
 }
 
 /// Route a single UDP packet to the right destination.
+///
+/// Allocates + copies before acquiring the read lock, then calls try_send
+/// inside the lock to avoid cloning the mpsc::Sender (saves an atomic).
+#[inline]
 fn dispatch_packet(
     packet: &[u8],
     from: SocketAddr,
@@ -206,15 +210,14 @@ fn dispatch_packet(
 
     let cid = ConnectionId::new(&packet[1..1 + cid_len]);
 
-    let sender = {
-        let state = table.read().expect("dispatch table poisoned");
-        state.connections.get(&cid).map(|h| h.udp_tx.clone())
-    };
+    // Allocate before lock to minimize lock hold time.
+    let mut data = BytesMut::with_capacity(packet.len());
+    data.extend_from_slice(packet);
 
-    if let Some(tx) = sender {
-        let mut data = BytesMut::with_capacity(packet.len());
-        data.extend_from_slice(packet);
-        if tx.try_send(data).is_err() {
+    // try_send inside the lock — avoids cloning the Sender (saves an atomic op).
+    let state = table.read().expect("dispatch table poisoned");
+    if let Some(handle) = state.connections.get(&cid) {
+        if handle.udp_tx.try_send(data).is_err() {
             debug!(cid = %hex::encode(&cid[..]), "connection channel full, dropping packet");
         }
     } else {
@@ -254,15 +257,14 @@ pub async fn run_tun_router(
                                 packet[16], packet[17], packet[18], packet[19],
                             );
 
-                            let sender = {
-                                let state = table.read().expect("dispatch table poisoned");
-                                state.routes.get(&dest_ip).map(|h| h.tun_tx.clone())
-                            };
+                            // Allocate before lock.
+                            let mut data = BytesMut::with_capacity(n);
+                            data.extend_from_slice(&packet[..n]);
 
-                            if let Some(tx) = sender {
-                                let mut data = BytesMut::with_capacity(n);
-                                data.extend_from_slice(&packet[..n]);
-                                if tx.try_send(data).is_err() {
+                            // try_send inside lock — no Sender clone.
+                            let state = table.read().expect("dispatch table poisoned");
+                            if let Some(handle) = state.routes.get(&dest_ip) {
+                                if handle.tun_tx.try_send(data).is_err() {
                                     debug!(dest = %dest_ip, "connection TUN channel full, dropping");
                                 }
                             } else {
