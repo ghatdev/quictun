@@ -136,14 +136,25 @@ impl Mbuf {
         }
     }
 
-    /// Set TX checksum offload flags for IPv4/UDP.
+    /// Set TX checksum offload flags for UDP only (IP checksum done in software).
     ///
-    /// Configures the mbuf so the NIC computes both the IPv4 header checksum
-    /// and the UDP checksum. The caller must write the pseudo-header checksum
-    /// seed into the UDP checksum field before transmitting.
-    pub fn set_tx_checksum_offload(&mut self) {
+    /// The caller must write the pseudo-header checksum seed into the UDP checksum field.
+    pub fn set_tx_udp_checksum_offload(&mut self) {
         // SAFETY: self.raw is a valid mbuf; we set ol_flags and the l2/l3 length
         // bitfields that DPDK uses to locate the headers for offload computation.
+        unsafe {
+            (*self.raw).ol_flags |= ffi::RTE_MBUF_F_TX_IPV4
+                | ffi::RTE_MBUF_F_TX_UDP_CKSUM;
+            (*self.raw).__bindgen_anon_3.__bindgen_anon_1.set_l2_len(14); // Ethernet
+            (*self.raw).__bindgen_anon_3.__bindgen_anon_1.set_l3_len(20); // IPv4 (no options)
+        }
+    }
+
+    /// Set TX checksum offload flags for both IPv4 header and UDP checksums.
+    ///
+    /// The caller must write the pseudo-header checksum seed into the UDP checksum field
+    /// and leave the IPv4 header checksum as 0x0000.
+    pub fn set_tx_full_checksum_offload(&mut self) {
         unsafe {
             (*self.raw).ol_flags |= ffi::RTE_MBUF_F_TX_IPV4
                 | ffi::RTE_MBUF_F_TX_IP_CKSUM

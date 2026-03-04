@@ -10,8 +10,8 @@ const DEFAULT_NB_DESC: u16 = 1024;
 
 /// Configure and start a DPDK Ethernet port with 1 RX queue and 1 TX queue.
 ///
-/// Returns `(mac_address, hw_udp_checksum_offload_supported)` on success.
-pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([u8; 6], bool)> {
+/// Returns `(mac_address, hw_udp_cksum, hw_ip_cksum)`.
+pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([u8; 6], bool, bool)> {
     // Get device info for default RX/TX conf.
     let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
     // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
@@ -22,10 +22,18 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([
     // SAFETY: ret == 0 guarantees dev_info was fully initialized by DPDK.
     let dev_info = unsafe { dev_info.assume_init() };
 
-    // Minimal port configuration (no RSS, no offloads).
-    let port_conf = ffi::rte_eth_conf::default();
+    // Port configuration: enable TX checksum offloads based on device capabilities.
+    let mut port_conf = ffi::rte_eth_conf::default();
+    let hw_udp_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+    let hw_ip_cksum_cap = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
+    if hw_udp_cksum {
+        port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+    }
+    if hw_ip_cksum_cap {
+        port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+    }
 
-    // SAFETY: port_conf is a valid default config; port_id was validated by dev_info_get above.
+    // SAFETY: port_conf is a valid config; port_id was validated by dev_info_get above.
     let ret = unsafe { ffi::rte_eth_dev_configure(port_id, 1, 1, &port_conf) };
     if ret != 0 {
         bail!("rte_eth_dev_configure failed: {}", dpdk_strerror(-ret));
@@ -96,10 +104,8 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([
     // SAFETY: rte_eth_link_get_nowait always initializes the struct (even on error, zeroed).
     let link = unsafe { link.assume_init() };
 
-    // Check TX checksum offload capability.
-    let hw_udp_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+    // TX checksum offload: only need UDP (IP done in software).
     let hw_ip_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
-    let hw_offload = hw_udp_cksum && hw_ip_cksum;
 
     // SAFETY: rte_eth_link is a bindgen union; accessing the inner bitfield struct
     // is valid because both union variants share the same underlying memory layout.
@@ -114,17 +120,17 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([
         "DPDK port configured"
     );
 
-    Ok((mac.addr_bytes, hw_offload))
+    Ok((mac.addr_bytes, hw_udp_cksum, hw_ip_cksum))
 }
 
 /// Configure and start a DPDK Ethernet port with N RX/TX queues and RSS.
 ///
-/// Returns `(mac_address, hw_udp_checksum_offload_supported)` on success.
+/// Returns `(mac_address, hw_udp_cksum, hw_ip_cksum)` on success.
 pub fn configure_port_multiqueue(
     port_id: u16,
     n_queues: u16,
     mempool: *mut ffi::rte_mempool,
-) -> Result<([u8; 6], bool)> {
+) -> Result<([u8; 6], bool, bool)> {
     // Get device info for default RX/TX conf.
     let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
     // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
@@ -139,7 +145,14 @@ pub fn configure_port_multiqueue(
     // SAFETY: shim_rss_ip_udp_flags returns the correct DPDK RSS flag combination.
     let rss_hf = unsafe { ffi::shim_rss_ip_udp_flags() };
     // SAFETY: shim_create_rss_port_conf creates a valid rte_eth_conf with RSS mode.
-    let port_conf = unsafe { ffi::shim_create_rss_port_conf(rss_hf) };
+    let mut port_conf = unsafe { ffi::shim_create_rss_port_conf(rss_hf) };
+    // Enable TX checksum offloads if supported.
+    if (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0 {
+        port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+    }
+    if (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0 {
+        port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+    }
 
     // SAFETY: port_conf is a valid RSS config; port_id was validated by dev_info_get above.
     let ret =
@@ -213,7 +226,6 @@ pub fn configure_port_multiqueue(
     // Check TX checksum offload capability.
     let hw_udp_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
     let hw_ip_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
-    let hw_offload = hw_udp_cksum && hw_ip_cksum;
 
     tracing::info!(
         port = port_id,
@@ -224,7 +236,97 @@ pub fn configure_port_multiqueue(
         "DPDK port configured (multi-queue RSS)"
     );
 
-    Ok((mac.addr_bytes, hw_offload))
+    Ok((mac.addr_bytes, hw_udp_cksum, hw_ip_cksum))
+}
+
+/// Configure a DPDK port for dispatcher mode: 1 RX queue (core 0) + N TX queues.
+///
+/// Core 0 reads all packets and dispatches via SPSC rings. Each worker has
+/// its own TX queue for sending encrypted outer packets directly.
+pub fn configure_port_dispatcher(
+    port_id: u16,
+    n_tx_queues: u16,
+    mempool: *mut ffi::rte_mempool,
+) -> Result<([u8; 6], bool, bool)> {
+    let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
+    let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, dev_info.as_mut_ptr()) };
+    if ret != 0 {
+        bail!("rte_eth_dev_info_get failed: {}", dpdk_strerror(-ret));
+    }
+    let dev_info = unsafe { dev_info.assume_init() };
+
+    // No RSS — 1 RX queue, N TX queues. Enable TX checksum offloads if supported.
+    let mut port_conf = ffi::rte_eth_conf::default();
+    if (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0 {
+        port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+    }
+    if (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0 {
+        port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+    }
+
+    let ret = unsafe { ffi::rte_eth_dev_configure(port_id, 1, n_tx_queues, &port_conf) };
+    if ret != 0 {
+        bail!(
+            "rte_eth_dev_configure (dispatcher) failed: {}",
+            dpdk_strerror(-ret)
+        );
+    }
+
+    // 1 RX queue (core 0).
+    let ret = unsafe {
+        ffi::rte_eth_rx_queue_setup(port_id, 0, DEFAULT_NB_DESC, 0, &dev_info.default_rxconf, mempool)
+    };
+    if ret != 0 {
+        bail!("rte_eth_rx_queue_setup(q=0) failed: {}", dpdk_strerror(-ret));
+    }
+
+    // N TX queues (one per core: dispatcher + workers).
+    for qid in 0..n_tx_queues {
+        let ret = unsafe {
+            ffi::rte_eth_tx_queue_setup(port_id, qid, DEFAULT_NB_DESC, 0, &dev_info.default_txconf)
+        };
+        if ret != 0 {
+            bail!(
+                "rte_eth_tx_queue_setup(q={qid}) failed: {}",
+                dpdk_strerror(-ret)
+            );
+        }
+    }
+
+    // Enable promiscuous mode.
+    let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
+    if ret != 0 {
+        bail!("rte_eth_promiscuous_enable failed: {}", dpdk_strerror(-ret));
+    }
+
+    // Start the port.
+    let ret = unsafe { ffi::rte_eth_dev_start(port_id) };
+    if ret != 0 {
+        bail!("rte_eth_dev_start failed: {}", dpdk_strerror(-ret));
+    }
+
+    // Read MAC address.
+    let mut mac_addr = MaybeUninit::<ffi::rte_ether_addr>::uninit();
+    let ret = unsafe { ffi::rte_eth_macaddr_get(port_id, mac_addr.as_mut_ptr()) };
+    if ret != 0 {
+        bail!("rte_eth_macaddr_get failed: {}", dpdk_strerror(-ret));
+    }
+    let mac = unsafe { mac_addr.assume_init() };
+
+    // Check TX checksum offload capability.
+    let hw_udp_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
+    let hw_ip_cksum = (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
+
+    tracing::info!(
+        port = port_id,
+        mac = %format_mac(&mac.addr_bytes),
+        n_tx_queues,
+        hw_udp_cksum,
+        hw_ip_cksum,
+        "DPDK port configured (dispatcher: 1 RX, {n_tx_queues} TX)"
+    );
+
+    Ok((mac.addr_bytes, hw_udp_cksum, hw_ip_cksum))
 }
 
 /// Stop and close a DPDK port.

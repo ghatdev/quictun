@@ -6,6 +6,7 @@
 #include <rte_mempool.h>
 #include <rte_eal.h>
 #include <rte_bus_vdev.h>
+#include <rte_ring.h>
 
 /*
  * C shim wrappers for inline DPDK functions.
@@ -52,5 +53,18 @@ struct rte_eth_conf shim_create_rss_port_conf(uint64_t rss_hf);
  * Return the RSS hash flags for IPv4 + UDP.
  */
 uint64_t shim_rss_ip_udp_flags(void);
+
+/*
+ * rte_ring SPSC wrappers (inline functions not visible to bindgen/FFI).
+ */
+struct rte_ring *shim_rte_ring_create(const char *name, unsigned count,
+                                       int socket_id, unsigned flags);
+void shim_rte_ring_free(struct rte_ring *r);
+int shim_rte_ring_sp_enqueue(struct rte_ring *r, void *obj);
+unsigned shim_rte_ring_sp_enqueue_burst(struct rte_ring *r,
+                                         void * const *objs, unsigned n,
+                                         unsigned *free_space);
+unsigned shim_rte_ring_sc_dequeue_burst(struct rte_ring *r, void **objs,
+                                         unsigned n, unsigned *available);
 
 #endif /* QUICTUN_DPDK_SHIM_H */

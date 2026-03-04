@@ -52,3 +52,11 @@ pub const RTE_MBUF_F_TX_IP_CKSUM: u64 = 1 << 54;
 
 /// Packet is IPv4 (ol_flags, required for IP/UDP checksum offload).
 pub const RTE_MBUF_F_TX_IPV4: u64 = 1 << 55;
+
+// rte_ring flags (rte_ring.h #define macros).
+
+/// Single-producer enqueue (RING_F_SP_ENQ).
+pub const RING_F_SP_ENQ: u32 = 0x0001;
+
+/// Single-consumer dequeue (RING_F_SC_DEQ).
+pub const RING_F_SC_DEQ: u32 = 0x0002;

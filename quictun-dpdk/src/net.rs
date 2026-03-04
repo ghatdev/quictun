@@ -27,16 +27,20 @@ const ARP_PACKET_LEN: usize = 28; // fixed for Ethernet + IPv4
 
 // ── Checksum mode ────────────────────────────────────────────────
 
-/// UDP checksum computation strategy.
+/// Checksum offload strategy for TX packets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChecksumMode {
     /// Skip UDP checksum entirely (write 0x0000). Valid for IPv4 (RFC 768).
-    /// Use `--no-udp-checksum` for benchmarking.
+    /// Use `--no-udp-checksum` for benchmarking. IP checksum still computed in software.
     None,
-    /// Optimized software checksum (u64 scalar / AVX2 / NEON).
+    /// All checksums computed in software (SIMD-optimized).
     Software,
-    /// NIC hardware offload: write pseudo-header seed, NIC finishes.
-    HardwareOffload,
+    /// NIC offloads UDP checksum only; IP checksum computed in software.
+    /// (e.g., virtio-user: hw_udp_cksum=true, hw_ip_cksum=false)
+    HardwareUdpOnly,
+    /// NIC offloads both IPv4 header and UDP checksums.
+    /// (e.g., physical NICs with full offload support)
+    HardwareFull,
 }
 
 // ── Identity & ARP table ──────────────────────────────────────────
@@ -257,8 +261,8 @@ pub fn build_udp_packet(
     ip[12..16].copy_from_slice(&src_ip.octets());
     ip[16..20].copy_from_slice(&dst_ip.octets());
 
-    // IPv4 header checksum: HW offload leaves 0x0000 (NIC computes it).
-    if checksum_mode != ChecksumMode::HardwareOffload {
+    // IPv4 header checksum: HardwareFull lets the NIC compute it; otherwise software.
+    if checksum_mode != ChecksumMode::HardwareFull {
         let cksum = ipv4_checksum(ip);
         ip[10..12].copy_from_slice(&cksum.to_be_bytes());
     }
@@ -284,7 +288,7 @@ pub fn build_udp_packet(
             let cksum = checksum::udp_checksum(src_ip, dst_ip, &buf[udp_offset..total_len]);
             buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&cksum.to_be_bytes());
         }
-        ChecksumMode::HardwareOffload => {
+        ChecksumMode::HardwareUdpOnly | ChecksumMode::HardwareFull => {
             // Write pseudo-header seed; NIC adds the UDP segment sum.
             let seed = checksum::udp_pseudo_header_checksum(src_ip, dst_ip, udp_len);
             buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&seed.to_be_bytes());
@@ -335,7 +339,8 @@ pub fn build_udp_packet_inplace(
     ip[12..16].copy_from_slice(&src_ip.octets());
     ip[16..20].copy_from_slice(&dst_ip.octets());
 
-    if checksum_mode != ChecksumMode::HardwareOffload {
+    // IPv4 header checksum: HardwareFull lets the NIC compute it; otherwise software.
+    if checksum_mode != ChecksumMode::HardwareFull {
         let cksum = ipv4_checksum(ip);
         ip[10..12].copy_from_slice(&cksum.to_be_bytes());
     }
@@ -356,7 +361,7 @@ pub fn build_udp_packet_inplace(
             let cksum = checksum::udp_checksum(src_ip, dst_ip, &buf[udp_offset..total_len]);
             buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&cksum.to_be_bytes());
         }
-        ChecksumMode::HardwareOffload => {
+        ChecksumMode::HardwareUdpOnly | ChecksumMode::HardwareFull => {
             let seed = checksum::udp_pseudo_header_checksum(src_ip, dst_ip, udp_len);
             buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&seed.to_be_bytes());
         }
@@ -589,7 +594,7 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
             &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
-            ChecksumMode::HardwareOffload,
+            ChecksumMode::HardwareFull,
         );
 
         // IPv4 checksum should be 0x0000 (NIC computes).

@@ -174,7 +174,6 @@ unsafe fn checksum_avx2_partial(data: &[u8]) -> u64 {
     // Accumulate in 4 × u64 lanes to avoid overflow.
     // Each iteration: load 32 bytes, zero-extend u16→u32, horizontal pair-add to u64.
     let mut acc = _mm256_setzero_si256();
-    let zero = _mm256_setzero_si256();
 
     // We can safely do ~2048 iterations before u32 lanes overflow (65535 * 2048 < u32::MAX).
     // For simplicity, fold every 256 iterations.
@@ -196,13 +195,20 @@ unsafe fn checksum_avx2_partial(data: &[u8]) -> u64 {
         let lo_swapped = _mm_shuffle_epi8(lo128, swap_mask);
         let hi_swapped = _mm_shuffle_epi8(hi128, swap_mask);
 
-        // Use _mm_madd_epi16 with all-ones to pairwise-add adjacent u16→u32.
-        let ones = _mm_set1_epi16(1);
-        let lo_u32 = _mm256_cvtepu32_epi64(_mm_madd_epi16(lo_swapped, ones));
-        let hi_u32 = _mm256_cvtepu32_epi64(_mm_madd_epi16(hi_swapped, ones));
+        // Unsigned u16 → u32 widening add (NOT _mm_madd_epi16 which treats as signed i16).
+        let zero128 = _mm_setzero_si128();
+        let lo_lo = _mm_unpacklo_epi16(lo_swapped, zero128); // words 0-3 zero-extended to u32
+        let lo_hi = _mm_unpackhi_epi16(lo_swapped, zero128); // words 4-7 zero-extended to u32
+        let lo_sum = _mm_add_epi32(lo_lo, lo_hi);            // 4 × u32 partial sums
+        let lo_u64 = _mm256_cvtepu32_epi64(lo_sum);
 
-        acc = _mm256_add_epi64(acc, lo_u32);
-        acc = _mm256_add_epi64(acc, hi_u32);
+        let hi_lo = _mm_unpacklo_epi16(hi_swapped, zero128);
+        let hi_hi = _mm_unpackhi_epi16(hi_swapped, zero128);
+        let hi_sum = _mm_add_epi32(hi_lo, hi_hi);
+        let hi_u64 = _mm256_cvtepu32_epi64(hi_sum);
+
+        acc = _mm256_add_epi64(acc, lo_u64);
+        acc = _mm256_add_epi64(acc, hi_u64);
 
         offset += 32;
         iters_since_fold += 1;

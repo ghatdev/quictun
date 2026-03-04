@@ -29,6 +29,7 @@ fn dpdk_build() {
         .allowlist_type("rte_eth_dev_info")
         .allowlist_type("rte_ether_addr")
         .allowlist_type("rte_eth_link")
+        .allowlist_type("rte_ring")
         // DPDK functions (non-inline — callable directly)
         .allowlist_function("rte_eal_init")
         .allowlist_function("rte_eal_cleanup")

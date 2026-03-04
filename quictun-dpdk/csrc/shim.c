@@ -64,3 +64,27 @@ struct rte_eth_conf shim_create_rss_port_conf(uint64_t rss_hf) {
 uint64_t shim_rss_ip_udp_flags(void) {
     return RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP;
 }
+
+struct rte_ring *shim_rte_ring_create(const char *name, unsigned count,
+                                       int socket_id, unsigned flags) {
+    return rte_ring_create(name, count, socket_id, flags);
+}
+
+void shim_rte_ring_free(struct rte_ring *r) {
+    rte_ring_free(r);
+}
+
+int shim_rte_ring_sp_enqueue(struct rte_ring *r, void *obj) {
+    return rte_ring_sp_enqueue(r, obj);
+}
+
+unsigned shim_rte_ring_sp_enqueue_burst(struct rte_ring *r,
+                                         void * const *objs, unsigned n,
+                                         unsigned *free_space) {
+    return rte_ring_sp_enqueue_burst(r, objs, n, free_space);
+}
+
+unsigned shim_rte_ring_sc_dequeue_burst(struct rte_ring *r, void **objs,
+                                         unsigned n, unsigned *available) {
+    return rte_ring_sc_dequeue_burst(r, objs, n, available);
+}

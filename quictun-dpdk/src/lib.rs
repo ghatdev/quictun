@@ -15,6 +15,10 @@ mod shared;
 #[cfg(target_os = "linux")]
 mod engine;
 #[cfg(target_os = "linux")]
+mod ring;
+#[cfg(target_os = "linux")]
+mod dispatch;
+#[cfg(target_os = "linux")]
 mod veth;
 #[cfg(target_os = "linux")]
 pub mod quic;
