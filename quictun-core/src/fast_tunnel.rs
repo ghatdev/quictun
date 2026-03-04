@@ -96,6 +96,8 @@ pub async fn run_fast_loop_multi(
     let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; crate::batch_io::BATCH_SIZE];
     #[cfg(target_os = "linux")]
     let mut recv_lens = vec![0usize; crate::batch_io::BATCH_SIZE];
+    #[cfg(target_os = "linux")]
+    let mut recv_addrs = vec![SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0); crate::batch_io::BATCH_SIZE];
 
     // Non-Linux: simple per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -153,8 +155,8 @@ pub async fn run_fast_loop_multi(
                     if let Some(result) = handle_udp_readable_linux(
                         udp, tun, &mut connections, cid_len,
                         &mut endpoint, &mut handshakes, &server_config,
-                        &mut recv_bufs, &mut recv_lens, &mut scratch,
-                        &mut response_buf,
+                        &mut recv_bufs, &mut recv_lens, &mut recv_addrs,
+                        &mut scratch, &mut response_buf,
                     ).await {
                         return result;
                     }
@@ -426,7 +428,7 @@ async fn handle_tun_readable_nonlinux(
     None
 }
 
-/// Handle UDP readable event on Linux (recvmmsg batch).
+/// Handle UDP readable event on Linux (recvmmsg batch with source addresses).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_udp_readable_linux(
@@ -439,11 +441,12 @@ async fn handle_udp_readable_linux(
     server_config: &Arc<ServerConfig>,
     recv_bufs: &mut [Vec<u8>],
     recv_lens: &mut [usize],
+    recv_addrs: &mut [SocketAddr],
     scratch: &mut BytesMut,
     response_buf: &mut Vec<u8>,
 ) -> Option<TunnelResult> {
     let n_msgs = match crate::batch_io::recvmmsg_batch(
-        udp, recv_bufs, recv_lens, crate::batch_io::BATCH_SIZE,
+        udp, recv_bufs, recv_lens, recv_addrs, crate::batch_io::BATCH_SIZE,
     ) {
         Ok(n) => n,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
@@ -459,15 +462,19 @@ async fn handle_udp_readable_linux(
         let first_byte = recv_bufs[i][0];
 
         if first_byte & 0x80 != 0 {
-            // Long header → handshake.
+            // Long header → handshake via endpoint.
+            let from = recv_addrs[i];
             let mut data = BytesMut::with_capacity(n);
             data.extend_from_slice(&recv_bufs[i][..n]);
-            // recvmmsg doesn't give us source addr per-message easily;
-            // use try_recv_from fallback for handshake packets below.
-            // For now, feed to endpoint with a placeholder (handshakes will
-            // also be caught in the non-batch path).
-            // Actually, recvmmsg doesn't provide source addresses. For handshake
-            // packets we need the source address. Fall through to handle below.
+            let now = Instant::now();
+            if let Some(event) = endpoint.handle(now, from, None, None, data, response_buf)
+                && let Some(result) = handle_endpoint_event(
+                    udp, endpoint, handshakes, server_config,
+                    event, from, response_buf,
+                ).await
+            {
+                return Some(result);
+            }
             continue;
         }
 
@@ -493,56 +500,6 @@ async fn handle_udp_readable_linux(
                     debug!(error = %e, "decrypt failed, dropping");
                 }
             }
-        }
-    }
-
-    // Also drain with try_recv_from to catch handshake packets (which need source addr).
-    loop {
-        let mut buf = [0u8; MAX_PACKET];
-        match udp.try_recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if n == 0 { continue; }
-                if buf[0] & 0x80 != 0 {
-                    // Long header → endpoint.handle().
-                    let mut data = BytesMut::with_capacity(n);
-                    data.extend_from_slice(&buf[..n]);
-                    let now = Instant::now();
-                    if let Some(event) = endpoint.handle(now, from, None, None, data, response_buf)
-                        && let Some(result) = handle_endpoint_event(
-                            udp, endpoint, handshakes, server_config,
-                            event, from, response_buf,
-                        ).await
-                    {
-                        return Some(result);
-                    }
-                } else {
-                    // Short header — may have been missed by recvmmsg.
-                    if cid_len > 0 && n > cid_len {
-                        let cid_bytes = &buf[1..1 + cid_len];
-                        if let Some(entry) = connections.get_mut(cid_bytes) {
-                            match entry.conn.decrypt_packet_with_buf(&mut buf[..n], scratch) {
-                                Ok(decrypted) => {
-                                    entry.last_rx = Instant::now();
-                                    if let Some(ref ack) = decrypted.ack {
-                                        entry.conn.process_ack(ack);
-                                    }
-                                    for datagram in &decrypted.datagrams {
-                                        if datagram.is_empty() { continue; }
-                                        if let Err(e) = tun.send(datagram).await {
-                                            return Some(TunnelResult::Fatal(e.into()));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(error = %e, "decrypt failed, dropping");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Some(TunnelResult::Fatal(e.into())),
         }
     }
 
@@ -894,6 +851,8 @@ pub async fn run_fast_loop(
     let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; crate::batch_io::BATCH_SIZE];
     #[cfg(target_os = "linux")]
     let mut recv_lens = vec![0usize; crate::batch_io::BATCH_SIZE];
+    #[cfg(target_os = "linux")]
+    let mut recv_addrs = vec![SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0); crate::batch_io::BATCH_SIZE];
 
     // Non-Linux: simple per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -1069,6 +1028,7 @@ pub async fn run_fast_loop(
                         udp,
                         &mut recv_bufs,
                         &mut recv_lens,
+                        &mut recv_addrs,
                         crate::batch_io::BATCH_SIZE,
                     ) {
                         Ok(n) => n,

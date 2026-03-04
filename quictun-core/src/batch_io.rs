@@ -84,7 +84,8 @@ pub fn sendmmsg_batch(
 
 /// Receive multiple UDP packets in a single syscall via recvmmsg(2).
 ///
-/// Fills `bufs[0..n]` with received data, `lens[0..n]` with lengths.
+/// Fills `bufs[0..n]` with received data, `lens[0..n]` with lengths,
+/// and `addrs[0..n]` with source addresses.
 /// Returns the number of messages received.
 ///
 /// Uses MSG_DONTWAIT so it won't block — call after ensuring readability.
@@ -92,15 +93,17 @@ pub fn recvmmsg_batch(
     fd: &impl AsRawFd,
     bufs: &mut [Vec<u8>],
     lens: &mut [usize],
+    addrs: &mut [SocketAddr],
     max_count: usize,
 ) -> io::Result<usize> {
-    let count = max_count.min(bufs.len()).min(lens.len()).min(BATCH_SIZE);
+    let count = max_count.min(bufs.len()).min(lens.len()).min(addrs.len()).min(BATCH_SIZE);
     if count == 0 {
         return Ok(0);
     }
 
     let mut iovecs: [libc::iovec; BATCH_SIZE] = unsafe { std::mem::zeroed() };
     let mut msgs: [libc::mmsghdr; BATCH_SIZE] = unsafe { std::mem::zeroed() };
+    let mut sockaddrs: [libc::sockaddr_in; BATCH_SIZE] = unsafe { std::mem::zeroed() };
 
     for i in 0..count {
         iovecs[i] = libc::iovec {
@@ -109,6 +112,8 @@ pub fn recvmmsg_batch(
         };
         msgs[i].msg_hdr.msg_iov = &mut iovecs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &mut sockaddrs[i] as *mut _ as *mut libc::c_void;
+        msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     }
 
     let ret = unsafe {
@@ -127,6 +132,10 @@ pub fn recvmmsg_batch(
         let n = ret as usize;
         for i in 0..n {
             lens[i] = msgs[i].msg_len as usize;
+            let sa = &sockaddrs[i];
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            let port = u16::from_be(sa.sin_port);
+            addrs[i] = SocketAddr::new(ip.into(), port);
         }
         Ok(n)
     }
