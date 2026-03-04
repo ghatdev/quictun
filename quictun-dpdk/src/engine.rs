@@ -1,17 +1,19 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 
 use crate::ffi;
-use crate::mbuf::{Mbuf, MbufSlice};
+use crate::mbuf::Mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
-use crate::shared::{self, DriveResult, QuicState, BUF_SIZE};
-use quictun_quic::ConnectionState;
+use crate::dispatch::{ConnectionEntry, PeerInfo};
+use crate::shared::{self, DriveResult, MultiQuicState, QuicState, BUF_SIZE};
+use quictun_quic::local::LocalConnectionState;
 
 /// Maximum burst size for rx/tx.
 const BURST_SIZE: usize = 32;
@@ -69,31 +71,39 @@ const MAX_DELAY_US: u32 = 100;
 ///
 /// This is the hot loop: RX burst → QUIC → inner write → drain transmits → TX burst.
 /// No syscalls for network I/O (pure DPDK PMD polling).
+///
+/// Handles 1..N connections on a single core via a connection table.
+/// Single peer = 1-entry table. Multi-peer listeners work without multi-core.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     outer_port_id: u16,
     queue_id: u16,
     mempool: *mut ffi::rte_mempool,
-    state: &mut QuicState,
+    multi_state: &mut MultiQuicState,
     identity: &mut NetIdentity,
     arp_table: &mut ArpTable,
     inner: InnerPort,
     shutdown: Arc<AtomicBool>,
     adaptive_poll: bool,
     checksum_mode: ChecksumMode,
+    peers: &[PeerInfo],
 ) -> Result<()> {
+    const CID_LEN: usize = 8;
+
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
-    let mut drive_result = DriveResult::new();
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut pkt_buf = [0u8; 2048];
-    let mut deadline = Instant::now() + Duration::from_secs(1);
     let mut ip_id: u16 = 0;
     // Reusable BytesMut for feeding quinn-proto long header RX (handshake path).
     let mut rx_buf = BytesMut::with_capacity(2048);
 
-
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
-    let mut peer_learned = identity.remote_port != 0;
+
+    // Connection table: CID → connection entry.
+    let mut connections: HashMap<Vec<u8>, ConnectionEntry> = HashMap::new();
+    // Tunnel IP → CID (for inner RX routing).
+    let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
 
     // Stats.
     let mut rx_pkts: u64 = 0;
@@ -111,8 +121,6 @@ pub fn run(
     let mut delay_us: u32 = MIN_DELAY_US;
     let mut now = Instant::now();
 
-    // quictun-quic: fast data plane state (set after handshake completes).
-    let mut quic_conn_state: Option<Arc<ConnectionState>> = None;
     // Pre-allocated mbuf vectors for batched TX (reused across loop iterations).
     let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
     let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
@@ -120,20 +128,22 @@ pub fn run(
     // Pending mbufs from a failed outer tx_burst (retry next iteration instead of dropping).
     let mut pending_outer_tx: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
 
-    // If connector, drain initial handshake transmits.
-    drain_and_send(
-        state,
-        Instant::now(),
-        outer_port_id,
-        queue_id,
-        mempool,
-        identity,
-        arp_table,
-        &mut transmit_buf,
-        &mut tx_pkts,
-        &mut ip_id,
-        checksum_mode,
-    )?;
+    // If connector, drain initial handshake transmits (Client Hello).
+    for hs in multi_state.handshakes.values_mut() {
+        drain_handshake_transmits(
+            &mut hs.connection,
+            Instant::now(),
+            outer_port_id,
+            queue_id,
+            mempool,
+            identity,
+            arp_table,
+            &mut transmit_buf,
+            &mut tx_pkts,
+            &mut ip_id,
+            checksum_mode,
+        );
+    }
 
     tracing::info!("DPDK engine started (polling loop)");
 
@@ -144,15 +154,13 @@ pub fn run(
         }
 
         // During handshake, quinn-proto needs accurate time every iteration.
-        // After handshake (quictun-quic), `now` is only used for stats — sample less.
-        // We also refresh when packets arrive (see below after rx_burst).
-        if quic_conn_state.is_none() {
+        // After all handshakes complete, `now` is only used for stats — sample less.
+        if !multi_state.handshakes.is_empty() {
             now = Instant::now();
         }
 
-        // ── Phase 1a: RX burst from outer port → parse → feed QUIC ──
+        // ── Phase 1a: RX burst from outer port → parse → decrypt/handshake ──
 
-        // Reuse pre-allocated vectors for this iteration.
         inner_tx_mbufs.clear();
 
         let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
@@ -166,13 +174,10 @@ pub fn run(
             let mut mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
             rx_pkts += 1;
 
-            // Single data_mut() call for the entire packet lifecycle.
-            // Reborrows as &[u8] for read-only phases (parse, datagram copy).
             enum RxAction {
                 ShortHeader {
                     src_mac: [u8; 6],
                     src_ip: Ipv4Addr,
-                    src_port: u16,
                     payload_offset: usize,
                     payload_len: usize,
                 },
@@ -204,15 +209,16 @@ pub fn run(
                             };
                             let payload_len = udp.payload.len();
                             let first_byte = udp.payload[0];
-                            if first_byte & 0x80 == 0 && quic_conn_state.is_some() {
+                            if first_byte & 0x80 == 0 {
+                                // Short header → fast path (decrypt via connection table).
                                 RxAction::ShortHeader {
                                     src_mac: udp.src_mac,
                                     src_ip: udp.src_ip,
-                                    src_port: udp.src_port,
                                     payload_offset,
                                     payload_len,
                                 }
-                            } else if first_byte & 0x80 != 0 {
+                            } else {
+                                // Long header → handshake via MultiQuicState.
                                 RxAction::LongHeader {
                                     src_mac: udp.src_mac,
                                     src_ip: udp.src_ip,
@@ -221,8 +227,6 @@ pub fn run(
                                     payload_offset,
                                     payload_len,
                                 }
-                            } else {
-                                RxAction::Skip
                             }
                         }
                     }
@@ -235,34 +239,29 @@ pub fn run(
                 RxAction::ShortHeader {
                     src_mac,
                     src_ip,
-                    src_port,
                     payload_offset,
                     payload_len,
                 } => {
                     arp_table.learn(src_ip, src_mac);
-                    if identity.remote_mac.is_none() {
-                        identity.remote_mac = Some(src_mac);
-                        tracing::info!(
-                            mac = %format_mac(&src_mac),
-                            ip = %src_ip,
-                            "learned peer MAC"
-                        );
-                    }
-                    if !peer_learned {
-                        state.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                        identity.remote_port = src_port;
-                        peer_learned = true;
-                        tracing::info!(remote = %state.remote_addr, "learned peer address");
-                    }
                     quic_rx += 1;
 
-                    let conn_state = quic_conn_state.as_ref().unwrap();
-                    match conn_state.decrypt_packet_in_place(
+                    // Extract CID and look up connection.
+                    if payload_len < 1 + CID_LEN {
+                        continue;
+                    }
+                    let cid_bytes = &data[payload_offset + 1..payload_offset + 1 + CID_LEN];
+
+                    let Some(entry) = connections.get_mut(cid_bytes) else {
+                        decrypt_fail += 1;
+                        continue;
+                    };
+
+                    match entry.conn.decrypt_packet_in_place(
                         &mut data[payload_offset..payload_offset + payload_len],
                     ) {
                         Ok(decrypted) => {
                             if let Some(ref ack) = decrypted.ack {
-                                conn_state.process_ack(ack);
+                                entry.conn.process_ack(ack);
                             }
                             for range in &decrypted.datagrams {
                                 let abs_start = payload_offset + range.start;
@@ -293,22 +292,7 @@ pub fn run(
                     payload_offset,
                     payload_len,
                 } => {
-                    // MAC / peer learning
                     arp_table.learn(src_ip, src_mac);
-                    if identity.remote_mac.is_none() {
-                        identity.remote_mac = Some(src_mac);
-                        tracing::info!(
-                            mac = %format_mac(&src_mac),
-                            ip = %src_ip,
-                            "learned peer MAC"
-                        );
-                    }
-                    if !peer_learned {
-                        state.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                        identity.remote_port = src_port;
-                        peer_learned = true;
-                        tracing::info!(remote = %state.remote_addr, "learned peer address");
-                    }
                     quic_rx += 1;
 
                     // Long header → quinn-proto (handshake, cold path — copy is fine).
@@ -317,51 +301,32 @@ pub fn run(
                     let quic_data = rx_buf.split();
 
                     let remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                    if let Some(event) =
-                        state
-                            .endpoint
-                            .handle(now, remote_addr, None, ecn, quic_data, &mut response_buf)
-                    {
-                        let responses =
-                            shared::handle_datagram_event(state, event, &mut response_buf);
+                    let responses = multi_state.handle_incoming(
+                        now, remote_addr, ecn, quic_data, &mut response_buf,
+                    );
 
-                        for (len, buf) in responses {
-                            let dst_mac = identity
-                                .remote_mac
-                                .or_else(|| arp_table.lookup(identity.remote_ip))
-                                .unwrap_or([0xff; 6]);
-
-                            ip_id = ip_id.wrapping_add(1);
-                            let frame_len = net::build_udp_packet(
-                                &identity.local_mac,
-                                &dst_mac,
-                                identity.local_ip,
-                                identity.remote_ip,
-                                identity.local_port,
-                                identity.remote_port,
-                                &buf[..len],
-                                &mut pkt_buf,
-                                0, // no ECN for stateless responses
-                                ip_id,
-                                checksum_mode,
-                            );
-                            pending_frames.push(pkt_buf[..frame_len].to_vec());
-                        }
+                    // Send responses back to the sender.
+                    for (len, buf) in responses {
+                        let dst_mac = arp_table.lookup(src_ip).unwrap_or([0xff; 6]);
+                        ip_id = ip_id.wrapping_add(1);
+                        let frame_len = net::build_udp_packet(
+                            &identity.local_mac,
+                            &dst_mac,
+                            identity.local_ip,
+                            src_ip,
+                            identity.local_port,
+                            src_port,
+                            &buf[..len],
+                            &mut pkt_buf,
+                            0,
+                            ip_id,
+                            checksum_mode,
+                        );
+                        pending_frames.push(pkt_buf[..frame_len].to_vec());
                     }
                 }
                 RxAction::Arp(arp) => {
-                    // Learn MAC from any ARP we receive.
                     arp_table.learn(arp.sender_ip, arp.sender_mac);
-                    if identity.remote_mac.is_none()
-                        && arp.sender_ip == identity.remote_ip
-                    {
-                        identity.remote_mac = Some(arp.sender_mac);
-                        tracing::info!(
-                            mac = %format_mac(&arp.sender_mac),
-                            ip = %arp.sender_ip,
-                            "learned peer MAC via ARP"
-                        );
-                    }
 
                     // Reply to ARP requests for our IP.
                     if arp.is_request && arp.target_ip == identity.local_ip {
@@ -392,28 +357,20 @@ pub fn run(
             }
         }
 
-        // ── Phase 1b: Read from inner port → send_datagram ──
+        // ── Phase 1b: Read from inner port → encrypt → outer TX ──
         //
         // Back-pressure: if the outer TX ring was full last iteration,
-        // skip inner RX to let the TX queue drain. ARP is always handled.
-        // This prevents sustained queue overflow that causes TCP retransmits.
-        //
-        // rx_burst handles ARP regardless of connection state,
-        // then send IP packets via QUIC if connection exists.
-        //
+        // skip inner RX to let the TX queue drain.
+
         let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
-        // Use smaller burst for quictun-quic mode to prevent outer TX ring overflow.
-        // Back-pressure: if we have pending unsent mbufs, skip inner RX and drain first.
-        let inner_burst = if quic_conn_state.is_some() { INNER_BURST_SIZE } else { BURST_SIZE as u16 };
+        let inner_burst = if !connections.is_empty() { INNER_BURST_SIZE } else { BURST_SIZE as u16 };
         let nb = if !pending_outer_tx.is_empty() {
             0 // back-pressure: drain pending mbufs first
         } else {
             port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, inner_burst)
         };
 
-        let mut inner_ip_count: usize = 0;
-        // Reuse pre-allocated vector for quictun-quic TX batch.
         outer_tx_mbufs.clear();
 
         for i in 0..nb as usize {
@@ -426,72 +383,76 @@ pub fn run(
             let ethertype = u16::from_be_bytes([data[12], data[13]]);
             match ethertype {
                 0x0800 => {
-                    // IPv4: strip Ethernet header, send via QUIC.
-                    if let Some(ref conn_state) = quic_conn_state {
-                        // quictun-quic fast path: encrypt directly into outer mbuf.
-                        // Eliminates the quic_tx_buf intermediate copy.
-                        inner_rx += 1;
-                        let ip_payload = &data[ETH_HLEN..];
-                        // Max QUIC packet: header(1+cid+4) + DATAGRAM(1+payload) + AEAD tag
-                        let max_quic_len = 1 + conn_state.remote_cid().len() + 4
-                            + 1 + ip_payload.len() + conn_state.tag_len();
-                        let max_frame_len = net::HEADER_SIZE + max_quic_len;
+                    // IPv4: route by dest IP, encrypt via quictun-quic.
+                    if data.len() < ETH_HLEN + 20 {
+                        continue;
+                    }
+                    inner_rx += 1;
+                    let ip_payload = &data[ETH_HLEN..];
 
-                        if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
-                            if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
-                                // Encrypt QUIC packet directly at buf[HEADER_SIZE..]
-                                match conn_state.encrypt_datagram(
-                                    ip_payload,
-                                    None,
-                                    &mut buf[net::HEADER_SIZE..],
-                                ) {
-                                    Ok(result) => {
-                                        let dst_mac = identity
-                                            .remote_mac
-                                            .or_else(|| arp_table.lookup(identity.remote_ip))
-                                            .unwrap_or([0xff; 6]);
-                                        ip_id = ip_id.wrapping_add(1);
+                    let dst_ip = Ipv4Addr::new(
+                        data[ETH_HLEN + 16],
+                        data[ETH_HLEN + 17],
+                        data[ETH_HLEN + 18],
+                        data[ETH_HLEN + 19],
+                    );
 
-                                        // Write headers around the already-placed payload.
-                                        let actual_len = net::build_udp_packet_inplace(
-                                            &identity.local_mac,
-                                            &dst_mac,
-                                            identity.local_ip,
-                                            identity.remote_ip,
-                                            identity.local_port,
-                                            identity.remote_port,
-                                            result.len,
-                                            buf,
-                                            0,
-                                            ip_id,
-                                            checksum_mode,
-                                        );
-                                        // Trim mbuf to actual frame size.
-                                        tx_mbuf.truncate(actual_len as u16);
-                                        if checksum_mode == ChecksumMode::HardwareOffload {
-                                            tx_mbuf.set_tx_checksum_offload();
-                                        }
-                                        outer_tx_mbufs.push(tx_mbuf.into_raw());
+                    // Look up connection by dest IP, with single-connection default route.
+                    let entry = if let Some(cid) = ip_to_cid.get(&dst_ip) {
+                        connections.get_mut(cid.as_slice())
+                    } else if connections.len() == 1 {
+                        connections.values_mut().next()
+                    } else {
+                        None
+                    };
+
+                    let Some(entry) = entry else {
+                        continue;
+                    };
+
+                    let max_quic_len = 1 + entry.conn.remote_cid().len() + 4
+                        + 1 + ip_payload.len() + entry.conn.tag_len();
+                    let max_frame_len = net::HEADER_SIZE + max_quic_len;
+
+                    if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
+                        if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
+                            match entry.conn.encrypt_datagram(
+                                ip_payload,
+                                None,
+                                &mut buf[net::HEADER_SIZE..],
+                            ) {
+                                Ok(result) => {
+                                    let remote_ip = match entry.remote_addr.ip() {
+                                        std::net::IpAddr::V4(ip) => ip,
+                                        _ => identity.remote_ip,
+                                    };
+                                    ip_id = ip_id.wrapping_add(1);
+                                    let actual_len = net::build_udp_packet_inplace(
+                                        &identity.local_mac,
+                                        &entry.remote_mac,
+                                        identity.local_ip,
+                                        remote_ip,
+                                        identity.local_port,
+                                        entry.remote_addr.port(),
+                                        result.len,
+                                        buf,
+                                        0,
+                                        ip_id,
+                                        checksum_mode,
+                                    );
+                                    tx_mbuf.truncate(actual_len as u16);
+                                    match checksum_mode {
+                                        ChecksumMode::HardwareUdpOnly => tx_mbuf.set_tx_udp_checksum_offload(),
+                                        ChecksumMode::HardwareFull => tx_mbuf.set_tx_full_checksum_offload(),
+                                        _ => {}
                                     }
-                                    Err(e) => {
-                                        tracing::trace!(error = %e, "quictun-quic encrypt failed");
-                                        // mbuf freed on drop (encrypt failed)
-                                    }
+                                    outer_tx_mbufs.push(tx_mbuf.into_raw());
+                                }
+                                Err(e) => {
+                                    tracing::trace!(error = %e, "quictun-quic encrypt failed");
                                 }
                             }
                         }
-                        inner_ip_count += 1;
-                    } else if let Some(conn) = state.connection.as_mut() {
-                        // Handshake still in progress: use quinn-proto path
-                        inner_rx += 1;
-                        // Zero-copy: transfer mbuf ownership to Bytes via MbufSlice.
-                        // The mbuf lives until quinn consumes/drops the datagram.
-                        let pkt = Bytes::from_owner(MbufSlice::new(mbuf, ETH_HLEN));
-                        if let Err(e) = conn.datagrams().send(pkt, true) {
-                            tracing::trace!(error = %e, "send_datagram failed (likely blocked)");
-                        }
-                        inner_ip_count += 1;
-                        continue; // mbuf owned by Bytes now, skip drop
                     }
                 }
                 0x0806 => {
@@ -506,7 +467,6 @@ pub fn run(
                                     let mut tx = [raw];
                                     let sent = port::tx_burst(inner.port_id, 0, &mut tx, 1);
                                     if sent == 0 {
-                                        // SAFETY: tx_burst didn't send; we still own this mbuf.
                                         unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                                     }
                                 }
@@ -518,7 +478,6 @@ pub fn run(
             }
             // mbuf freed on drop
         }
-        let _ = inner_ip_count;
 
         // Drain pending mbufs from previous iteration first.
         if !pending_outer_tx.is_empty() {
@@ -526,7 +485,6 @@ pub fn run(
             let sent = port::tx_burst(outer_port_id, queue_id, &mut pending_outer_tx, nb_pend);
             tx_pkts += sent as u64;
             if sent < nb_pend {
-                // Still can't drain — keep the unsent ones, drop oldest to prevent unbounded growth.
                 if pending_outer_tx.len() > 64 {
                     outer_tx_drop += (pending_outer_tx.len() - 64) as u64;
                     for raw in &pending_outer_tx[64..] {
@@ -534,7 +492,6 @@ pub fn run(
                     }
                     pending_outer_tx.truncate(64);
                 }
-                // Shift unsent to the front.
                 let unsent: Vec<_> = pending_outer_tx[sent as usize..].to_vec();
                 pending_outer_tx.clear();
                 pending_outer_tx.extend(unsent);
@@ -549,80 +506,109 @@ pub fn run(
             let sent = port::tx_burst(outer_port_id, queue_id, &mut outer_tx_mbufs, nb_tx);
             tx_pkts += sent as u64;
             if sent < nb_tx {
-                // Save unsent mbufs for next iteration instead of dropping.
                 pending_outer_tx.extend_from_slice(&outer_tx_mbufs[sent as usize..]);
             }
         }
 
-        // ── Phase 1c-3: quinn-proto processing ────────────────────
+        // ── Phase 2: Drive handshakes ────────────────────────────────
 
-        if quic_conn_state.is_none() {
-            // Handshake in progress — run quinn-proto state machine
-
-            if now >= deadline {
-                if let Some(conn) = state.connection.as_mut() {
-                    conn.handle_timeout(now);
-                }
-            }
-
-            shared::process_events(state, &mut drive_result);
-
-            {
-                let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
-                for datagram in &drive_result.datagrams {
-                    let frame_len = ETH_HLEN + datagram.len();
-                    if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
-                        if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
-                            buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                            buf[ETH_HLEN..frame_len].copy_from_slice(datagram);
-                            tx_mbufs.push(mbuf.into_raw());
-                            inner_tx += 1;
-                        }
-                    }
-                }
-                if !tx_mbufs.is_empty() {
-                    let nb = tx_mbufs.len() as u16;
-                    let sent = port::tx_burst(inner.port_id, 0, &mut tx_mbufs, nb);
-                    for raw in &tx_mbufs[sent as usize..] {
-                        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+        if !multi_state.handshakes.is_empty() {
+            // Handle timeouts.
+            for hs in multi_state.handshakes.values_mut() {
+                if let Some(timeout) = hs.connection.poll_timeout() {
+                    if now >= timeout {
+                        hs.connection.handle_timeout(now);
                     }
                 }
             }
 
-            // Capture quictun-quic state on first Connected event
-            if drive_result.connected {
-                if let Some(cs) = drive_result.connection_state.take() {
-                    tracing::info!("tunnel established via DPDK (quictun-quic data plane active)");
-                    quic_conn_state = Some(cs);
-                } else {
-                    tracing::info!("tunnel established via DPDK");
+            // Poll for completed handshakes.
+            let drive_result = multi_state.poll_handshakes();
+
+            for ch in drive_result.completed {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                    // Drain final handshake transmits.
+                    drain_handshake_transmits(
+                        &mut hs.connection,
+                        now,
+                        outer_port_id,
+                        queue_id,
+                        mempool,
+                        identity,
+                        arp_table,
+                        &mut transmit_buf,
+                        &mut tx_pkts,
+                        &mut ip_id,
+                        checksum_mode,
+                    );
+
+                    // Identify peer to get tunnel IP.
+                    let tunnel_ip = identify_peer_dpdk(&hs.connection, peers)
+                        .or_else(|| {
+                            // Single-peer fallback: skip identification.
+                            if peers.len() == 1 {
+                                Some(peers[0].tunnel_ip)
+                            } else {
+                                None
+                            }
+                        });
+
+                    let Some(tunnel_ip) = tunnel_ip else {
+                        tracing::warn!(
+                            remote = %hs.remote_addr,
+                            "could not identify peer, rejecting"
+                        );
+                        continue;
+                    };
+
+                    // Resolve remote MAC from ARP table.
+                    let remote_ip = match hs.remote_addr.ip() {
+                        std::net::IpAddr::V4(ip) => ip,
+                        _ => identity.remote_ip,
+                    };
+                    let remote_mac = arp_table
+                        .lookup(remote_ip)
+                        .or(identity.remote_mac)
+                        .unwrap_or([0xff; 6]);
+
+                    // Insert into connection table.
+                    let cid = conn_state.local_cid().to_vec();
+                    ip_to_cid.insert(tunnel_ip, cid.clone());
+                    connections.insert(
+                        cid.clone(),
+                        ConnectionEntry {
+                            conn: conn_state,
+                            tunnel_ip,
+                            remote_addr: hs.remote_addr,
+                            remote_mac,
+                        },
+                    );
+
+                    tracing::info!(
+                        tunnel_ip = %tunnel_ip,
+                        remote = %hs.remote_addr,
+                        cid = %hex::encode(&cid),
+                        "connection established"
+                    );
                 }
             }
-            if drive_result.connection_lost {
-                tracing::info!("connection lost, engine exiting");
-                break;
+
+            // Drain handshake transmits for in-progress connections.
+            for hs in multi_state.handshakes.values_mut() {
+                drain_handshake_transmits(
+                    &mut hs.connection,
+                    now,
+                    outer_port_id,
+                    queue_id,
+                    mempool,
+                    identity,
+                    arp_table,
+                    &mut transmit_buf,
+                    &mut tx_pkts,
+                    &mut ip_id,
+                    checksum_mode,
+                );
             }
-
-            drain_and_send(
-                state,
-                now,
-                outer_port_id,
-                queue_id,
-                mempool,
-                identity,
-                arp_table,
-                &mut transmit_buf,
-                &mut tx_pkts,
-                &mut ip_id,
-                checksum_mode,
-            )?;
-
-            deadline = if let Some(conn) = state.connection.as_mut() {
-                conn.poll_timeout()
-                    .unwrap_or(now + Duration::from_secs(1))
-            } else {
-                now + Duration::from_secs(1)
-            };
         }
 
         // Send pending raw frames (ARP replies, stateless QUIC responses).
@@ -631,8 +617,7 @@ pub fn run(
         // ── Refresh `now` when traffic is present ─────────────────────
         // During handshake: refreshed unconditionally at loop top (quinn-proto needs it).
         // After handshake: skip clock_gettime on empty polls (saves ~4% CPU at 8 Gbps).
-        // When packets arrive, refresh so stats and any LongHeader processing get fresh time.
-        if quic_conn_state.is_some() && (nb_rx > 0 || nb > 0) {
+        if multi_state.handshakes.is_empty() && (nb_rx > 0 || nb > 0) {
             now = Instant::now();
         }
 
@@ -648,6 +633,8 @@ pub fn run(
                 inner_tx_drop,
                 outer_tx_drop,
                 decrypt_fail,
+                connections = connections.len(),
+                handshakes = multi_state.handshakes.len(),
                 "dpdk engine stats"
             );
             last_stats = now;
@@ -741,8 +728,10 @@ fn drain_and_send(
                 *ip_id,
                 checksum_mode,
             );
-            if checksum_mode == ChecksumMode::HardwareOffload {
-                mbuf.set_tx_checksum_offload();
+            match checksum_mode {
+                ChecksumMode::HardwareUdpOnly => mbuf.set_tx_udp_checksum_offload(),
+                ChecksumMode::HardwareFull => mbuf.set_tx_full_checksum_offload(),
+                _ => {}
             }
             tx_mbufs.push(mbuf.into_raw());
         }
@@ -799,7 +788,7 @@ fn send_raw_frames(
 /// Result from handshake-only phase.
 pub struct HandshakeResult {
     /// quictun-quic connection state for the data plane.
-    pub conn_state: Arc<ConnectionState>,
+    pub conn_state: LocalConnectionState,
     /// Learned network identity (peer MAC, ports, etc.).
     pub identity: NetIdentity,
     /// Learned ARP entries.
@@ -1009,227 +998,184 @@ pub fn run_handshake_only(
     }
 }
 
-/// Run the quictun-quic data plane on a single worker core.
+// ── Multi-client dispatcher + worker loops ──────────────────────────────
+
+use quinn_proto::ConnectionId;
+use crate::dispatch::{ControlMessage, DpdkDispatchTable, WorkerRings};
+
+/// Run the multi-client dispatcher on core 0.
 ///
-/// This is the multi-core hot loop: no quinn-proto, no handshake logic.
-/// All workers share the same `Arc<ConnectionState>` for encrypt/decrypt.
-///
-/// Each worker has its own:
-/// - outer queue_id (RSS distributes outer RX, or software distributor later)
-/// - inner TAP port (for inner RX → encrypt → outer TX)
-///
-/// For Phase 2 MVP, all outer TX goes through the worker directly (no ordered
-/// queue yet — that requires core 0 drainer coordination). When outer RX
-/// multi-core is added (Step 2D), the ordered queue will be integrated.
+/// Core 0 reads all outer and inner RX, dispatches to workers via SPSC rings,
+/// collects inner TX from workers for inner port, and drives handshakes.
 #[allow(clippy::too_many_arguments)]
-pub fn run_quictun_multicore(
+pub fn run_dispatcher(
     outer_port_id: u16,
-    queue_id: u16,
     mempool: *mut ffi::rte_mempool,
-    conn_state: &Arc<ConnectionState>,
-    identity: &NetIdentity,
-    arp_table: &ArpTable,
+    multi_state: &mut MultiQuicState,
+    dispatch_table: &mut DpdkDispatchTable,
+    workers: &[WorkerRings],
+    identity: &mut NetIdentity,
+    arp_table: &mut ArpTable,
     inner: &InnerPort,
+    peers: &[PeerInfo],
     shutdown: &AtomicBool,
     adaptive_poll: bool,
     checksum_mode: ChecksumMode,
-    core_id: usize,
 ) -> Result<()> {
-    let mut ip_id: u16 = (core_id as u16).wrapping_mul(10000); // offset per core
+    let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    let mut pkt_buf = [0u8; 2048];
+    let mut ip_id: u16 = 0;
+    let mut rx_buf = BytesMut::with_capacity(2048);
+    let mut pending_frames: Vec<Vec<u8>> = Vec::new();
 
-    // Stats
+    // Stats.
     let mut rx_pkts: u64 = 0;
     let mut tx_pkts: u64 = 0;
-    let mut inner_rx: u64 = 0;
-    let mut inner_tx: u64 = 0;
-    let mut inner_tx_drop: u64 = 0;
-    let mut outer_tx_drop: u64 = 0;
-    let mut decrypt_fail: u64 = 0;
+    let mut dispatch_miss: u64 = 0;
     let mut last_stats = Instant::now();
 
-    // Adaptive polling state
+    // Adaptive polling state.
     let mut empty_polls: u32 = 0;
     let mut delay_us: u32 = MIN_DELAY_US;
     let mut now = Instant::now();
 
-    // Pre-allocated mbuf vectors
-    let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
-    let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
-    let mut pending_outer_tx: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+    // Reusable mbuf array for collecting inner TX from workers.
+    let mut inner_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] =
+        [std::ptr::null_mut(); BURST_SIZE];
 
-    tracing::info!(core = core_id, queue = queue_id, "quictun-quic worker started");
+    tracing::info!(n_workers = workers.len(), "dispatcher started on core 0");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            tracing::info!(core = core_id, "shutdown signal received");
+            tracing::info!("dispatcher: shutdown signal received");
             break;
         }
 
-        // ── Outer RX → decrypt → inner TX ──
-        inner_tx_mbufs.clear();
+        now = Instant::now();
+        let mut had_work = false;
+
+        // ── 1. Outer RX burst → dispatch by CID or feed handshake ──
 
         let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
-        let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
+        let nb_rx = port::rx_burst(outer_port_id, 0, &mut rx_mbufs, BURST_SIZE as u16);
 
         for i in 0..nb_rx as usize {
-            let mut mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
+            let mbuf = unsafe { Mbuf::from_raw(rx_mbufs[i]) };
             rx_pkts += 1;
+            let data = mbuf.data();
 
-            // Single data_mut() call; reborrows as &[u8] for read-only phases.
-            enum RxAction {
-                ShortHeader { payload_offset: usize, payload_len: usize },
-                Arp(net::ParsedArp),
-                Skip,
-            }
-
-            let data = mbuf.data_mut();
-
-            let action = {
-                match net::parse_packet(data) {
-                    Some(ParsedPacket::Udp(udp)) => {
-                        if udp.dst_ip != identity.local_ip
-                            || udp.dst_port != identity.local_port
-                            || udp.payload.is_empty()
-                            || udp.payload[0] & 0x80 != 0
-                        {
-                            RxAction::Skip
-                        } else {
-                            let payload_offset = unsafe {
-                                udp.payload.as_ptr().offset_from(data.as_ptr()) as usize
-                            };
-                            RxAction::ShortHeader {
-                                payload_offset,
-                                payload_len: udp.payload.len(),
-                            }
-                        }
+            match net::parse_packet(data) {
+                Some(ParsedPacket::Udp(udp)) => {
+                    if udp.payload.is_empty() {
+                        continue;
                     }
-                    Some(ParsedPacket::Arp(arp)) => RxAction::Arp(arp),
-                    None => RxAction::Skip,
-                }
-            };
 
-            match action {
-                RxAction::ShortHeader { payload_offset, payload_len } => {
-                    match conn_state.decrypt_packet_in_place(
-                        &mut data[payload_offset..payload_offset + payload_len],
-                    ) {
-                        Ok(decrypted) => {
-                            if let Some(ref ack) = decrypted.ack {
-                                conn_state.process_ack(ack);
-                            }
-                            for range in &decrypted.datagrams {
-                                let abs_start = payload_offset + range.start;
-                                let abs_end = payload_offset + range.end;
-                                let datagram_len = abs_end - abs_start;
-                                let frame_len = ETH_HLEN + datagram_len;
-                                if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
-                                    if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
-                                        buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                                        buf[ETH_HLEN..frame_len]
-                                            .copy_from_slice(&data[abs_start..abs_end]);
-                                        inner_tx_mbufs.push(out_mbuf.into_raw());
-                                        inner_tx += 1;
-                                    }
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            decrypt_fail += 1;
-                        }
+                    // Learn MAC/port.
+                    arp_table.learn(udp.src_ip, udp.src_mac);
+                    if identity.remote_mac.is_none() {
+                        identity.remote_mac = Some(udp.src_mac);
                     }
-                }
-                RxAction::Arp(arp) => {
-                    if arp.is_request && arp.target_ip == identity.local_ip {
-                        let reply =
-                            net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
-                        if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
-                            if reply_mbuf.write_packet(&reply).is_ok() {
-                                let raw = reply_mbuf.into_raw();
-                                let mut tx = [raw];
-                                let sent =
-                                    port::tx_burst(outer_port_id, queue_id, &mut tx, 1);
-                                if sent == 0 {
+
+                    let first_byte = udp.payload[0];
+                    if first_byte & 0x80 == 0 {
+                        // Short header → dispatch by CID.
+                        let cid_offset = 1; // first byte of CID after header byte
+                        // CID length: use endpoint's expected CID length (default 8).
+                        let cid_len = 8usize; // TODO: make configurable
+                        if udp.payload.len() >= 1 + cid_len {
+                            let cid_bytes = &udp.payload[cid_offset..cid_offset + cid_len];
+                            if let Some(worker_id) = dispatch_table.lookup_cid(cid_bytes) {
+                                // Enqueue raw mbuf to worker. Worker decrypts in-place.
+                                let raw = mbuf.into_raw();
+                                if !workers[worker_id].outer_rx.enqueue(raw) {
+                                    // Ring full — drop packet.
                                     unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                                 }
+                            } else {
+                                dispatch_miss += 1;
                             }
+                        }
+                    } else {
+                        // Long header → handshake via quinn-proto.
+                        rx_buf.clear();
+                        rx_buf.extend_from_slice(udp.payload);
+                        let quic_data = rx_buf.split();
+                        let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
+
+                        let responses = multi_state.handle_incoming(
+                            now, remote_addr, udp.ecn, quic_data,
+                            &mut response_buf,
+                        );
+
+                        for (len, buf) in responses {
+                            let dst_mac = identity
+                                .remote_mac
+                                .or_else(|| arp_table.lookup(identity.remote_ip))
+                                .unwrap_or([0xff; 6]);
+                            ip_id = ip_id.wrapping_add(1);
+                            let frame_len = net::build_udp_packet(
+                                &identity.local_mac, &dst_mac,
+                                identity.local_ip, udp.src_ip,
+                                identity.local_port, udp.src_port,
+                                &buf[..len], &mut pkt_buf,
+                                0, ip_id, checksum_mode,
+                            );
+                            pending_frames.push(pkt_buf[..frame_len].to_vec());
                         }
                     }
                 }
-                RxAction::Skip => {}
-            }
-        }
-
-        // Batch send to inner
-        if !inner_tx_mbufs.is_empty() {
-            let nb = inner_tx_mbufs.len() as u16;
-            let mut sent = port::tx_burst(inner.port_id, 0, &mut inner_tx_mbufs, nb);
-            if sent < nb {
-                let remaining = &mut inner_tx_mbufs[sent as usize..];
-                sent += port::tx_burst(inner.port_id, 0, remaining, remaining.len() as u16);
-            }
-            if sent < nb {
-                inner_tx_drop += (nb - sent) as u64;
-                for raw in &inner_tx_mbufs[sent as usize..] {
-                    unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+                Some(ParsedPacket::Arp(arp)) => {
+                    arp_table.learn(arp.sender_ip, arp.sender_mac);
+                    if arp.is_request && arp.target_ip == identity.local_ip {
+                        let reply = net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
+                        pending_frames.push(reply);
+                    }
                 }
+                None => {}
             }
         }
 
-        // ── Inner RX → encrypt → outer TX ──
+        if nb_rx > 0 {
+            had_work = true;
+        }
+
+        // ── 2. Inner RX burst → dispatch by dest IP ──
+
         let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
-        let inner_burst = if !pending_outer_tx.is_empty() { 0 } else { INNER_BURST_SIZE };
-        let nb = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, inner_burst);
+        let nb_inner = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, BURST_SIZE as u16);
 
-        outer_tx_mbufs.clear();
-
-        for i in 0..nb as usize {
+        for i in 0..nb_inner as usize {
             let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
             let data = mbuf.data();
+
             if data.len() < ETH_HLEN {
                 continue;
             }
             let ethertype = u16::from_be_bytes([data[12], data[13]]);
             match ethertype {
                 0x0800 => {
-                    inner_rx += 1;
-                    let ip_payload = &data[ETH_HLEN..];
-                    let max_quic_len = 1 + conn_state.remote_cid().len() + 4
-                        + 1 + ip_payload.len() + conn_state.tag_len();
-                    let max_frame_len = net::HEADER_SIZE + max_quic_len;
-
-                    if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
-                        if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
-                            match conn_state.encrypt_datagram(
-                                ip_payload, None, &mut buf[net::HEADER_SIZE..],
-                            ) {
-                                Ok(result) => {
-                                    let dst_mac = identity.remote_mac
-                                        .or_else(|| arp_table.lookup(identity.remote_ip))
-                                        .unwrap_or([0xff; 6]);
-                                    ip_id = ip_id.wrapping_add(1);
-                                    let actual_len = net::build_udp_packet_inplace(
-                                        &identity.local_mac, &dst_mac,
-                                        identity.local_ip, identity.remote_ip,
-                                        identity.local_port, identity.remote_port,
-                                        result.len, buf, 0, ip_id, checksum_mode,
-                                    );
-                                    tx_mbuf.truncate(actual_len as u16);
-                                    if checksum_mode == ChecksumMode::HardwareOffload {
-                                        tx_mbuf.set_tx_checksum_offload();
-                                    }
-                                    outer_tx_mbufs.push(tx_mbuf.into_raw());
-                                }
-                                Err(e) => {
-                                    tracing::trace!(core = core_id, error = %e, "encrypt failed");
-                                }
+                    // IPv4: extract dest IP, dispatch to worker.
+                    if data.len() >= ETH_HLEN + 20 {
+                        let dst_ip = Ipv4Addr::new(
+                            data[ETH_HLEN + 16],
+                            data[ETH_HLEN + 17],
+                            data[ETH_HLEN + 18],
+                            data[ETH_HLEN + 19],
+                        );
+                        if let Some(worker_id) = dispatch_table.lookup_ip(dst_ip) {
+                            let raw = mbuf.into_raw();
+                            if !workers[worker_id].inner_rx.enqueue(raw) {
+                                unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                             }
                         }
+                        // No route = drop (unknown dest IP).
                     }
                 }
                 0x0806 => {
-                    // Inner ARP reply
+                    // Inner ARP reply.
                     if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
                         if arp.is_request {
                             let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
@@ -1251,56 +1197,112 @@ pub fn run_quictun_multicore(
             }
         }
 
-        // Drain pending outer TX
-        if !pending_outer_tx.is_empty() {
-            let nb_pend = pending_outer_tx.len() as u16;
-            let sent = port::tx_burst(outer_port_id, queue_id, &mut pending_outer_tx, nb_pend);
-            tx_pkts += sent as u64;
-            if sent < nb_pend {
-                if pending_outer_tx.len() > 64 {
-                    outer_tx_drop += (pending_outer_tx.len() - 64) as u64;
-                    for raw in &pending_outer_tx[64..] {
-                        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
-                    }
-                    pending_outer_tx.truncate(64);
+        if nb_inner > 0 {
+            had_work = true;
+        }
+
+        // ── 3. Drain worker inner_tx rings → inner port TX ──
+
+        for worker in workers {
+            let nb = worker.inner_tx.dequeue_burst(&mut inner_tx_collect);
+            if nb > 0 {
+                had_work = true;
+                let sent = port::tx_burst(inner.port_id, 0, &mut inner_tx_collect[..nb as usize], nb as u16);
+                for j in sent as usize..nb as usize {
+                    unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_collect[j]) };
                 }
-                let unsent: Vec<_> = pending_outer_tx[sent as usize..].to_vec();
-                pending_outer_tx.clear();
-                pending_outer_tx.extend(unsent);
-            } else {
-                pending_outer_tx.clear();
             }
         }
 
-        // Batch outer TX
-        if !outer_tx_mbufs.is_empty() {
-            let nb_tx = outer_tx_mbufs.len() as u16;
-            let sent = port::tx_burst(outer_port_id, queue_id, &mut outer_tx_mbufs, nb_tx);
-            tx_pkts += sent as u64;
-            if sent < nb_tx {
-                pending_outer_tx.extend_from_slice(&outer_tx_mbufs[sent as usize..]);
+        // ── 4. Drive handshakes ──
+
+        let drive_result = multi_state.poll_handshakes();
+
+        for ch in drive_result.completed {
+            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                // Identify peer by certificate.
+                let tunnel_ip = identify_peer_dpdk(&hs.connection, peers);
+                let Some(tunnel_ip) = tunnel_ip else {
+                    tracing::warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                    continue;
+                };
+
+                // Assign to least-loaded worker.
+                let worker_id = dispatch_table.least_loaded_worker();
+                let local_cid = hs.local_cid;
+                dispatch_table.register_cid(&local_cid, worker_id);
+                dispatch_table.add_route(tunnel_ip, worker_id);
+
+                // Resolve remote MAC from ARP table or use learned identity MAC.
+                let remote_ip = match hs.remote_addr.ip() {
+                    std::net::IpAddr::V4(ip) => ip,
+                    _ => identity.remote_ip,
+                };
+                let remote_mac = arp_table.lookup(remote_ip)
+                    .or(identity.remote_mac)
+                    .unwrap_or([0xff; 6]);
+
+                // Drain final handshake transmits.
+                drain_handshake_transmits(
+                    &mut hs.connection, now, outer_port_id, 0, mempool,
+                    identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+                    checksum_mode,
+                );
+
+                // Send control message to worker.
+                if let Ok(mut ctrl) = workers[worker_id].control.lock() {
+                    ctrl.push(ControlMessage::AddConnection {
+                        conn: conn_state,
+                        tunnel_ip,
+                        remote_addr: hs.remote_addr,
+                        remote_mac,
+                    });
+                }
+
+                tracing::info!(
+                    tunnel_ip = %tunnel_ip,
+                    worker = worker_id,
+                    cid = %hex::encode(&local_cid[..]),
+                    "connection assigned to worker"
+                );
             }
         }
 
-        // Refresh `now` when traffic is present (skip clock_gettime on empty polls).
-        if nb_rx > 0 || nb > 0 {
-            now = Instant::now();
+        // Drain handshake transmits for in-progress connections.
+        for hs in multi_state.handshakes.values_mut() {
+            drain_handshake_transmits(
+                &mut hs.connection, now, outer_port_id, 0, mempool,
+                identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+                checksum_mode,
+            );
         }
 
-        // Stats
+        // Handle timeouts.
+        for hs in multi_state.handshakes.values_mut() {
+            let timeout = hs.connection.poll_timeout();
+            if let Some(t) = timeout {
+                if now >= t {
+                    hs.connection.handle_timeout(now);
+                }
+            }
+        }
+
+        // ── 5. Send pending raw frames ──
+        send_raw_frames(outer_port_id, 0, mempool, &mut pending_frames, &mut tx_pkts)?;
+
+        // ── Stats ──
         if now.duration_since(last_stats).as_secs() >= 2 {
             tracing::info!(
-                core = core_id,
-                rx_pkts, tx_pkts, inner_rx, inner_tx,
-                inner_tx_drop, outer_tx_drop, decrypt_fail,
-                "worker stats"
+                rx_pkts, tx_pkts, dispatch_miss,
+                handshakes = multi_state.handshakes.len(),
+                "dispatcher stats"
             );
             last_stats = now;
         }
 
-        // Adaptive polling
+        // ── Adaptive polling ──
         if adaptive_poll {
-            if nb_rx == 0 && nb == 0 {
+            if !had_work {
                 empty_polls += 1;
                 if empty_polls > EMPTY_POLL_THRESHOLD {
                     std::thread::sleep(Duration::from_micros(delay_us as u64));
@@ -1313,9 +1315,358 @@ pub fn run_quictun_multicore(
         }
     }
 
-    // Free any remaining pending mbufs
-    for raw in &pending_outer_tx {
-        unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
+    Ok(())
+}
+
+/// Drain transmits from a quinn-proto connection during handshake.
+#[allow(clippy::too_many_arguments)]
+fn drain_handshake_transmits(
+    conn: &mut quinn_proto::Connection,
+    now: Instant,
+    outer_port_id: u16,
+    queue_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    identity: &NetIdentity,
+    arp_table: &ArpTable,
+    transmit_buf: &mut Vec<u8>,
+    tx_count: &mut u64,
+    ip_id: &mut u16,
+    checksum_mode: ChecksumMode,
+) {
+    loop {
+        transmit_buf.clear();
+        let Some(transmit) = conn.poll_transmit(now, MAX_GSO_SEGMENTS, transmit_buf) else {
+            break;
+        };
+        let data = &transmit_buf[..transmit.size];
+
+        // Use transmit.destination for per-connection addressing (multi-client safe).
+        let dst_ip = match transmit.destination {
+            SocketAddr::V4(v4) => *v4.ip(),
+            _ => identity.remote_ip,
+        };
+        let dst_port = transmit.destination.port();
+        let dst_mac = arp_table
+            .lookup(dst_ip)
+            .or(identity.remote_mac)
+            .unwrap_or([0xff; 6]);
+
+        let seg_size = transmit.segment_size.unwrap_or(data.len());
+
+        for chunk in data.chunks(seg_size) {
+            *ip_id = ip_id.wrapping_add(1);
+            let frame_len = net::HEADER_SIZE + chunk.len();
+            if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                    net::build_udp_packet(
+                        &identity.local_mac, &dst_mac,
+                        identity.local_ip, dst_ip,
+                        identity.local_port, dst_port,
+                        chunk, buf, 0, *ip_id, checksum_mode,
+                    );
+                    match checksum_mode {
+                        ChecksumMode::HardwareUdpOnly => mbuf.set_tx_udp_checksum_offload(),
+                        ChecksumMode::HardwareFull => mbuf.set_tx_full_checksum_offload(),
+                        _ => {}
+                    }
+                    let raw = mbuf.into_raw();
+                    let mut tx = [raw];
+                    let sent = port::tx_burst(outer_port_id, queue_id, &mut tx, 1);
+                    *tx_count += sent as u64;
+                    if sent == 0 {
+                        unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Identify a peer by matching their certificate against known peer SPKI DERs.
+fn identify_peer_dpdk(
+    conn: &quinn_proto::Connection,
+    peers: &[PeerInfo],
+) -> Option<Ipv4Addr> {
+    let identity = conn.crypto_session().peer_identity()?;
+    let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity.downcast_ref()?;
+    let peer_cert = certs.first()?;
+    let peer_der: &[u8] = peer_cert.as_ref();
+
+    // Match against known peer SPKI DERs.
+    peers.iter().find(|p| p.spki_der == peer_der).map(|p| p.tunnel_ip)
+}
+
+/// Run a multi-client worker on a dedicated core.
+///
+/// Each worker owns per-connection `LocalConnectionState` (no sharing).
+/// Receives mbufs from dispatcher via SPSC rings, encrypts/decrypts, and
+/// TX directly to outer port on its own TX queue.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker(
+    outer_port_id: u16,
+    tx_queue_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    rings: &WorkerRings,
+    inner_eth_hdr: &InnerEthHeader,
+    identity: &NetIdentity,
+    shutdown: &AtomicBool,
+    adaptive_poll: bool,
+    checksum_mode: ChecksumMode,
+    core_id: usize,
+) -> Result<()> {
+    // Per-connection state: CID → connection entry.
+    let mut connections: HashMap<Vec<u8>, ConnectionEntry> = HashMap::new();
+    // IP → CID lookup for inner RX routing.
+    let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
+
+    let mut ip_id: u16 = (core_id as u16).wrapping_mul(10000);
+
+    // Stats.
+    let mut rx_pkts: u64 = 0;
+    let mut tx_pkts: u64 = 0;
+    let mut inner_rx: u64 = 0;
+    let mut decrypt_fail: u64 = 0;
+    let mut last_stats = Instant::now();
+
+    // Adaptive polling.
+    let mut empty_polls: u32 = 0;
+    let mut delay_us: u32 = MIN_DELAY_US;
+    let mut now = Instant::now();
+
+    // Reusable mbuf arrays.
+    let mut outer_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+        [std::ptr::null_mut(); BURST_SIZE];
+    let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+        [std::ptr::null_mut(); BURST_SIZE];
+    let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+    let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
+
+    tracing::info!(core = core_id, tx_queue = tx_queue_id, "worker started");
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!(core = core_id, "worker: shutdown signal received");
+            break;
+        }
+
+        let mut had_work = false;
+
+        // ── 0. Check control channel ──
+        if let Ok(mut ctrl) = rings.control.try_lock() {
+            for msg in ctrl.drain(..) {
+                match msg {
+                    ControlMessage::AddConnection { conn, tunnel_ip, remote_addr, remote_mac } => {
+                        let cid = conn.local_cid().to_vec();
+                        tracing::info!(
+                            core = core_id,
+                            tunnel_ip = %tunnel_ip,
+                            cid = %hex::encode(&cid),
+                            "worker: added connection"
+                        );
+                        ip_to_cid.insert(tunnel_ip, cid.clone());
+                        connections.insert(cid, ConnectionEntry {
+                            conn,
+                            tunnel_ip,
+                            remote_addr,
+                            remote_mac,
+                        });
+                    }
+                    ControlMessage::RemoveConnection { cid } => {
+                        let key: &[u8] = cid.as_ref();
+                        if let Some(entry) = connections.remove(key) {
+                            ip_to_cid.remove(&entry.tunnel_ip);
+                            tracing::info!(
+                                core = core_id,
+                                tunnel_ip = %entry.tunnel_ip,
+                                "worker: removed connection"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 1. Outer RX: dequeue from ring → decrypt → enqueue inner TX ──
+
+        let nb_rx = rings.outer_rx.dequeue_burst(&mut outer_rx_mbufs);
+        inner_tx_mbufs.clear();
+
+        for i in 0..nb_rx as usize {
+            let mut mbuf = unsafe { Mbuf::from_raw(outer_rx_mbufs[i]) };
+            rx_pkts += 1;
+            let data = mbuf.data_mut();
+
+            // Parse to get UDP payload.
+            let Some(ParsedPacket::Udp(udp)) = net::parse_packet(data) else {
+                continue;
+            };
+            if udp.payload.is_empty() || udp.payload[0] & 0x80 != 0 {
+                continue;
+            }
+
+            let payload_offset = unsafe {
+                udp.payload.as_ptr().offset_from(data.as_ptr()) as usize
+            };
+            let payload_len = udp.payload.len();
+
+            // Extract CID to find connection.
+            let cid_len = 8usize; // TODO: make configurable
+            if payload_len < 1 + cid_len {
+                continue;
+            }
+            let cid_bytes = &data[payload_offset + 1..payload_offset + 1 + cid_len];
+
+            let Some(entry) = connections.get_mut(cid_bytes) else {
+                decrypt_fail += 1;
+                continue;
+            };
+
+            match entry.conn.decrypt_packet_in_place(
+                &mut data[payload_offset..payload_offset + payload_len],
+            ) {
+                Ok(decrypted) => {
+                    if let Some(ref ack) = decrypted.ack {
+                        entry.conn.process_ack(ack);
+                    }
+                    for range in &decrypted.datagrams {
+                        let abs_start = payload_offset + range.start;
+                        let abs_end = payload_offset + range.end;
+                        let datagram_len = abs_end - abs_start;
+                        let frame_len = ETH_HLEN + datagram_len;
+                        if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
+                            if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
+                                buf[..ETH_HLEN].copy_from_slice(&inner_eth_hdr.bytes);
+                                buf[ETH_HLEN..frame_len]
+                                    .copy_from_slice(&data[abs_start..abs_end]);
+                                inner_tx_mbufs.push(out_mbuf.into_raw());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    decrypt_fail += 1;
+                }
+            }
+        }
+
+        if nb_rx > 0 {
+            had_work = true;
+        }
+
+        // Enqueue inner TX mbufs back to dispatcher via ring.
+        if !inner_tx_mbufs.is_empty() {
+            let enqueued = rings.inner_tx.enqueue_burst(&inner_tx_mbufs);
+            // Free any that didn't fit.
+            for j in enqueued as usize..inner_tx_mbufs.len() {
+                unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_mbufs[j]) };
+            }
+        }
+
+        // ── 2. Inner RX: dequeue from ring → encrypt → TX directly to outer port ──
+
+        let nb_inner = rings.inner_rx.dequeue_burst(&mut inner_rx_mbufs);
+        outer_tx_mbufs.clear();
+
+        for i in 0..nb_inner as usize {
+            let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
+            let data = mbuf.data();
+            if data.len() < ETH_HLEN + 20 {
+                continue;
+            }
+            let ethertype = u16::from_be_bytes([data[12], data[13]]);
+            if ethertype != 0x0800 {
+                continue;
+            }
+
+            inner_rx += 1;
+            let ip_payload = &data[ETH_HLEN..];
+
+            // Find connection by dest IP.
+            let dst_ip = Ipv4Addr::new(
+                data[ETH_HLEN + 16], data[ETH_HLEN + 17],
+                data[ETH_HLEN + 18], data[ETH_HLEN + 19],
+            );
+            let Some(cid) = ip_to_cid.get(&dst_ip) else {
+                continue;
+            };
+            let Some(entry) = connections.get_mut(cid.as_slice()) else {
+                continue;
+            };
+
+            let max_quic_len = 1 + entry.conn.remote_cid().len() + 4
+                + 1 + ip_payload.len() + entry.conn.tag_len();
+            let max_frame_len = net::HEADER_SIZE + max_quic_len;
+
+            if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
+                if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
+                    match entry.conn.encrypt_datagram(
+                        ip_payload, None, &mut buf[net::HEADER_SIZE..],
+                    ) {
+                        Ok(result) => {
+                            ip_id = ip_id.wrapping_add(1);
+                            let actual_len = net::build_udp_packet_inplace(
+                                &identity.local_mac, &entry.remote_mac,
+                                identity.local_ip, identity.remote_ip,
+                                identity.local_port, entry.remote_addr.port(),
+                                result.len, buf, 0, ip_id, checksum_mode,
+                            );
+                            tx_mbuf.truncate(actual_len as u16);
+                            match checksum_mode {
+                                ChecksumMode::HardwareUdpOnly => tx_mbuf.set_tx_udp_checksum_offload(),
+                                ChecksumMode::HardwareFull => tx_mbuf.set_tx_full_checksum_offload(),
+                                _ => {}
+                            }
+                            outer_tx_mbufs.push(tx_mbuf.into_raw());
+                        }
+                        Err(e) => {
+                            tracing::trace!(core = core_id, error = %e, "encrypt failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        if nb_inner > 0 {
+            had_work = true;
+        }
+
+        // TX directly to outer port on this worker's queue.
+        if !outer_tx_mbufs.is_empty() {
+            let nb_tx = outer_tx_mbufs.len() as u16;
+            let sent = port::tx_burst(outer_port_id, tx_queue_id, &mut outer_tx_mbufs, nb_tx);
+            tx_pkts += sent as u64;
+            for j in sent as usize..outer_tx_mbufs.len() {
+                unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_mbufs[j]) };
+            }
+        }
+
+        // ── Stats ──
+        if had_work {
+            now = Instant::now();
+        }
+        if now.duration_since(last_stats).as_secs() >= 2 {
+            tracing::info!(
+                core = core_id,
+                rx_pkts, tx_pkts, inner_rx, decrypt_fail,
+                connections = connections.len(),
+                "worker stats"
+            );
+            last_stats = now;
+        }
+
+        // ── Adaptive polling ──
+        if adaptive_poll {
+            if !had_work {
+                empty_polls += 1;
+                if empty_polls > EMPTY_POLL_THRESHOLD {
+                    std::thread::sleep(Duration::from_micros(delay_us as u64));
+                    delay_us = delay_us.saturating_mul(2).min(MAX_DELAY_US);
+                }
+            } else {
+                empty_polls = 0;
+                delay_us = MIN_DELAY_US;
+            }
+        }
     }
 
     Ok(())

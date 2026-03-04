@@ -45,7 +45,6 @@ pub fn run(
     no_udp_checksum: bool,
     offload: bool,
     fast: bool,
-    legacy_parallel: bool,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -91,7 +90,6 @@ pub fn run(
     if fast {
         return rt.block_on(run_async_fast(
             config_path,
-            serial,
             cc,
             recv_buf,
             send_buf,
@@ -99,7 +97,6 @@ pub fn run(
             initial_rtt,
             pin_mtu,
             offload,
-            legacy_parallel,
         ));
     }
 
@@ -237,6 +234,13 @@ fn run_dpdk(
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
+    // Parse all peer public keys for server config and peer identification.
+    let all_peer_pubkeys: Vec<PublicKey> = config
+        .peer
+        .iter()
+        .map(|p| PublicKey::from_base64(&p.public_key).expect("invalid peer public_key"))
+        .collect();
+
     let setup = match role {
         Role::Connector => {
             let cc = quictun_dpdk::quic::build_proto_client_config(
@@ -251,14 +255,34 @@ fn run_dpdk(
             }
         }
         Role::Listener => {
+            // Always pass ALL peer public keys (not just peer[0]).
             let sc = quictun_dpdk::quic::build_proto_server_config(
-                &private_key, &[peer_pubkey], keepalive, &tuning,
+                &private_key, &all_peer_pubkeys, keepalive, &tuning,
             )?;
             quictun_dpdk::event_loop::EndpointSetup::Listener {
                 server_config: sc,
             }
         }
     };
+
+    // Always build peer configs for identification (listener and connector).
+    let dpdk_peers: Vec<quictun_dpdk::event_loop::DpdkPeerConfig> = config
+        .peer
+        .iter()
+        .zip(all_peer_pubkeys.iter())
+        .map(|(p, pubkey)| {
+            let tunnel_ip: std::net::Ipv4Addr = p
+                .allowed_ips
+                .first()
+                .and_then(|cidr| cidr.split('/').next())
+                .and_then(|ip| ip.parse().ok())
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+            quictun_dpdk::event_loop::DpdkPeerConfig {
+                spki_der: pubkey.spki_der().to_vec(),
+                tunnel_ip,
+            }
+        })
+        .collect();
 
     let dpdk_config = quictun_dpdk::event_loop::DpdkConfig {
         mode: dpdk_mode.to_string(),
@@ -275,6 +299,7 @@ fn run_dpdk(
         adaptive_poll: !no_adaptive_poll,
         n_cores: dpdk_cores,
         no_udp_checksum,
+        peers: dpdk_peers,
     };
 
     quictun_dpdk::event_loop::run(local_addr, setup, dpdk_config)
@@ -853,7 +878,6 @@ async fn run_async(
 #[allow(clippy::too_many_arguments)]
 async fn run_async_fast(
     config_path: &str,
-    serial: bool,
     cc: CongestionControl,
     recv_buf: usize,
     send_buf: usize,
@@ -861,7 +885,6 @@ async fn run_async_fast(
     initial_rtt: u64,
     pin_mtu: bool,
     offload: bool,
-    legacy_parallel: bool,
 ) -> Result<()> {
     use quictun_core::tunnel::TunnelResult;
 
@@ -1109,82 +1132,12 @@ async fn run_async_fast(
     let mut backoff_secs: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
 
-    let parallel = !serial;
-
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        let result = if legacy_parallel {
-            let handshake_result = match proto_driver::run_handshake(&udp, &setup, &shutdown_rx).await {
-                Ok(r) => {
-                    backoff_secs = 1;
-                    r
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "handshake failed");
-                    if reconnect_interval.is_some() {
-                        let jitter_ms = (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos()
-                            % 1000) as u64;
-                        let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
-                        tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
-                        tokio::time::sleep(delay).await;
-                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                        continue;
-                    }
-                    return Err(e).context("handshake failed");
-                }
-            };
-
-            tracing::info!(
-                remote = %handshake_result.remote_addr,
-                "connection established, switching to fast data plane (legacy parallel)"
-            );
-
-            if cfg!(target_os = "linux") && offload && parallel {
-                #[cfg(target_os = "linux")]
-                {
-                    fast_tunnel::run_fast_forwarding_loop_offload(
-                        handshake_result.connection_state,
-                        udp.clone(),
-                        tun.clone(),
-                        handshake_result.remote_addr,
-                        idle_timeout,
-                        keepalive,
-                        shutdown_rx.clone(),
-                    )
-                    .await
-                }
-                #[cfg(not(target_os = "linux"))]
-                unreachable!()
-            } else if parallel {
-                fast_tunnel::run_fast_forwarding_loop_parallel(
-                    handshake_result.connection_state,
-                    udp.clone(),
-                    tun.clone(),
-                    handshake_result.remote_addr,
-                    idle_timeout,
-                    keepalive,
-                    shutdown_rx.clone(),
-                )
-                .await
-            } else {
-                fast_tunnel::run_fast_forwarding_loop(
-                    &handshake_result.connection_state,
-                    &udp,
-                    &tun,
-                    handshake_result.remote_addr,
-                    idle_timeout,
-                    keepalive,
-                    shutdown_rx.clone(),
-                )
-                .await
-            }
-        } else {
+        let result = {
             let handshake_result = match proto_driver::run_handshake_local(&udp, &setup, &shutdown_rx).await {
                 Ok(r) => {
                     backoff_secs = 1;
@@ -1210,7 +1163,7 @@ async fn run_async_fast(
 
             tracing::info!(
                 remote = %handshake_result.remote_addr,
-                "connection established, switching to fast data plane (single-task)"
+                "connection established, switching to fast data plane"
             );
 
             fast_tunnel::run_fast_loop(

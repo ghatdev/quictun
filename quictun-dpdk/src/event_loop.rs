@@ -6,30 +6,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use crate::dispatch::{DpdkDispatchTable, PeerInfo, WorkerRings};
 use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
 use crate::mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity};
 use crate::port;
-use crate::shared::QuicState;
+use crate::shared::MultiQuicState;
 use crate::veth::VethPair;
-
-/// Wrapper around `*mut T` that implements `Send`.
-///
-/// SAFETY: The caller must ensure that the pointee is safe to access from another
-/// thread.  DPDK mempools (`rte_mempool`) are thread-safe by design — they use
-/// per-lcore caches and internal locking — so sharing the pointer across engine
-/// threads is correct.
-#[derive(Clone, Copy)]
-struct SendPtr<T>(*mut T);
-unsafe impl<T> Send for SendPtr<T> {}
-
-impl<T> SendPtr<T> {
-    fn as_ptr(self) -> *mut T {
-        self.0
-    }
-}
 
 /// QUIC endpoint setup (connector or listener), same pattern as quictun-uring.
 pub enum EndpointSetup {
@@ -40,6 +25,28 @@ pub enum EndpointSetup {
     Listener {
         server_config: Arc<quinn_proto::ServerConfig>,
     },
+}
+
+/// Wrapper around `*mut T` that implements `Send`.
+///
+/// SAFETY: The caller must ensure that the pointee is safe to access from another
+/// thread. DPDK mempools (`rte_mempool`) are thread-safe by design.
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn as_ptr(self) -> *mut T {
+        self.0
+    }
+}
+
+/// Peer info for multi-client DPDK (used for peer identification after handshake).
+pub struct DpdkPeerConfig {
+    /// Peer's public key SPKI DER (for identity matching).
+    pub spki_der: Vec<u8>,
+    /// Tunnel IP assigned to this peer.
+    pub tunnel_ip: Ipv4Addr,
 }
 
 /// DPDK-specific configuration from CLI flags.
@@ -73,6 +80,8 @@ pub struct DpdkConfig {
     pub n_cores: usize,
     /// Skip UDP checksum entirely (write 0x0000). Valid for IPv4, useful for benchmarking.
     pub no_udp_checksum: bool,
+    /// Peer configurations for peer identification (listener with >1 peer).
+    pub peers: Vec<DpdkPeerConfig>,
 }
 
 /// Run the DPDK data plane.
@@ -127,7 +136,7 @@ pub fn run(
     let mempool =
         mbuf::create_mempool("quictun_dpdk", ffi::DEFAULT_NUM_MBUFS, ffi::MEMPOOL_CACHE_SIZE)?;
 
-    let (local_mac, hw_cksum_offload) = if n_cores > 1 {
+    let (local_mac, hw_udp_cksum, hw_ip_cksum) = if n_cores > 1 {
         port::configure_port_multiqueue(dpdk_config.port_id, n_cores as u16, mempool)?
     } else {
         port::configure_port(dpdk_config.port_id, mempool)?
@@ -137,9 +146,12 @@ pub fn run(
     let checksum_mode = if dpdk_config.no_udp_checksum {
         tracing::info!("UDP checksum disabled (--no-udp-checksum)");
         ChecksumMode::None
-    } else if hw_cksum_offload {
-        tracing::info!("using hardware TX checksum offload");
-        ChecksumMode::HardwareOffload
+    } else if hw_udp_cksum && hw_ip_cksum {
+        tracing::info!("using hardware TX checksum offload (UDP + IP)");
+        ChecksumMode::HardwareFull
+    } else if hw_udp_cksum {
+        tracing::info!("using hardware TX UDP checksum offload (IP in software)");
+        ChecksumMode::HardwareUdpOnly
     } else {
         tracing::info!("using optimized software UDP checksum");
         ChecksumMode::Software
@@ -175,21 +187,13 @@ pub fn run(
 
     // ── 4. Build QUIC state ──────────────────────────────────────
 
-    // For DPDK, the QUIC endpoint uses our DPDK IP:port, not the kernel socket.
-    let _quic_local_addr = SocketAddr::new(dpdk_config.local_ip.into(), local_port);
-    let quic_remote_addr = match &setup {
-        EndpointSetup::Connector { remote_addr, .. } => *remote_addr,
-        // Listener: unknown until first packet.
-        EndpointSetup::Listener { .. } => SocketAddr::new(dpdk_config.remote_ip.into(), 0),
-    };
-
     let is_connector = matches!(&setup, EndpointSetup::Connector { .. });
 
-    let server_config = match &setup {
-        EndpointSetup::Listener { server_config } => Some(server_config.clone()),
-        EndpointSetup::Connector { .. } => None,
+    // Build MultiQuicState for both listener and connector.
+    let mut multi_state = match &setup {
+        EndpointSetup::Listener { server_config } => MultiQuicState::new(server_config.clone()),
+        EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
-    let mut quic_state = QuicState::new(quic_remote_addr, server_config);
 
     // For connector: initiate QUIC connection.
     if let EndpointSetup::Connector {
@@ -197,14 +201,12 @@ pub fn run(
         client_config,
     } = setup
     {
-        let (ch, conn) = quic_state
-            .endpoint
-            .connect(Instant::now(), client_config, remote_addr, "quictun")
+        multi_state.connect(client_config, remote_addr)
             .context("failed to initiate QUIC connection")?;
-        quic_state.ch = Some(ch);
-        quic_state.connection = Some(conn);
-        tracing::info!(remote = %remote_addr, "QUIC connection initiated");
     }
+
+    // Keep server_config clone for multi-core dispatcher path.
+    let server_config_clone = multi_state.server_config.clone();
 
     tracing::info!(
         local_mac = %format_mac(&local_mac),
@@ -263,7 +265,7 @@ pub fn run(
 
         for i in 0..n_cores {
             let inner_port_id = (total_ports - n_cores as u16) + i as u16;
-            let (inner_mac, inner_hw_offload) = port::configure_port(inner_port_id, mempool)?;
+            let (inner_mac, _inner_hw_udp, _inner_hw_ip) = port::configure_port(inner_port_id, mempool)?;
 
             let iface = if n_cores == 1 {
                 dpdk_config.tunnel_iface.clone()
@@ -274,7 +276,8 @@ pub fn run(
             tracing::info!(
                 inner_port = inner_port_id,
                 inner_mac = %format_mac(&inner_mac),
-                hw_offload = inner_hw_offload,
+                hw_udp = _inner_hw_udp,
+                hw_ip = _inner_hw_ip,
                 iface = %iface,
                 mode = %dpdk_config.mode,
                 "inner port configured"
@@ -340,7 +343,7 @@ pub fn run(
             );
         }
         let inner_port_id = total_ports as u16 - 1;
-        let (inner_mac, _inner_hw_offload) = port::configure_port(inner_port_id, mempool)?;
+        let (inner_mac, _inner_hw_udp, _inner_hw_ip) = port::configure_port(inner_port_id, mempool)?;
 
         tracing::info!(
             inner_port = inner_port_id,
@@ -387,69 +390,102 @@ pub fn run(
 
     let result = if n_cores == 1 {
         // Single-core: run directly on this thread.
+        // Handles 1..N connections via connection table (no multi-client flag needed).
         let inner = inner_ports.into_iter().next().expect("exactly 1 inner port");
+
+        // Convert DpdkPeerConfig → PeerInfo for engine.
+        let peer_infos: Vec<PeerInfo> = dpdk_config.peers.iter().map(|p| PeerInfo {
+            spki_der: p.spki_der.clone(),
+            tunnel_ip: p.tunnel_ip,
+        }).collect();
+
         engine::run(
             dpdk_config.port_id,
             0, // queue_id
             mempool,
-            &mut quic_state,
+            &mut multi_state,
             &mut identity,
             &mut arp_table,
             inner,
             shutdown.clone(),
             dpdk_config.adaptive_poll,
             checksum_mode,
+            &peer_infos,
         )
     } else {
-        // Multi-core: handshake on core 0 via queue 0 + inner port 0,
-        // then spawn N worker threads sharing Arc<ConnectionState>.
+        // Multi-core: dispatcher + worker architecture.
+        let n_workers = n_cores - 1; // core 0 = dispatcher
 
-        let outer_port_id = dpdk_config.port_id;
-        let adaptive_poll = dpdk_config.adaptive_poll;
+        // Build peer info for identification.
+        let peers: Vec<PeerInfo> = dpdk_config.peers.iter().map(|p| PeerInfo {
+            spki_der: p.spki_der.clone(),
+            tunnel_ip: p.tunnel_ip,
+        }).collect();
 
-        // Phase 1: Handshake on core 0
-        let handshake_inner = &inner_ports[0];
-        let hs_result = engine::run_handshake_only(
-            outer_port_id,
-            0, // queue 0
-            mempool,
-            &mut quic_state,
-            &mut identity,
-            &mut arp_table,
-            handshake_inner,
-            &shutdown,
-            checksum_mode,
+        // Configure outer port: 1 RX queue, n_cores TX queues.
+        // Close and reconfigure for dispatcher mode.
+        port::close_port(dpdk_config.port_id);
+        let (new_mac, hw_udp, hw_ip) = port::configure_port_dispatcher(
+            dpdk_config.port_id, n_cores as u16, mempool,
         )?;
+        identity.local_mac = new_mac;
 
-        let conn_state = hs_result.conn_state;
-        let learned_identity = hs_result.identity;
-        let learned_arp = hs_result.arp_table;
+        let checksum_mode = if dpdk_config.no_udp_checksum {
+            ChecksumMode::None
+        } else if hw_udp && hw_ip {
+            ChecksumMode::HardwareFull
+        } else if hw_udp {
+            ChecksumMode::HardwareUdpOnly
+        } else {
+            ChecksumMode::Software
+        };
 
-        tracing::info!(
-            n_cores,
-            "handshake complete, spawning {n_cores} worker threads"
-        );
+        // Build multi-client QUIC state (listener only for multi-core).
+        let multi_server_config = server_config_clone
+            .ok_or_else(|| anyhow::anyhow!("multi-core DPDK requires listener mode"))?;
+        let mut multi_state = MultiQuicState::new(multi_server_config);
 
-        // Phase 2: Spawn N worker threads
+        // Create per-worker ring bundles.
+        let mut worker_rings: Vec<WorkerRings> = Vec::with_capacity(n_workers);
+        for i in 0..n_workers {
+            worker_rings.push(WorkerRings::new(i)?);
+        }
+
+        // Build dispatch table.
+        let mut dispatch_table = DpdkDispatchTable::new(n_workers);
+
+        // Single inner port on core 0.
+        let inner = inner_ports.into_iter().next().expect("at least 1 inner port");
+
+        let adaptive_poll = dpdk_config.adaptive_poll;
+        let outer_port_id = dpdk_config.port_id;
+
+        // Spawn worker threads (pinned to cores 1..N).
         std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_cores);
+            let mut handles = Vec::with_capacity(n_workers);
 
-            for (core_idx, inner) in inner_ports.iter().enumerate() {
+            for (idx, rings) in worker_rings.iter().enumerate() {
                 let shutdown = shutdown.clone();
-                let conn_state = conn_state.clone();
-                let worker_identity = learned_identity.clone();
-                let worker_arp = learned_arp.clone();
+                let worker_identity = identity.clone();
+                let inner_eth_hdr = &inner.eth_hdr;
                 let mempool = SendPtr(mempool);
 
                 handles.push(s.spawn(move || -> Result<()> {
                     let mempool = mempool.as_ptr();
-                    // Pin thread to CPU core_idx
+                    let core_idx = idx + 1; // core 0 is dispatcher
+                    let tx_queue = core_idx as u16;
+
+                    // Pin thread to CPU.
                     #[cfg(target_os = "linux")]
                     {
                         let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
                         unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
                         let ret = unsafe {
-                            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
+                            libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &cpuset,
+                            )
                         };
                         if ret == 0 {
                             tracing::info!(core = core_idx, "pinned worker thread to CPU");
@@ -458,14 +494,13 @@ pub fn run(
                         }
                     }
 
-                    engine::run_quictun_multicore(
+                    engine::run_worker(
                         outer_port_id,
-                        core_idx as u16,
+                        tx_queue,
                         mempool,
-                        &conn_state,
+                        rings,
+                        inner_eth_hdr,
                         &worker_identity,
-                        &worker_arp,
-                        inner,
                         &shutdown,
                         adaptive_poll,
                         checksum_mode,
@@ -474,8 +509,25 @@ pub fn run(
                 }));
             }
 
-            // Wait for all threads. Return first error if any.
-            let mut result: Result<()> = Ok(());
+            // Run dispatcher on core 0 (this thread).
+            let disp_result = engine::run_dispatcher(
+                outer_port_id,
+                mempool,
+                &mut multi_state,
+                &mut dispatch_table,
+                &worker_rings,
+                &mut identity,
+                &mut arp_table,
+                &inner,
+                &peers,
+                &shutdown,
+                adaptive_poll,
+                checksum_mode,
+            );
+
+            // Signal shutdown and wait for workers.
+            shutdown.store(true, Ordering::Release);
+            let mut result = disp_result;
             for handle in handles {
                 if let Err(e) = handle.join().expect("worker thread panicked") {
                     if result.is_ok() {
