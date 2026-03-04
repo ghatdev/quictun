@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::dispatch::{DpdkDispatchTable, PeerInfo, WorkerRings};
+use crate::dispatch::{DpdkDispatchTable, WorkerRings};
+use quictun_core::peer::PeerConfig;
 use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
@@ -393,10 +394,11 @@ pub fn run(
         // Handles 1..N connections via connection table (no multi-client flag needed).
         let inner = inner_ports.into_iter().next().expect("exactly 1 inner port");
 
-        // Convert DpdkPeerConfig → PeerInfo for engine.
-        let peer_infos: Vec<PeerInfo> = dpdk_config.peers.iter().map(|p| PeerInfo {
+        // Convert DpdkPeerConfig → PeerConfig for engine.
+        let peer_infos: Vec<PeerConfig> = dpdk_config.peers.iter().map(|p| PeerConfig {
             spki_der: p.spki_der.clone(),
             tunnel_ip: p.tunnel_ip,
+            keepalive: None,
         }).collect();
 
         engine::run(
@@ -417,9 +419,10 @@ pub fn run(
         let n_workers = n_cores - 1; // core 0 = dispatcher
 
         // Build peer info for identification.
-        let peers: Vec<PeerInfo> = dpdk_config.peers.iter().map(|p| PeerInfo {
+        let peers: Vec<PeerConfig> = dpdk_config.peers.iter().map(|p| PeerConfig {
             spki_der: p.spki_der.clone(),
             tunnel_ip: p.tunnel_ip,
+            keepalive: None,
         }).collect();
 
         // Configure outer port: 1 RX queue, n_cores TX queues.

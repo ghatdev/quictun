@@ -11,8 +11,9 @@ use crate::ffi;
 use crate::mbuf::Mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
-use crate::dispatch::{ConnectionEntry, PeerInfo};
+use crate::dispatch::ConnectionEntry;
 use crate::shared::{self, DriveResult, MultiQuicState, QuicState, BUF_SIZE};
+use quictun_core::peer::{self, PeerConfig};
 use quictun_quic::local::LocalConnectionState;
 
 /// Maximum burst size for rx/tx.
@@ -86,7 +87,7 @@ pub fn run(
     shutdown: Arc<AtomicBool>,
     adaptive_poll: bool,
     checksum_mode: ChecksumMode,
-    peers: &[PeerInfo],
+    peers: &[PeerConfig],
 ) -> Result<()> {
     const CID_LEN: usize = 8;
 
@@ -543,7 +544,8 @@ pub fn run(
                     );
 
                     // Identify peer to get tunnel IP.
-                    let tunnel_ip = identify_peer_dpdk(&hs.connection, peers)
+                    let tunnel_ip = peer::identify_peer(&hs.connection, peers)
+                        .map(|p| p.tunnel_ip)
                         .or_else(|| {
                             // Single-peer fallback: skip identification.
                             if peers.len() == 1 {
@@ -1017,7 +1019,7 @@ pub fn run_dispatcher(
     identity: &mut NetIdentity,
     arp_table: &mut ArpTable,
     inner: &InnerPort,
-    peers: &[PeerInfo],
+    peers: &[PeerConfig],
     shutdown: &AtomicBool,
     adaptive_poll: bool,
     checksum_mode: ChecksumMode,
@@ -1221,7 +1223,7 @@ pub fn run_dispatcher(
         for ch in drive_result.completed {
             if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
                 // Identify peer by certificate.
-                let tunnel_ip = identify_peer_dpdk(&hs.connection, peers);
+                let tunnel_ip = peer::identify_peer(&hs.connection, peers).map(|p| p.tunnel_ip);
                 let Some(tunnel_ip) = tunnel_ip else {
                     tracing::warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
                     continue;
@@ -1380,20 +1382,6 @@ fn drain_handshake_transmits(
             }
         }
     }
-}
-
-/// Identify a peer by matching their certificate against known peer SPKI DERs.
-fn identify_peer_dpdk(
-    conn: &quinn_proto::Connection,
-    peers: &[PeerInfo],
-) -> Option<Ipv4Addr> {
-    let identity = conn.crypto_session().peer_identity()?;
-    let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity.downcast_ref()?;
-    let peer_cert = certs.first()?;
-    let peer_der: &[u8] = peer_cert.as_ref();
-
-    // Match against known peer SPKI DERs.
-    peers.iter().find(|p| p.spki_der == peer_der).map(|p| p.tunnel_ip)
 }
 
 /// Run a multi-client worker on a dedicated core.

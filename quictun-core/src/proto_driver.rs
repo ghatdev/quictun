@@ -2,22 +2,23 @@
 //!
 //! Drives quinn-proto's `Endpoint` + `Connection` state machine over a tokio
 //! `UdpSocket` until `Event::Connected` fires, then extracts 1-RTT keys and
-//! returns a `quictun_quic::ConnectionState` for the fast data plane.
+//! returns a `quictun_quic::local::LocalConnectionState` for the fast data plane.
 //!
 //! This is the async equivalent of `quictun-dpdk/src/shared.rs`, which does
 //! the same thing in a synchronous polling loop.
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig, crypto};
+use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+use crate::peer;
 
 /// Maximum QUIC packet buffer size.
 const BUF_SIZE: usize = 2048;
@@ -31,14 +32,6 @@ pub enum HandshakeSetup {
     Listener {
         server_config: Arc<ServerConfig>,
     },
-}
-
-/// Result of a successful handshake (thread-safe ConnectionState).
-pub struct HandshakeResult {
-    /// quictun-quic connection state with extracted 1-RTT keys.
-    pub connection_state: Arc<quictun_quic::ConnectionState>,
-    /// Remote peer address.
-    pub remote_addr: SocketAddr,
 }
 
 /// Result of a successful handshake (single-owner LocalConnectionState).
@@ -59,32 +52,12 @@ enum LoopAction {
     Shutdown,
 }
 
-/// Run the quinn-proto handshake, returning a thread-safe `ConnectionState`.
-pub async fn run_handshake(
-    udp: &UdpSocket,
-    setup: &HandshakeSetup,
-    shutdown: &watch::Receiver<bool>,
-) -> Result<HandshakeResult> {
-    let raw = run_handshake_raw(udp, setup, shutdown).await?;
-    let connection_state = quictun_quic::ConnectionState::new(
-        raw.keys,
-        raw.key_gens,
-        raw.local_cid,
-        raw.remote_cid,
-        raw.is_server,
-    );
-    Ok(HandshakeResult {
-        connection_state,
-        remote_addr: raw.remote_addr,
-    })
-}
-
 /// Core handshake loop — returns raw keys for the caller to wrap.
 async fn run_handshake_raw(
     udp: &UdpSocket,
     setup: &HandshakeSetup,
     shutdown: &watch::Receiver<bool>,
-) -> Result<RawHandshakeKeys> {
+) -> Result<RawHandshakeResult> {
     let local_addr = udp.local_addr().context("failed to get local address")?;
 
     let server_config = match setup {
@@ -191,10 +164,15 @@ async fn run_handshake_raw(
                 match event {
                     Event::Connected => {
                         info!("quic: handshake complete");
+                        let extracted = peer::extract_1rtt_keys(conn)
+                            .context("Connected but no 1-RTT keys available")?;
                         let is_server = server_config.is_some();
-                        let raw = extract_keys(conn, is_server, remote_addr)?;
                         drain_transmits(udp, conn, remote_addr).await?;
-                        return Ok(raw);
+                        return Ok(RawHandshakeResult {
+                            extracted,
+                            is_server,
+                            remote_addr,
+                        });
                     }
                     Event::ConnectionLost { reason } => {
                         anyhow::bail!("connection lost during handshake: {reason}");
@@ -264,53 +242,11 @@ async fn handle_datagram_event(
     Ok(())
 }
 
-/// Raw keys extracted from a quinn-proto handshake.
-struct RawHandshakeKeys {
-    keys: crypto::Keys,
-    key_gens: VecDeque<crypto::KeyPair<Box<dyn quinn_proto::crypto::PacketKey>>>,
-    local_cid: quinn_proto::ConnectionId,
-    remote_cid: quinn_proto::ConnectionId,
+/// Result of `run_handshake_raw`: extracted keys + metadata.
+struct RawHandshakeResult {
+    extracted: peer::ExtractedKeys,
     is_server: bool,
     remote_addr: SocketAddr,
-}
-
-/// Extract 1-RTT keys and pre-compute key generations from a connected quinn-proto Connection.
-fn extract_keys(
-    conn: &mut quinn_proto::Connection,
-    is_server: bool,
-    remote_addr: SocketAddr,
-) -> Result<RawHandshakeKeys> {
-    let keys = conn
-        .take_1rtt_keys()
-        .context("Connected but no 1-RTT keys available")?;
-
-    let local_cid = *conn.local_cid();
-    let remote_cid = conn.remote_cid();
-
-    let mut key_gens = VecDeque::new();
-    if let Some(first) = conn.take_next_1rtt_keys() {
-        key_gens.push_back(first);
-    }
-    for _ in 0..999 {
-        if let Some(kp) = conn.produce_next_1rtt_keys() {
-            key_gens.push_back(kp);
-        } else {
-            break;
-        }
-    }
-    info!(
-        key_generations = key_gens.len(),
-        "pre-computed key update generations"
-    );
-
-    Ok(RawHandshakeKeys {
-        keys,
-        key_gens,
-        local_cid,
-        remote_cid,
-        is_server,
-        remote_addr,
-    })
 }
 
 /// Run the quinn-proto handshake, returning a `LocalConnectionState`.
@@ -323,27 +259,18 @@ pub async fn run_handshake_local(
     shutdown: &watch::Receiver<bool>,
 ) -> Result<LocalHandshakeResult> {
     let raw = run_handshake_raw(udp, setup, shutdown).await?;
+    let e = raw.extracted;
     let connection_state = quictun_quic::local::LocalConnectionState::new(
-        raw.keys,
-        raw.key_gens,
-        raw.local_cid,
-        raw.remote_cid,
+        e.keys,
+        e.key_gens,
+        e.local_cid,
+        e.remote_cid,
         raw.is_server,
     );
     Ok(LocalHandshakeResult {
         connection_state,
         remote_addr: raw.remote_addr,
     })
-}
-
-/// Resolved peer info for multi-client accept loop.
-pub struct ResolvedPeer {
-    /// Peer's public key SPKI DER (for identity matching after handshake).
-    pub spki_der: Vec<u8>,
-    /// Peer's tunnel IP (first IP from `allowed_ips`).
-    pub tunnel_ip: std::net::Ipv4Addr,
-    /// Keepalive interval.
-    pub keepalive: Option<std::time::Duration>,
 }
 
 /// Multi-client accept loop for the listener `--fast` data plane.
@@ -357,7 +284,7 @@ pub async fn run_accept_loop(
     server_config: std::sync::Arc<ServerConfig>,
     table: std::sync::Arc<std::sync::RwLock<crate::dispatcher::DispatchTable>>,
     tun: std::sync::Arc<quictun_tun::TunDevice>,
-    peers: Vec<ResolvedPeer>,
+    peers: Vec<peer::PeerConfig>,
     cid_len: usize,
     idle_timeout: std::time::Duration,
     mut handshake_rx: tokio::sync::mpsc::Receiver<(BytesMut, std::net::SocketAddr)>,
@@ -550,8 +477,8 @@ pub async fn run_accept_loop(
             let remote_cid = hs.connection.remote_cid();
 
             // Identify peer by certificate.
-            let tunnel_ip = match identify_peer(&hs.connection, &peers) {
-                Some(peer) => peer.tunnel_ip,
+            let matched_peer = match peer::identify_peer(&hs.connection, &peers) {
+                Some(p) => p,
                 None => {
                     warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
                     let mut t = table.write().expect("dispatch table poisoned");
@@ -559,10 +486,8 @@ pub async fn run_accept_loop(
                     continue;
                 }
             };
-            let peer_keepalive = peers
-                .iter()
-                .find(|p| p.tunnel_ip == tunnel_ip)
-                .and_then(|p| p.keepalive);
+            let tunnel_ip = matched_peer.tunnel_ip;
+            let peer_keepalive = matched_peer.keepalive;
 
             // Add IP route (phase 2 of registration).
             {
@@ -582,11 +507,10 @@ pub async fn run_accept_loop(
             }
 
             // Extract keys (expensive: pre-computes 1000 key generations).
-            let is_server = true;
-            let raw = match extract_keys(&mut hs.connection, is_server, hs.remote_addr) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "failed to extract keys after handshake");
+            let extracted = match peer::extract_1rtt_keys(&mut hs.connection) {
+                Some(e) => e,
+                None => {
+                    warn!("failed to extract 1-RTT keys after handshake");
                     let mut t = table.write().expect("dispatch table poisoned");
                     t.unregister(&local_cid, tunnel_ip);
                     continue;
@@ -595,11 +519,11 @@ pub async fn run_accept_loop(
 
             // Create LocalConnectionState.
             let conn = quictun_quic::local::LocalConnectionState::new(
-                raw.keys,
-                raw.key_gens,
+                extracted.keys,
+                extracted.key_gens,
                 local_cid,
                 remote_cid,
-                raw.is_server,
+                true, // is_server
             );
 
             // Take channel receivers from handshake state.
@@ -645,20 +569,6 @@ pub async fn run_accept_loop(
             });
         }
     }
-}
-
-/// Identify which peer connected by matching peer certificate against known peers.
-fn identify_peer<'a>(
-    conn: &quinn_proto::Connection,
-    peers: &'a [ResolvedPeer],
-) -> Option<&'a ResolvedPeer> {
-    let identity = conn.crypto_session().peer_identity()?;
-    let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity.downcast_ref()?;
-    let peer_cert = certs.first()?;
-    let peer_der: &[u8] = peer_cert.as_ref();
-
-    // Match against known peer SPKI DERs.
-    peers.iter().find(|p| p.spki_der == peer_der)
 }
 
 /// Drain all pending transmits from a quinn-proto connection.

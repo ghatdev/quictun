@@ -2,6 +2,7 @@ pub mod config;
 pub mod connection;
 pub mod dispatcher;
 pub mod fast_tunnel;
+pub mod peer;
 pub mod proto_config;
 pub mod proto_driver;
 pub mod tunnel;

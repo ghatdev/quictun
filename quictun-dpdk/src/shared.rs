@@ -1,10 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
+use quictun_core::peer;
 use quictun_quic::local::LocalConnectionState;
 use tracing::{info, warn};
 
@@ -384,26 +385,15 @@ impl MultiQuicState {
     ) -> Option<(HandshakeState, LocalConnectionState)> {
         let mut hs = self.handshakes.remove(&ch)?;
 
-        let keys = hs.connection.take_1rtt_keys()?;
-        let local_cid = hs.connection.local_cid().clone();
-        let remote_cid = hs.connection.remote_cid();
-
-        // Pre-compute key generations.
-        let mut key_gens = VecDeque::new();
-        if let Some(first) = hs.connection.take_next_1rtt_keys() {
-            key_gens.push_back(first);
-        }
-        for _ in 0..999 {
-            if let Some(kp) = hs.connection.produce_next_1rtt_keys() {
-                key_gens.push_back(kp);
-            } else {
-                break;
-            }
-        }
-        info!(key_generations = key_gens.len(), "pre-computed key update generations");
-
+        let extracted = peer::extract_1rtt_keys(&mut hs.connection)?;
         let is_server = self.server_config.is_some();
-        let conn_state = LocalConnectionState::new(keys, key_gens, local_cid, remote_cid, is_server);
+        let conn_state = LocalConnectionState::new(
+            extracted.keys,
+            extracted.key_gens,
+            extracted.local_cid,
+            extracted.remote_cid,
+            is_server,
+        );
 
         Some((hs, conn_state))
     }

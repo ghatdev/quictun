@@ -1012,7 +1012,7 @@ async fn run_async_fast(
         )?;
 
         // Resolve peer configs for identity matching.
-        let resolved_peers: Vec<proto_driver::ResolvedPeer> = config
+        let resolved_peers: Vec<quictun_core::peer::PeerConfig> = config
             .peer
             .iter()
             .zip(peer_pubkeys.iter())
@@ -1025,7 +1025,7 @@ async fn run_async_fast(
                     .map(|net| net.addr())
                     .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-                proto_driver::ResolvedPeer {
+                quictun_core::peer::PeerConfig {
                     spki_der: pubkey.spki_der().to_vec(),
                     tunnel_ip,
                     keepalive: peer_cfg.keepalive.map(Duration::from_secs),
