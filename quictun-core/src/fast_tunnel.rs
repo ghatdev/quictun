@@ -850,6 +850,10 @@ pub async fn run_connection_task(
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
     let mut scratch = BytesMut::with_capacity(2048);
 
+    // Linux: GSO send buffer for batching TUN→QUIC.
+    #[cfg(target_os = "linux")]
+    let mut gso_buf = vec![0u8; crate::batch_io::GSO_BUF_SIZE];
+
     loop {
         let timeout = {
             let keepalive_remaining = if keepalive.is_some() {
@@ -870,28 +874,126 @@ pub async fn run_connection_task(
                 }
             }
 
-            // TUN packet from dispatcher → encrypt → send via UDP.
+            // TUN packet from dispatcher → encrypt → batch with GSO → send via UDP.
             pkt = tun_rx.recv() => {
-                let Some(data) = pkt else {
-                    // Channel closed — dispatcher shut down.
+                let Some(first) = pkt else {
                     tracing::info!("TUN channel closed, connection ending");
                     return TunnelResult::ConnectionLost(quinn::ConnectionError::TimedOut);
                 };
 
-                let ack_ranges = if conn.needs_ack() {
-                    Some(conn.generate_ack_ranges())
-                } else {
-                    None
-                };
-                match conn.encrypt_datagram(&data, ack_ranges.as_deref(), &mut encrypt_buf) {
-                    Ok(result) => {
-                        if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
-                            return TunnelResult::Fatal(e.into());
+                #[cfg(target_os = "linux")]
+                {
+                    // Encrypt first packet into GSO buffer.
+                    let max_segs = crate::batch_io::GSO_MAX_SEGMENTS;
+                    let mut gso_pos = 0usize;
+                    let mut gso_segment_size = 0usize;
+                    let mut gso_count = 0usize;
+
+                    let ack_ranges = if conn.needs_ack() {
+                        Some(conn.generate_ack_ranges())
+                    } else {
+                        None
+                    };
+                    match conn.encrypt_datagram(&first, ack_ranges.as_deref(), &mut gso_buf) {
+                        Ok(result) => {
+                            gso_segment_size = result.len;
+                            gso_pos = result.len;
+                            gso_count = 1;
                         }
-                        last_tx = Instant::now();
+                        Err(e) => {
+                            warn!(error = %e, "encrypt failed, dropping packet");
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "encrypt failed, dropping packet");
+
+                    // Drain channel: batch remaining packets into GSO buffer.
+                    while gso_count < max_segs {
+                        match tun_rx.try_recv() {
+                            Ok(data) => {
+                                if gso_pos + MAX_PACKET > gso_buf.len() { break; }
+                                let ack_ranges = if conn.needs_ack() {
+                                    Some(conn.generate_ack_ranges())
+                                } else {
+                                    None
+                                };
+                                match conn.encrypt_datagram(
+                                    &data,
+                                    ack_ranges.as_deref(),
+                                    &mut gso_buf[gso_pos..],
+                                ) {
+                                    Ok(result) => {
+                                        if gso_count == 0 {
+                                            gso_segment_size = result.len;
+                                            gso_pos += result.len;
+                                            gso_count += 1;
+                                        } else if result.len == gso_segment_size {
+                                            gso_pos += result.len;
+                                            gso_count += 1;
+                                        } else {
+                                            // Odd-sized: send individually.
+                                            let odd_end = gso_pos + result.len;
+                                            if let Err(e) = udp
+                                                .send_to(&gso_buf[gso_pos..odd_end], remote_addr)
+                                                .await
+                                            {
+                                                return TunnelResult::Fatal(e.into());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "encrypt failed, dropping packet");
+                                    }
+                                }
+                            }
+                            Err(_) => break, // channel empty
+                        }
+                    }
+
+                    // Flush GSO batch.
+                    if gso_count > 0 {
+                        let seg = gso_segment_size as u16;
+                        loop {
+                            match crate::batch_io::send_gso(
+                                &udp,
+                                &gso_buf[..gso_pos],
+                                seg,
+                                remote_addr,
+                            ) {
+                                Ok(_) => {
+                                    last_tx = Instant::now();
+                                    break;
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    if let Err(e) = udp.writable().await {
+                                        return TunnelResult::Fatal(e.into());
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "send_gso failed");
+                                    return TunnelResult::Fatal(e.into());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Non-Linux: per-packet send.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let ack_ranges = if conn.needs_ack() {
+                        Some(conn.generate_ack_ranges())
+                    } else {
+                        None
+                    };
+                    match conn.encrypt_datagram(&first, ack_ranges.as_deref(), &mut encrypt_buf) {
+                        Ok(result) => {
+                            if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
+                                return TunnelResult::Fatal(e.into());
+                            }
+                            last_tx = Instant::now();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "encrypt failed, dropping packet");
+                        }
                     }
                 }
             }
@@ -903,26 +1005,34 @@ pub async fn run_connection_task(
                     return TunnelResult::ConnectionLost(quinn::ConnectionError::TimedOut);
                 };
 
-                // Skip long-header packets (shouldn't arrive here, but be safe).
-                if !data.is_empty() && data[0] & 0x80 != 0 {
-                    continue;
-                }
-
-                match conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
-                    Ok(decrypted) => {
-                        last_rx = Instant::now();
-                        if let Some(ref ack) = decrypted.ack {
-                            conn.process_ack(ack);
-                        }
-                        for datagram in &decrypted.datagrams {
-                            if datagram.is_empty() { continue; }
-                            if let Err(e) = tun.send(datagram).await {
-                                return TunnelResult::Fatal(e.into());
+                // Process first packet, then drain channel for batch.
+                loop {
+                    if !data.is_empty() && data[0] & 0x80 != 0 {
+                        // Skip long-header packets.
+                    } else {
+                        match conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
+                            Ok(decrypted) => {
+                                last_rx = Instant::now();
+                                if let Some(ref ack) = decrypted.ack {
+                                    conn.process_ack(ack);
+                                }
+                                for datagram in &decrypted.datagrams {
+                                    if datagram.is_empty() { continue; }
+                                    if let Err(e) = tun.send(datagram).await {
+                                        return TunnelResult::Fatal(e.into());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "decrypt failed, dropping packet");
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "decrypt failed, dropping packet");
+
+                    // Try to drain more from channel.
+                    match udp_rx.try_recv() {
+                        Ok(next) => { data = next; }
+                        Err(_) => break,
                     }
                 }
             }
