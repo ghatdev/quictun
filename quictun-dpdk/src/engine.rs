@@ -68,6 +68,66 @@ const MIN_DELAY_US: u32 = 1;
 /// Maximum sleep duration in microseconds during adaptive backoff.
 const MAX_DELAY_US: u32 = 100;
 
+/// Result of resolving a completed handshake into connection metadata.
+pub struct ResolvedHandshake {
+    pub conn: LocalConnectionState,
+    pub tunnel_ip: Ipv4Addr,
+    pub remote_addr: SocketAddr,
+    pub remote_mac: [u8; 6],
+    pub cid: Vec<u8>,
+}
+
+/// Extract shared handshake completion logic: identify peer, resolve MAC, build CID.
+///
+/// Returns `None` if the peer cannot be identified (rejects the connection).
+pub fn resolve_completed_handshake(
+    hs: &shared::HandshakeState,
+    conn_state: LocalConnectionState,
+    peers: &[PeerConfig],
+    identity: &NetIdentity,
+    arp_table: &ArpTable,
+) -> Option<ResolvedHandshake> {
+    // Identify peer to get tunnel IP.
+    let tunnel_ip = peer::identify_peer(&hs.connection, peers)
+        .map(|p| p.tunnel_ip)
+        .or_else(|| {
+            // Single-peer fallback: skip identification.
+            if peers.len() == 1 {
+                Some(peers[0].tunnel_ip)
+            } else {
+                None
+            }
+        });
+
+    let tunnel_ip = tunnel_ip.or_else(|| {
+        tracing::warn!(
+            remote = %hs.remote_addr,
+            "could not identify peer, rejecting"
+        );
+        None
+    })?;
+
+    // Resolve remote MAC from ARP table or use learned identity MAC.
+    let remote_ip = match hs.remote_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        _ => identity.remote_ip,
+    };
+    let remote_mac = arp_table
+        .lookup(remote_ip)
+        .or(identity.remote_mac)
+        .unwrap_or([0xff; 6]);
+
+    let cid = conn_state.local_cid().to_vec();
+
+    Some(ResolvedHandshake {
+        conn: conn_state,
+        tunnel_ip,
+        remote_addr: hs.remote_addr,
+        remote_mac,
+        cid,
+    })
+}
+
 /// Run the DPDK polling engine.
 ///
 /// This is the hot loop: RX burst → QUIC → inner write → drain transmits → TX burst.
@@ -543,53 +603,28 @@ pub fn run(
                         checksum_mode,
                     );
 
-                    // Identify peer to get tunnel IP.
-                    let tunnel_ip = peer::identify_peer(&hs.connection, peers)
-                        .map(|p| p.tunnel_ip)
-                        .or_else(|| {
-                            // Single-peer fallback: skip identification.
-                            if peers.len() == 1 {
-                                Some(peers[0].tunnel_ip)
-                            } else {
-                                None
-                            }
-                        });
-
-                    let Some(tunnel_ip) = tunnel_ip else {
-                        tracing::warn!(
-                            remote = %hs.remote_addr,
-                            "could not identify peer, rejecting"
-                        );
+                    let Some(resolved) = resolve_completed_handshake(
+                        &hs, conn_state, peers, identity, arp_table,
+                    ) else {
                         continue;
                     };
 
-                    // Resolve remote MAC from ARP table.
-                    let remote_ip = match hs.remote_addr.ip() {
-                        std::net::IpAddr::V4(ip) => ip,
-                        _ => identity.remote_ip,
-                    };
-                    let remote_mac = arp_table
-                        .lookup(remote_ip)
-                        .or(identity.remote_mac)
-                        .unwrap_or([0xff; 6]);
-
                     // Insert into connection table.
-                    let cid = conn_state.local_cid().to_vec();
-                    ip_to_cid.insert(tunnel_ip, cid.clone());
+                    ip_to_cid.insert(resolved.tunnel_ip, resolved.cid.clone());
                     connections.insert(
-                        cid.clone(),
+                        resolved.cid.clone(),
                         ConnectionEntry {
-                            conn: conn_state,
-                            tunnel_ip,
-                            remote_addr: hs.remote_addr,
-                            remote_mac,
+                            conn: resolved.conn,
+                            tunnel_ip: resolved.tunnel_ip,
+                            remote_addr: resolved.remote_addr,
+                            remote_mac: resolved.remote_mac,
                         },
                     );
 
                     tracing::info!(
-                        tunnel_ip = %tunnel_ip,
-                        remote = %hs.remote_addr,
-                        cid = %hex::encode(&cid),
+                        tunnel_ip = %resolved.tunnel_ip,
+                        remote = %resolved.remote_addr,
+                        cid = %hex::encode(&resolved.cid),
                         "connection established"
                     );
                 }
@@ -1222,10 +1257,9 @@ pub fn run_dispatcher(
 
         for ch in drive_result.completed {
             if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                // Identify peer by certificate.
-                let tunnel_ip = peer::identify_peer(&hs.connection, peers).map(|p| p.tunnel_ip);
-                let Some(tunnel_ip) = tunnel_ip else {
-                    tracing::warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                let Some(resolved) = resolve_completed_handshake(
+                    &hs, conn_state, peers, identity, arp_table,
+                ) else {
                     continue;
                 };
 
@@ -1233,16 +1267,7 @@ pub fn run_dispatcher(
                 let worker_id = dispatch_table.least_loaded_worker();
                 let local_cid = hs.local_cid;
                 dispatch_table.register_cid(&local_cid, worker_id);
-                dispatch_table.add_route(tunnel_ip, worker_id);
-
-                // Resolve remote MAC from ARP table or use learned identity MAC.
-                let remote_ip = match hs.remote_addr.ip() {
-                    std::net::IpAddr::V4(ip) => ip,
-                    _ => identity.remote_ip,
-                };
-                let remote_mac = arp_table.lookup(remote_ip)
-                    .or(identity.remote_mac)
-                    .unwrap_or([0xff; 6]);
+                dispatch_table.add_route(resolved.tunnel_ip, worker_id);
 
                 // Drain final handshake transmits.
                 drain_handshake_transmits(
@@ -1254,15 +1279,15 @@ pub fn run_dispatcher(
                 // Send control message to worker.
                 if let Ok(mut ctrl) = workers[worker_id].control.lock() {
                     ctrl.push(ControlMessage::AddConnection {
-                        conn: conn_state,
-                        tunnel_ip,
-                        remote_addr: hs.remote_addr,
-                        remote_mac,
+                        conn: resolved.conn,
+                        tunnel_ip: resolved.tunnel_ip,
+                        remote_addr: resolved.remote_addr,
+                        remote_mac: resolved.remote_mac,
                     });
                 }
 
                 tracing::info!(
-                    tunnel_ip = %tunnel_ip,
+                    tunnel_ip = %resolved.tunnel_ip,
                     worker = worker_id,
                     cid = %hex::encode(&local_cid[..]),
                     "connection assigned to worker"

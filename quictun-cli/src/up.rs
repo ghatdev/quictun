@@ -266,7 +266,7 @@ fn run_dpdk(
     };
 
     // Always build peer configs for identification (listener and connector).
-    let dpdk_peers: Vec<quictun_dpdk::event_loop::DpdkPeerConfig> = config
+    let dpdk_peers: Vec<quictun_core::peer::PeerConfig> = config
         .peer
         .iter()
         .zip(all_peer_pubkeys.iter())
@@ -277,9 +277,10 @@ fn run_dpdk(
                 .and_then(|cidr| cidr.split('/').next())
                 .and_then(|ip| ip.parse().ok())
                 .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-            quictun_dpdk::event_loop::DpdkPeerConfig {
+            quictun_core::peer::PeerConfig {
                 spki_der: pubkey.spki_der().to_vec(),
                 tunnel_ip,
+                keepalive: None,
             }
         })
         .collect();

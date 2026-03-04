@@ -42,14 +42,6 @@ impl<T> SendPtr<T> {
     }
 }
 
-/// Peer info for multi-client DPDK (used for peer identification after handshake).
-pub struct DpdkPeerConfig {
-    /// Peer's public key SPKI DER (for identity matching).
-    pub spki_der: Vec<u8>,
-    /// Tunnel IP assigned to this peer.
-    pub tunnel_ip: Ipv4Addr,
-}
-
 /// DPDK-specific configuration from CLI flags.
 pub struct DpdkConfig {
     /// Inner interface mode: "tap" (default), "xdp", or "virtio".
@@ -82,7 +74,7 @@ pub struct DpdkConfig {
     /// Skip UDP checksum entirely (write 0x0000). Valid for IPv4, useful for benchmarking.
     pub no_udp_checksum: bool,
     /// Peer configurations for peer identification (listener with >1 peer).
-    pub peers: Vec<DpdkPeerConfig>,
+    pub peers: Vec<PeerConfig>,
 }
 
 /// Run the DPDK data plane.
@@ -394,13 +386,6 @@ pub fn run(
         // Handles 1..N connections via connection table (no multi-client flag needed).
         let inner = inner_ports.into_iter().next().expect("exactly 1 inner port");
 
-        // Convert DpdkPeerConfig → PeerConfig for engine.
-        let peer_infos: Vec<PeerConfig> = dpdk_config.peers.iter().map(|p| PeerConfig {
-            spki_der: p.spki_der.clone(),
-            tunnel_ip: p.tunnel_ip,
-            keepalive: None,
-        }).collect();
-
         engine::run(
             dpdk_config.port_id,
             0, // queue_id
@@ -412,18 +397,11 @@ pub fn run(
             shutdown.clone(),
             dpdk_config.adaptive_poll,
             checksum_mode,
-            &peer_infos,
+            &dpdk_config.peers,
         )
     } else {
         // Multi-core: dispatcher + worker architecture.
         let n_workers = n_cores - 1; // core 0 = dispatcher
-
-        // Build peer info for identification.
-        let peers: Vec<PeerConfig> = dpdk_config.peers.iter().map(|p| PeerConfig {
-            spki_der: p.spki_der.clone(),
-            tunnel_ip: p.tunnel_ip,
-            keepalive: None,
-        }).collect();
 
         // Configure outer port: 1 RX queue, n_cores TX queues.
         // Close and reconfigure for dispatcher mode.
@@ -522,7 +500,7 @@ pub fn run(
                 &mut identity,
                 &mut arp_table,
                 &inner,
-                &peers,
+                &dpdk_config.peers,
                 &shutdown,
                 adaptive_poll,
                 checksum_mode,
