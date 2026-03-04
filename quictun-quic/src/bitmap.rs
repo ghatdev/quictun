@@ -1,8 +1,7 @@
 //! Non-atomic sliding-window bitmap for tracking packet numbers.
 //!
-//! Single-owner variant of [`AtomicBitmap`](crate::ack::AtomicBitmap).
-//! Same API, plain `u64` instead of `AtomicU64`. For use in
-//! [`LocalConnectionState`](crate::local::LocalConnectionState) (single-task loop).
+//! Plain `u64` words — designed for single-owner `&mut self` access in
+//! [`LocalConnectionState`](crate::local::LocalConnectionState).
 
 /// Number of u64 words in the bitmap (65536 PNs = 8KB).
 const BITMAP_WORDS: usize = 1024;

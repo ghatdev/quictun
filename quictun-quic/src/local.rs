@@ -16,9 +16,9 @@ use tracing::warn;
 use crate::bitmap::Bitmap;
 use crate::frame::AckFrame;
 use crate::{
-    DecryptedPacket, EncryptResult, ParseError,
-    decrypt_payload, encrypt_packet, prepare_key_generations, unprotect_header,
-    KEY_UPDATE_THRESHOLD, MAX_ACK_RANGES, DEFAULT_ACK_INTERVAL,
+    DecryptedInPlace, DecryptedPacket, EncryptResult, ParseError,
+    decrypt_payload, decrypt_payload_in_place, encrypt_packet, prepare_key_generations,
+    unprotect_header, KEY_UPDATE_THRESHOLD, MAX_ACK_RANGES, DEFAULT_ACK_INTERVAL,
 };
 
 /// Non-atomic QUIC 1-RTT connection state for single-task use.
@@ -114,6 +114,40 @@ impl LocalConnectionState {
         }
 
         let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
+
+        // Update RX state.
+        self.received.set(hdr.pn);
+        if hdr.pn > self.largest_rx_pn {
+            self.largest_rx_pn = hdr.pn;
+        }
+        self.rx_since_last_ack += 1;
+
+        Ok(result)
+    }
+
+    /// Decrypt an incoming 1-RTT packet fully in-place (zero heap allocation).
+    ///
+    /// Returns byte ranges into `packet` for each DATAGRAM payload.
+    /// Used by the DPDK data plane where mbufs are decrypted in-place.
+    pub fn decrypt_packet_in_place(
+        &mut self,
+        packet: &mut [u8],
+    ) -> Result<DecryptedInPlace, ParseError> {
+        let hdr = unprotect_header(
+            packet,
+            self.local_cid_len,
+            self.tag_len,
+            &*self.rx_header_key,
+            self.largest_rx_pn,
+        )?;
+
+        // Key phase rotation (single-owner, no CAS needed).
+        if hdr.key_phase != self.peer_key_phase {
+            self.peer_key_phase = hdr.key_phase;
+            self.handle_key_update_rx(hdr.key_phase);
+        }
+
+        let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
 
         // Update RX state.
         self.received.set(hdr.pn);

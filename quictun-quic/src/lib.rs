@@ -2,11 +2,10 @@
 //!
 //! Replaces quinn-proto for 1-RTT short header packets after handshake.
 //!
-//! Two connection state types:
-//! - [`ConnectionState`]: Thread-safe (`Arc`-shared, atomic/RwLock). For DPDK multi-core.
-//! - [`LocalConnectionState`]: Single-owner (`&mut self`). For tokio single-task loop.
+//! [`LocalConnectionState`]: Single-owner (`&mut self`). Used by both tokio and DPDK.
 //!
-//! Both share the same packet encrypt/decrypt core via free functions in this module.
+//! Packet encrypt/decrypt core is implemented as free functions in this module,
+//! called by `LocalConnectionState` methods.
 
 pub mod ack;
 pub mod bitmap;
@@ -16,17 +15,13 @@ pub mod packet;
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use parking_lot::{Mutex, RwLock};
 use quinn_proto::ConnectionId;
 use quinn_proto::crypto::{self, HeaderKey, PacketKey};
 use smallvec::SmallVec;
 use tracing::warn;
 
-use ack::{AtomicBitmap, generate_ack_ranges};
 use frame::AckFrame;
 
 /// Maximum ACK ranges to include in a single packet.
@@ -102,8 +97,7 @@ pub struct EncryptResult {
 
 // ── Shared free functions for packet encrypt/decrypt ─────────────────────
 //
-// These are the pure "mechanical" operations, shared by both ConnectionState
-// (DPDK, multi-core) and LocalConnectionState (tokio, single-task).
+// These are the pure "mechanical" operations, called by LocalConnectionState.
 
 /// Unprotect header and parse short header fields.
 ///
@@ -328,316 +322,6 @@ pub fn coarse_now_ns() -> u64 {
     use std::time::Instant;
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
-}
-
-// ── ConnectionState (thread-safe, for DPDK multi-core) ───────────────────
-
-/// QUIC 1-RTT connection state for the data plane.
-///
-/// Created from quinn-proto keys after handshake completes. Handles
-/// encrypt/decrypt/ACK for DATAGRAM-only tunnel traffic.
-///
-/// Thread-safe: packet keys use `RwLock` (read-heavy, ~3.4M reads/sec,
-/// write every 7M packets for key rotation). Pre-computed keys use `Mutex`.
-/// All counters are atomic. Designed for `Arc`-sharing across cores.
-pub struct ConnectionState {
-    // Current crypto keys (RwLock: read-heavy, write only on key rotation).
-    rx_packet_key: RwLock<Box<dyn PacketKey>>,
-    tx_packet_key: RwLock<Box<dyn PacketKey>>,
-    rx_header_key: Box<dyn HeaderKey>,
-    tx_header_key: Box<dyn HeaderKey>,
-    tag_len: usize,
-
-    // Key update (pre-computed generations)
-    next_keys: Mutex<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
-    /// New RX key saved by initiate_key_update(), applied when peer responds.
-    pending_rx_key: Mutex<Option<Box<dyn PacketKey>>>,
-    key_phase: AtomicBool,
-    peer_key_phase: AtomicBool,
-    packets_since_key_update: AtomicU64,
-
-    // Identity
-    local_cid: ConnectionId,
-    remote_cid: ConnectionId,
-    local_cid_len: usize,
-
-    // TX state
-    pn_counter: AtomicU64,
-    /// Largest acked PN (for PN encoding efficiency).
-    largest_acked: AtomicU64,
-
-    // RX state
-    largest_rx_pn: AtomicU64,
-    received: AtomicBitmap,
-
-    // ACK generation
-    rx_since_last_ack: AtomicU32,
-    ack_interval: u32,
-}
-
-impl ConnectionState {
-    /// Create from quinn-proto keys after handshake.
-    ///
-    /// - `keys`: 1-RTT keys extracted via `conn.take_1rtt_keys()`
-    /// - `key_generations`: pre-computed from `conn.produce_next_1rtt_keys()` calls
-    /// - `is_server`: determines which key in each KeyPair is TX vs RX
-    pub fn new(
-        keys: crypto::Keys,
-        key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
-        local_cid: ConnectionId,
-        remote_cid: ConnectionId,
-        is_server: bool,
-    ) -> Arc<Self> {
-        let tag_len = keys.packet.local.tag_len();
-
-        // KeyPair.local = our encryption key, KeyPair.remote = our decryption key.
-        let (tx_packet_key, rx_packet_key) = (keys.packet.local, keys.packet.remote);
-        let (tx_header_key, rx_header_key) = (keys.header.local, keys.header.remote);
-
-        let next_keys = prepare_key_generations(key_generations);
-
-        // Server starts with key_phase=false; initial phase matches.
-        let _ = is_server;
-
-        Arc::new(Self {
-            rx_packet_key: RwLock::new(rx_packet_key),
-            tx_packet_key: RwLock::new(tx_packet_key),
-            rx_header_key,
-            tx_header_key,
-            tag_len,
-            next_keys: Mutex::new(next_keys),
-            pending_rx_key: Mutex::new(None),
-            key_phase: AtomicBool::new(false),
-            peer_key_phase: AtomicBool::new(false),
-            packets_since_key_update: AtomicU64::new(0),
-            local_cid,
-            remote_cid,
-            local_cid_len: local_cid.len(),
-            pn_counter: AtomicU64::new(0),
-            largest_acked: AtomicU64::new(0),
-            largest_rx_pn: AtomicU64::new(0),
-            received: AtomicBitmap::new(),
-            rx_since_last_ack: AtomicU32::new(0),
-            ack_interval: DEFAULT_ACK_INTERVAL,
-        })
-    }
-
-    /// Decrypt an incoming 1-RTT packet (allocates a new BytesMut per call).
-    pub fn decrypt_packet(&self, packet: &mut [u8]) -> Result<DecryptedPacket, ParseError> {
-        let mut scratch = BytesMut::with_capacity(packet.len());
-        self.decrypt_packet_with_buf(packet, &mut scratch)
-    }
-
-    /// Decrypt an incoming 1-RTT packet, reusing a caller-provided BytesMut.
-    pub fn decrypt_packet_with_buf(
-        &self,
-        packet: &mut [u8],
-        scratch: &mut BytesMut,
-    ) -> Result<DecryptedPacket, ParseError> {
-        let largest_pn = self.largest_rx_pn.load(Ordering::Relaxed);
-        let hdr = unprotect_header(
-            packet,
-            self.local_cid_len,
-            self.tag_len,
-            &*self.rx_header_key,
-            largest_pn,
-        )?;
-
-        // Key phase rotation (CAS for multi-core safety).
-        let current_peer_phase = self.peer_key_phase.load(Ordering::Acquire);
-        if hdr.key_phase != current_peer_phase {
-            if self
-                .peer_key_phase
-                .compare_exchange(
-                    current_peer_phase,
-                    hdr.key_phase,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                self.handle_key_update_rx(hdr.key_phase);
-            }
-        }
-
-        let result = {
-            let rx_key = self.rx_packet_key.read();
-            decrypt_payload(packet, &hdr, &**rx_key, scratch)?
-        };
-
-        // Update RX state.
-        self.received.set(hdr.pn);
-        let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
-        self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
-
-        Ok(result)
-    }
-
-    /// Decrypt an incoming 1-RTT packet fully in-place (zero heap allocation).
-    pub fn decrypt_packet_in_place(
-        &self,
-        packet: &mut [u8],
-    ) -> Result<DecryptedInPlace, ParseError> {
-        let largest_pn = self.largest_rx_pn.load(Ordering::Relaxed);
-        let hdr = unprotect_header(
-            packet,
-            self.local_cid_len,
-            self.tag_len,
-            &*self.rx_header_key,
-            largest_pn,
-        )?;
-
-        // Key phase rotation (CAS for multi-core safety).
-        let current_peer_phase = self.peer_key_phase.load(Ordering::Acquire);
-        if hdr.key_phase != current_peer_phase {
-            if self
-                .peer_key_phase
-                .compare_exchange(
-                    current_peer_phase,
-                    hdr.key_phase,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                self.handle_key_update_rx(hdr.key_phase);
-            }
-        }
-
-        let result = {
-            let rx_key = self.rx_packet_key.read();
-            decrypt_payload_in_place(packet, &hdr, &**rx_key)?
-        };
-
-        // Update RX state.
-        self.received.set(hdr.pn);
-        let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
-        self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
-
-        Ok(result)
-    }
-
-    /// Handle a key phase change from the peer.
-    fn handle_key_update_rx(&self, new_phase: bool) {
-        let pending = self.pending_rx_key.lock().take();
-        if let Some(new_rx) = pending {
-            *self.rx_packet_key.write() = new_rx;
-            tracing::debug!("key update: RX rotated (peer responded to our initiation)");
-        } else {
-            let mut next_keys = self.next_keys.lock();
-            if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-                *self.rx_packet_key.write() = new_rx;
-                *self.tx_packet_key.write() = new_tx;
-                tracing::debug!("key update: rotated to new keys (peer-initiated)");
-            } else {
-                warn!("key update requested but no pre-computed keys available");
-                return;
-            }
-        }
-        self.key_phase.store(new_phase, Ordering::Release);
-        self.packets_since_key_update.store(0, Ordering::Relaxed);
-    }
-
-    /// Initiate a key update (our side).
-    fn initiate_key_update(&self) {
-        let mut next_keys = self.next_keys.lock();
-        if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            *self.pending_rx_key.lock() = Some(new_rx);
-            *self.tx_packet_key.write() = new_tx;
-            let old = self.key_phase.load(Ordering::Relaxed);
-            self.key_phase.store(!old, Ordering::Release);
-            self.packets_since_key_update.store(0, Ordering::Relaxed);
-            tracing::debug!("key update: TX rotated, awaiting peer response");
-        } else {
-            warn!("key update: no pre-computed keys available, cannot rotate");
-        }
-    }
-
-    /// Encrypt a datagram payload into a complete 1-RTT QUIC packet.
-    pub fn encrypt_datagram(
-        &self,
-        payload: &[u8],
-        ack_ranges: Option<&[Range<u64>]>,
-        buf: &mut [u8],
-    ) -> Result<EncryptResult, ParseError> {
-        let pkt_count = self.packets_since_key_update.fetch_add(1, Ordering::Relaxed);
-        if pkt_count == KEY_UPDATE_THRESHOLD {
-            self.initiate_key_update();
-        }
-
-        let pn = self.pn_counter.fetch_add(1, Ordering::Relaxed);
-        let largest_acked = self.largest_acked.load(Ordering::Relaxed);
-        let key_phase = self.key_phase.load(Ordering::Acquire);
-
-        let tx_key = self.tx_packet_key.read();
-        encrypt_packet(
-            payload,
-            ack_ranges,
-            &self.remote_cid,
-            pn,
-            largest_acked,
-            key_phase,
-            &**tx_key,
-            &*self.tx_header_key,
-            self.tag_len,
-            buf,
-        )
-    }
-
-    /// Check if an ACK should be sent (every N received packets).
-    pub fn needs_ack(&self) -> bool {
-        self.rx_since_last_ack.load(Ordering::Relaxed) >= self.ack_interval
-    }
-
-    /// Generate ACK ranges from the received bitmap.
-    pub fn generate_ack_ranges(&self) -> SmallVec<[Range<u64>; 8]> {
-        let largest = self.largest_rx_pn.load(Ordering::Relaxed);
-        let ranges = generate_ack_ranges(&self.received, largest, MAX_ACK_RANGES);
-        self.rx_since_last_ack.store(0, Ordering::Relaxed);
-        // Advance base past fully-ACKed regions to keep the scan window small.
-        if let Some(first_range) = ranges.first() {
-            let new_base = first_range.start.saturating_sub(256);
-            if new_base > self.received.base() {
-                self.received.advance_base(new_base);
-            }
-        }
-        ranges
-    }
-
-    /// Always returns true — no congestion control in tunnel mode.
-    pub fn can_send(&self) -> bool {
-        true
-    }
-
-    /// Update the largest acknowledged PN.
-    pub fn update_largest_acked(&self, pn: u64) {
-        self.largest_acked.fetch_max(pn, Ordering::Relaxed);
-    }
-
-    /// Process an ACK frame received from the peer.
-    pub fn process_ack(&self, ack: &AckFrame) {
-        self.update_largest_acked(ack.largest_acked);
-    }
-
-    /// Get the local CID.
-    pub fn local_cid(&self) -> &ConnectionId {
-        &self.local_cid
-    }
-
-    /// Get the remote CID.
-    pub fn remote_cid(&self) -> &ConnectionId {
-        &self.remote_cid
-    }
-
-    /// Get the local CID length.
-    pub fn local_cid_len(&self) -> usize {
-        self.local_cid_len
-    }
-
-    /// Get the AEAD tag length.
-    pub fn tag_len(&self) -> usize {
-        self.tag_len
-    }
 }
 
 /// Convert quinn-proto key generations to (rx, tx) pairs.
