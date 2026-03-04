@@ -7,6 +7,7 @@ members = [
     "quictun-uring",
     "quictun-dpdk",
     "quictun-quic",
+    "quictun-net",
     "quictun-cli",
 ]
 
@@ -22,6 +23,7 @@ quictun-core = { path = "quictun-core" }
 quictun-tun = { path = "quictun-tun" }
 quictun-uring = { path = "quictun-uring" }
 quictun-dpdk = { path = "quictun-dpdk" }
+quictun-net = { path = "quictun-net" }
 
 # QUIC + TLS
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
@@ -44,6 +46,8 @@ hex = "0.4"
 
 # Networking
 ipnet = "2"
+mio = { version = "1", features = ["os-poll", "net"] }
+socket2 = { version = "0.5", features = ["all"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

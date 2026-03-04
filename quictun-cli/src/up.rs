@@ -44,7 +44,7 @@ pub fn run(
     dpdk_cores: usize,
     no_udp_checksum: bool,
     offload: bool,
-    fast: bool,
+    legacy: bool,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -85,33 +85,199 @@ pub fn run(
         );
     }
 
-    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-
-    if fast {
-        return rt.block_on(run_async_fast(
+    // Default: synchronous blocking engine (quictun-net).
+    // --legacy: tokio-based forwarding.
+    if legacy {
+        let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+        return rt.block_on(run_async(
             config_path,
+            serial,
             cc,
             recv_buf,
             send_buf,
             send_window,
+            queues,
             initial_rtt,
             pin_mtu,
             offload,
         ));
     }
 
-    rt.block_on(run_async(
-        config_path,
-        serial,
+    run_net(config_path, cc, recv_buf, send_buf, send_window, initial_rtt, pin_mtu)
+}
+
+/// Run the synchronous blocking engine (quictun-net, default path).
+#[allow(clippy::too_many_arguments)]
+fn run_net(
+    config_path: &str,
+    cc: CongestionControl,
+    _recv_buf: usize,
+    _send_buf: usize,
+    _send_window: u64,
+    _initial_rtt: u64,
+    _pin_mtu: bool,
+) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
+    let role = config.role();
+    let addr = config.parse_address()?;
+
+    let private_key = PrivateKey::from_base64(&config.interface.private_key)
+        .context("invalid interface private_key")?;
+
+    // Parse all peer public keys.
+    let peer_pubkeys: Vec<PublicKey> = config
+        .peer
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            PublicKey::from_base64(&p.public_key)
+                .with_context(|| format!("invalid public_key for peer[{i}]"))
+        })
+        .collect::<Result<_>>()?;
+
+    let tuning = TransportTuning {
+        datagram_recv_buffer: _recv_buf,
+        datagram_send_buffer: _send_buf,
+        send_window: _send_window,
         cc,
-        recv_buf,
-        send_buf,
-        send_window,
-        queues,
-        initial_rtt,
-        pin_mtu,
-        offload,
-    ))
+        max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
+        initial_rtt_ms: _initial_rtt,
+        pin_mtu: _pin_mtu,
+        ..Default::default()
+    };
+
+    tracing::info!(
+        role = ?role,
+        address = %addr,
+        mtu = config.mtu(),
+        peers = config.peer.len(),
+        cc = %cc,
+        "starting quictun (net engine)"
+    );
+
+    // Resolve interface name from config.
+    let iface_name = config.interface_name(Path::new(config_path));
+
+    // Write PID file.
+    state::write_pid_file(&iface_name)?;
+    let _pid_guard = state::PidFileGuard::new(iface_name.clone());
+
+    // Idle timeout.
+    let idle_timeout = if config.interface.max_idle_timeout_ms > 0 {
+        Duration::from_millis(config.interface.max_idle_timeout_ms)
+    } else {
+        Duration::from_secs(30)
+    };
+
+    let cid_len = config.interface.cid_length as usize;
+
+    // Build peer configs for identity matching.
+    let resolved_peers: Vec<quictun_core::peer::PeerConfig> = config
+        .peer
+        .iter()
+        .zip(peer_pubkeys.iter())
+        .map(|(peer_cfg, pubkey)| {
+            let tunnel_ip: std::net::Ipv4Addr = peer_cfg
+                .allowed_ips
+                .first()
+                .and_then(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                .map(|net| net.addr())
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+            quictun_core::peer::PeerConfig {
+                spki_der: pubkey.spki_der().to_vec(),
+                tunnel_ip,
+                keepalive: peer_cfg.keepalive.map(Duration::from_secs),
+            }
+        })
+        .collect();
+
+    let reconnect = config.peer[0].reconnect_interval.is_some();
+
+    // Build UDP bind address.
+    let listen_port = config.interface.listen_port.unwrap_or(0);
+    let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
+
+    // Build endpoint setup.
+    let first_keepalive = config.peer[0].keepalive.map(Duration::from_secs);
+
+    let net_config = quictun_net::engine::NetConfig {
+        tunnel_ip: addr.addr(),
+        tunnel_prefix: addr.prefix_len(),
+        tunnel_mtu: config.mtu(),
+        tunnel_name: Some(iface_name),
+        idle_timeout,
+        cid_len,
+        peers: resolved_peers,
+        reconnect,
+    };
+
+    // Backoff state for reconnection.
+    let mut backoff_secs: u64 = 1;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    loop {
+        let setup = match role {
+            Role::Listener => {
+                let server_config = proto_config::build_proto_server_config(
+                    &private_key,
+                    &peer_pubkeys,
+                    first_keepalive,
+                    &tuning,
+                )?;
+                quictun_net::engine::EndpointSetup::Listener { server_config }
+            }
+            Role::Connector => {
+                let peer = &config.peer[0];
+                let peer_pubkey = &peer_pubkeys[0];
+                let keepalive = peer.keepalive.map(Duration::from_secs);
+                let client_config = proto_config::build_proto_client_config(
+                    &private_key,
+                    peer_pubkey,
+                    keepalive,
+                    &tuning,
+                )?;
+                let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+                quictun_net::engine::EndpointSetup::Connector {
+                    remote_addr,
+                    client_config,
+                }
+            }
+        };
+
+        match quictun_net::engine::run(local_addr, setup, net_config.clone())? {
+            quictun_net::engine::RunResult::Shutdown => {
+                tracing::info!("tunnel closed (shutdown)");
+                break;
+            }
+            quictun_net::engine::RunResult::ConnectionLost => {
+                if reconnect {
+                    let jitter_ms = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos()
+                        % 1000) as u64;
+                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                    std::thread::sleep(delay);
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+                tracing::info!("connection lost, exiting (no reconnect configured)");
+                break;
+            }
+        }
+    }
+
+    tracing::info!("tunnel closed");
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -876,7 +1042,7 @@ async fn run_async(
 ///
 /// Uses quinn-proto directly (not quinn high-level API) for the handshake,
 /// then switches to quictun-quic for the 1-RTT data plane.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 async fn run_async_fast(
     config_path: &str,
     cc: CongestionControl,

@@ -792,6 +792,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1065,6 +1066,7 @@ dependencies = [
  "quictun-core",
  "quictun-crypto",
  "quictun-dpdk",
+ "quictun-net",
  "quictun-tun",
  "quictun-uring",
  "quinn",
@@ -1125,6 +1127,7 @@ dependencies = [
  "bindgen 0.71.1",
  "bytes",
  "cc",
+ "hex",
  "libc",
  "pkg-config",
  "quictun-core",
@@ -1136,11 +1139,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "quictun-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "hex",
+ "libc",
+ "mio",
+ "quictun-core",
+ "quictun-quic",
+ "quictun-tun",
+ "quinn-proto",
+ "socket2 0.5.10",
+ "tracing",
+ "tun-rs",
+]
+
+[[package]]
 name = "quictun-quic"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "parking_lot",
  "quinn-proto",
  "smallvec",
  "tracing",

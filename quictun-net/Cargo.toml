@@ -1,0 +1,19 @@
+[package]
+name = "quictun-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quictun-core = { workspace = true }
+quictun-tun = { workspace = true }
+quictun-quic = { workspace = true }
+quinn-proto = { workspace = true }
+mio = { workspace = true }
+socket2 = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+hex = { workspace = true }
+tun-rs = { workspace = true }

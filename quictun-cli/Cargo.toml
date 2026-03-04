@@ -15,6 +15,7 @@ path = "src/main.rs"
 quictun-crypto = { workspace = true }
 quictun-core = { workspace = true }
 quictun-tun = { workspace = true }
+quictun-net = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

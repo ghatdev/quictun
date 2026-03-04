@@ -4,6 +4,7 @@ pub mod fast_tunnel;
 pub mod peer;
 pub mod proto_config;
 pub mod proto_driver;
+pub mod quic_state;
 pub mod tunnel;
 
 #[cfg(target_os = "linux")]

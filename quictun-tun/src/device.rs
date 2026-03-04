@@ -206,12 +206,11 @@ impl TunDevice {
     }
 }
 
-/// Create a synchronous TUN device (Linux only, for io_uring data plane).
+/// Create a synchronous TUN device for non-async data planes (io_uring, quictun-net).
 ///
-/// Returns the `SyncDevice` which implements `AsRawFd` for use with io_uring.
-/// When `opts.multi_queue` is true, the device supports `try_clone()` for
-/// additional queue fds (kernel distributes packets by flow hash).
-#[cfg(target_os = "linux")]
+/// Returns the `SyncDevice` which provides blocking I/O.
+/// On Linux, when `opts.multi_queue` is true, the device supports `try_clone()`
+/// for additional queue fds (kernel distributes packets by flow hash).
 pub fn create_sync(opts: &TunOptions) -> Result<tun_rs::SyncDevice, TunError> {
     let mut builder = tun_rs::DeviceBuilder::new();
 
@@ -219,6 +218,7 @@ pub fn create_sync(opts: &TunOptions) -> Result<tun_rs::SyncDevice, TunError> {
         builder = builder.name(n);
     }
 
+    #[cfg(target_os = "linux")]
     if opts.multi_queue {
         builder = builder.multi_queue(true);
     }
@@ -236,8 +236,7 @@ pub fn create_sync(opts: &TunOptions) -> Result<tun_rs::SyncDevice, TunError> {
         address = %opts.address,
         prefix_len = opts.prefix_len,
         mtu = opts.mtu,
-        multi_queue = opts.multi_queue,
-        "sync TUN device created (io_uring)"
+        "sync TUN device created"
     );
 
     Ok(device)

@@ -14,6 +14,7 @@ use tracing::info;
 /// Peer configuration for identity matching after handshake.
 ///
 /// Replaces the backend-specific `ResolvedPeer` (tokio) and `PeerInfo` (DPDK).
+#[derive(Clone)]
 pub struct PeerConfig {
     /// SPKI DER of the peer's public key.
     ///
