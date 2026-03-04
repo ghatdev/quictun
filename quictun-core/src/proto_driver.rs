@@ -378,6 +378,11 @@ pub async fn run_accept_loop(
     struct HandshakeState {
         connection: quinn_proto::Connection,
         remote_addr: std::net::SocketAddr,
+        /// Local CID registered in the dispatch table at accept time.
+        local_cid: quinn_proto::ConnectionId,
+        /// Channel receivers created at accept time (moved to connection task on completion).
+        udp_rx: Option<tokio::sync::mpsc::Receiver<BytesMut>>,
+        tun_rx: Option<tokio::sync::mpsc::Receiver<BytesMut>>,
     }
     let mut handshakes: HashMap<ConnectionHandle, HandshakeState> = HashMap::new();
 
@@ -418,10 +423,31 @@ pub async fn run_accept_loop(
                             match endpoint.accept(incoming, now, &mut response_buf, Some(server_config.clone())) {
                                 Ok((ch, conn)) => {
                                     let remote = conn.remote_address();
-                                    info!(remote = %remote, "accepted incoming handshake");
+                                    let local_cid = *conn.local_cid();
+
+                                    // Pre-register CID in dispatch table immediately.
+                                    // Packets for this CID get buffered while handshake proceeds.
+                                    let (handle, udp_rx, tun_rx) =
+                                        crate::dispatcher::new_connection_channels(
+                                            remote,
+                                            std::net::Ipv4Addr::UNSPECIFIED,
+                                        );
+                                    {
+                                        let mut t = table.write().expect("dispatch table poisoned");
+                                        t.register_cid(local_cid, handle);
+                                    }
+
+                                    info!(
+                                        remote = %remote,
+                                        cid = %hex::encode(&local_cid[..]),
+                                        "accepted incoming handshake (CID pre-registered)"
+                                    );
                                     handshakes.insert(ch, HandshakeState {
                                         connection: conn,
                                         remote_addr: remote,
+                                        local_cid,
+                                        udp_rx: Some(udp_rx),
+                                        tun_rx: Some(tun_rx),
                                     });
                                 }
                                 Err(e) => {
@@ -507,24 +533,42 @@ pub async fn run_accept_loop(
             }
         }
 
-        // Remove failed handshakes.
+        // Remove failed handshakes and unregister their pre-registered CIDs.
         for ch in failed {
-            handshakes.remove(&ch);
+            if let Some(hs) = handshakes.remove(&ch) {
+                let mut t = table.write().expect("dispatch table poisoned");
+                t.unregister_cid(&hs.local_cid);
+            }
         }
 
         // Promote completed handshakes to connection tasks.
         for ch in completed {
             let Some(mut hs) = handshakes.remove(&ch) else { continue };
 
-            // Extract keys.
-            let is_server = true;
-            let raw = match extract_keys(&mut hs.connection, is_server, hs.remote_addr) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "failed to extract keys after handshake");
+            // CID was pre-registered at accept time. Channels are in hs.
+            let local_cid = hs.local_cid;
+            let remote_cid = hs.connection.remote_cid();
+
+            // Identify peer by certificate.
+            let tunnel_ip = match identify_peer(&hs.connection, &peers) {
+                Some(peer) => peer.tunnel_ip,
+                None => {
+                    warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                    let mut t = table.write().expect("dispatch table poisoned");
+                    t.unregister_cid(&local_cid);
                     continue;
                 }
             };
+            let peer_keepalive = peers
+                .iter()
+                .find(|p| p.tunnel_ip == tunnel_ip)
+                .and_then(|p| p.keepalive);
+
+            // Add IP route (phase 2 of registration).
+            {
+                let mut t = table.write().expect("dispatch table poisoned");
+                t.add_route(&local_cid, tunnel_ip);
+            }
 
             // Drain final transmits.
             let now = Instant::now();
@@ -537,42 +581,36 @@ pub async fn run_accept_loop(
                 let _ = udp.send_to(&transmit_buf[..transmit.size], hs.remote_addr).await;
             }
 
-            // Match peer by certificate identity.
-            let tunnel_ip = match identify_peer(&hs.connection, &peers) {
-                Some(peer) => peer.tunnel_ip,
-                None => {
-                    warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+            // Extract keys (expensive: pre-computes 1000 key generations).
+            let is_server = true;
+            let raw = match extract_keys(&mut hs.connection, is_server, hs.remote_addr) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "failed to extract keys after handshake");
+                    let mut t = table.write().expect("dispatch table poisoned");
+                    t.unregister(&local_cid, tunnel_ip);
                     continue;
                 }
             };
-            let peer_keepalive = peers
-                .iter()
-                .find(|p| p.tunnel_ip == tunnel_ip)
-                .and_then(|p| p.keepalive);
 
             // Create LocalConnectionState.
             let conn = quictun_quic::local::LocalConnectionState::new(
                 raw.keys,
                 raw.key_gens,
-                raw.local_cid,
-                raw.remote_cid,
+                local_cid,
+                remote_cid,
                 raw.is_server,
             );
 
-            // Create channels and register in dispatch table.
-            let (handle, udp_chan_rx, tun_chan_rx) =
-                crate::dispatcher::new_connection_channels(hs.remote_addr, tunnel_ip);
-            {
-                let mut t = table.write().expect("dispatch table poisoned");
-                t.register(raw.local_cid, handle);
-            }
+            // Take channel receivers from handshake state.
+            let udp_chan_rx = hs.udp_rx.take().expect("udp_rx already taken");
+            let tun_chan_rx = hs.tun_rx.take().expect("tun_rx already taken");
 
             // Spawn the per-connection task.
             let udp_clone = udp.clone();
             let tun_clone = tun.clone();
             let shutdown_clone = shutdown.clone();
             let cleanup_tx_clone = cleanup_tx.clone();
-            let local_cid = raw.local_cid;
 
             info!(
                 remote = %hs.remote_addr,

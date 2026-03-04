@@ -48,17 +48,35 @@ impl DispatchTable {
         Self::default()
     }
 
-    /// Register a new connection in both lookup tables.
-    pub fn register(&mut self, cid: ConnectionId, handle: ConnectionHandle) {
-        let ip = handle.tunnel_ip;
+    /// Register CID routing only (phase 1).
+    ///
+    /// Called right after `endpoint.accept()`, before the handshake completes.
+    /// Packets arriving for this CID get buffered in the channel while the
+    /// handshake + key extraction proceed. The IP route is added later via
+    /// `add_route()` once the peer is identified.
+    pub fn register_cid(&mut self, cid: ConnectionId, handle: ConnectionHandle) {
         tracing::info!(
             cid = %hex::encode(&cid[..]),
-            tunnel_ip = %ip,
             remote = %handle.remote_addr,
-            "dispatcher: registered connection"
+            "dispatcher: registered CID (pre-handshake)"
         );
-        self.connections.insert(cid, handle.clone());
-        self.routes.insert(ip, handle);
+        self.connections.insert(cid, handle);
+    }
+
+    /// Add IP route for an already-registered connection (phase 2).
+    ///
+    /// Called after handshake completes and the peer is identified.
+    pub fn add_route(&mut self, cid: &ConnectionId, tunnel_ip: Ipv4Addr) {
+        if let Some(handle) = self.connections.get(cid) {
+            let mut routed = handle.clone();
+            routed.tunnel_ip = tunnel_ip;
+            tracing::info!(
+                cid = %hex::encode(&cid[..]),
+                tunnel_ip = %tunnel_ip,
+                "dispatcher: added IP route"
+            );
+            self.routes.insert(tunnel_ip, routed);
+        }
     }
 
     /// Remove a connection from both lookup tables.
@@ -69,6 +87,15 @@ impl DispatchTable {
             cid = %hex::encode(&cid[..]),
             tunnel_ip = %tunnel_ip,
             "dispatcher: unregistered connection"
+        );
+    }
+
+    /// Remove a CID-only registration (handshake failed before peer identified).
+    pub fn unregister_cid(&mut self, cid: &ConnectionId) {
+        self.connections.remove(cid);
+        tracing::info!(
+            cid = %hex::encode(&cid[..]),
+            "dispatcher: unregistered CID (handshake failed)"
         );
     }
 
