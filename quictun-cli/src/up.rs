@@ -45,6 +45,7 @@ pub fn run(
     no_udp_checksum: bool,
     offload: bool,
     fast: bool,
+    legacy_parallel: bool,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -98,6 +99,7 @@ pub fn run(
             initial_rtt,
             pin_mtu,
             offload,
+            legacy_parallel,
         ));
     }
 
@@ -859,6 +861,7 @@ async fn run_async_fast(
     initial_rtt: u64,
     pin_mtu: bool,
     offload: bool,
+    legacy_parallel: bool,
 ) -> Result<()> {
     use quictun_core::tunnel::TunnelResult;
 
@@ -979,6 +982,11 @@ async fn run_async_fast(
     let udp = tokio::net::UdpSocket::bind(bind_addr)
         .await
         .context("failed to bind UDP socket")?;
+    // Increase socket buffers to 4MB for high-throughput burst tolerance.
+    // Prevents UDP packet drops during slow start ramp-up.
+    let sock_ref = socket2::SockRef::from(&udp);
+    let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
     let udp = Arc::new(udp);
 
     tracing::info!(local_addr = %udp.local_addr()?, "UDP socket bound");
@@ -999,40 +1007,57 @@ async fn run_async_fast(
             break;
         }
 
-        // Phase 1: Handshake.
-        let handshake_result = match proto_driver::run_handshake(&udp, &setup, &shutdown_rx).await {
-            Ok(r) => {
-                backoff_secs = 1;
-                r
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "handshake failed");
-                if reconnect_interval.is_some() {
-                    let jitter_ms = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos()
-                        % 1000) as u64;
-                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
-                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
-                    tokio::time::sleep(delay).await;
-                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                    continue;
+        // Phase 1+2: Handshake + forwarding.
+        // Default: single-task loop with LocalConnectionState.
+        // --legacy-parallel: old two-task loop with Arc<ConnectionState>.
+        let result = if legacy_parallel {
+            // Legacy path: thread-safe ConnectionState, two tasks.
+            let handshake_result = match proto_driver::run_handshake(&udp, &setup, &shutdown_rx).await {
+                Ok(r) => {
+                    backoff_secs = 1;
+                    r
                 }
-                return Err(e).context("handshake failed");
-            }
-        };
+                Err(e) => {
+                    tracing::warn!(error = %e, "handshake failed");
+                    if reconnect_interval.is_some() {
+                        let jitter_ms = (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            % 1000) as u64;
+                        let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                        tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                        tokio::time::sleep(delay).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+                    return Err(e).context("handshake failed");
+                }
+            };
 
-        tracing::info!(
-            remote = %handshake_result.remote_addr,
-            "connection established, switching to fast data plane"
-        );
+            tracing::info!(
+                remote = %handshake_result.remote_addr,
+                "connection established, switching to fast data plane (legacy parallel)"
+            );
 
-        // Phase 2: Fast forwarding loop.
-        let result = if cfg!(target_os = "linux") && offload && parallel {
-            #[cfg(target_os = "linux")]
-            {
-                fast_tunnel::run_fast_forwarding_loop_offload(
+            if cfg!(target_os = "linux") && offload && parallel {
+                #[cfg(target_os = "linux")]
+                {
+                    fast_tunnel::run_fast_forwarding_loop_offload(
+                        handshake_result.connection_state,
+                        udp.clone(),
+                        tun.clone(),
+                        handshake_result.remote_addr,
+                        idle_timeout,
+                        keepalive,
+                        shutdown_rx.clone(),
+                    )
+                    .await
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!()
+            } else if parallel {
+                fast_tunnel::run_fast_forwarding_loop_parallel(
                     handshake_result.connection_state,
                     udp.clone(),
                     tun.clone(),
@@ -1042,23 +1067,50 @@ async fn run_async_fast(
                     shutdown_rx.clone(),
                 )
                 .await
+            } else {
+                fast_tunnel::run_fast_forwarding_loop(
+                    &handshake_result.connection_state,
+                    &udp,
+                    &tun,
+                    handshake_result.remote_addr,
+                    idle_timeout,
+                    keepalive,
+                    shutdown_rx.clone(),
+                )
+                .await
             }
-            #[cfg(not(target_os = "linux"))]
-            unreachable!()
-        } else if parallel {
-            fast_tunnel::run_fast_forwarding_loop_parallel(
-                handshake_result.connection_state,
-                udp.clone(),
-                tun.clone(),
-                handshake_result.remote_addr,
-                idle_timeout,
-                keepalive,
-                shutdown_rx.clone(),
-            )
-            .await
         } else {
-            fast_tunnel::run_fast_forwarding_loop(
-                &handshake_result.connection_state,
+            // New default: single-task loop with LocalConnectionState.
+            let handshake_result = match proto_driver::run_handshake_local(&udp, &setup, &shutdown_rx).await {
+                Ok(r) => {
+                    backoff_secs = 1;
+                    r
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "handshake failed");
+                    if reconnect_interval.is_some() {
+                        let jitter_ms = (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            % 1000) as u64;
+                        let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                        tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                        tokio::time::sleep(delay).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+                    return Err(e).context("handshake failed");
+                }
+            };
+
+            tracing::info!(
+                remote = %handshake_result.remote_addr,
+                "connection established, switching to fast data plane (single-task)"
+            );
+
+            fast_tunnel::run_fast_loop(
+                handshake_result.connection_state,
                 &udp,
                 &tun,
                 handshake_result.remote_addr,

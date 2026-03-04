@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
+use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig, crypto};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -33,10 +33,18 @@ pub enum HandshakeSetup {
     },
 }
 
-/// Result of a successful handshake.
+/// Result of a successful handshake (thread-safe ConnectionState).
 pub struct HandshakeResult {
     /// quictun-quic connection state with extracted 1-RTT keys.
     pub connection_state: Arc<quictun_quic::ConnectionState>,
+    /// Remote peer address.
+    pub remote_addr: SocketAddr,
+}
+
+/// Result of a successful handshake (single-owner LocalConnectionState).
+pub struct LocalHandshakeResult {
+    /// quictun-quic local connection state (non-atomic, for single-task loop).
+    pub connection_state: quictun_quic::local::LocalConnectionState,
     /// Remote peer address.
     pub remote_addr: SocketAddr,
 }
@@ -51,15 +59,32 @@ enum LoopAction {
     Shutdown,
 }
 
-/// Run the quinn-proto handshake over a tokio UdpSocket.
-///
-/// Drives the endpoint state machine until `Event::Connected`, extracts 1-RTT
-/// keys, and returns a `HandshakeResult` for the quictun-quic data plane.
+/// Run the quinn-proto handshake, returning a thread-safe `ConnectionState`.
 pub async fn run_handshake(
     udp: &UdpSocket,
     setup: &HandshakeSetup,
     shutdown: &watch::Receiver<bool>,
 ) -> Result<HandshakeResult> {
+    let raw = run_handshake_raw(udp, setup, shutdown).await?;
+    let connection_state = quictun_quic::ConnectionState::new(
+        raw.keys,
+        raw.key_gens,
+        raw.local_cid,
+        raw.remote_cid,
+        raw.is_server,
+    );
+    Ok(HandshakeResult {
+        connection_state,
+        remote_addr: raw.remote_addr,
+    })
+}
+
+/// Core handshake loop — returns raw keys for the caller to wrap.
+async fn run_handshake_raw(
+    udp: &UdpSocket,
+    setup: &HandshakeSetup,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<RawHandshakeKeys> {
     let local_addr = udp.local_addr().context("failed to get local address")?;
 
     let server_config = match setup {
@@ -76,7 +101,6 @@ pub async fn run_handshake(
         HandshakeSetup::Listener { .. } => "0.0.0.0:0".parse().unwrap(),
     };
 
-    // Initiate connection for connector mode.
     if let HandshakeSetup::Connector {
         remote_addr: addr,
         client_config,
@@ -90,8 +114,6 @@ pub async fn run_handshake(
         connection = Some(new_conn);
         remote_addr = *addr;
         info!(remote = %addr, "QUIC connection initiated (handshake)");
-
-        // Drain initial transmits (ClientHello).
         drain_transmits(udp, connection.as_mut().unwrap(), remote_addr).await?;
     } else {
         info!(address = %local_addr, "listening for incoming connection (handshake)");
@@ -109,7 +131,6 @@ pub async fn run_handshake(
 
         let timeout_dur = deadline.saturating_duration_since(Instant::now());
 
-        // Phase 1: Wait for I/O event (no mutable borrows held across await).
         let action = tokio::select! {
             result = udp.recv_from(&mut recv_buf) => {
                 let (n, from) = result.context("UDP recv failed during handshake")?;
@@ -123,7 +144,6 @@ pub async fn run_handshake(
             }
         };
 
-        // Phase 2: Process the event synchronously (no borrows cross await points).
         match action {
             LoopAction::RecvPacket { n, from } => {
                 let now = Instant::now();
@@ -158,59 +178,23 @@ pub async fn run_handshake(
             }
         }
 
-        // Phase 3: Process quinn-proto events and check for Connected.
         if let Some(conn) = connection.as_mut() {
             let conn_ch = ch.expect("connection exists but no ConnectionHandle");
 
-            // Process endpoint events.
             while let Some(event) = conn.poll_endpoint_events() {
                 if let Some(conn_event) = endpoint.handle_event(conn_ch, event) {
                     conn.handle_event(conn_event);
                 }
             }
 
-            // Process application events.
             while let Some(event) = conn.poll() {
                 match event {
                     Event::Connected => {
                         info!("quic: handshake complete");
-
-                        let keys = conn
-                            .take_1rtt_keys()
-                            .context("Connected but no 1-RTT keys available")?;
-
-                        let local_cid = *conn.local_cid();
-                        let remote_cid = conn.remote_cid();
                         let is_server = server_config.is_some();
-
-                        // Pre-compute key update generations (~2ms, ~128KB).
-                        let mut key_gens = VecDeque::new();
-                        if let Some(first) = conn.take_next_1rtt_keys() {
-                            key_gens.push_back(first);
-                        }
-                        for _ in 0..999 {
-                            if let Some(kp) = conn.produce_next_1rtt_keys() {
-                                key_gens.push_back(kp);
-                            } else {
-                                break;
-                            }
-                        }
-                        info!(
-                            key_generations = key_gens.len(),
-                            "pre-computed key update generations"
-                        );
-
-                        let connection_state = quictun_quic::ConnectionState::new(
-                            keys, key_gens, local_cid, remote_cid, is_server, true,
-                        );
-
-                        // Drain any remaining transmits after Connected.
+                        let raw = extract_keys(conn, is_server, remote_addr)?;
                         drain_transmits(udp, conn, remote_addr).await?;
-
-                        return Ok(HandshakeResult {
-                            connection_state,
-                            remote_addr,
-                        });
+                        return Ok(raw);
                     }
                     Event::ConnectionLost { reason } => {
                         anyhow::bail!("connection lost during handshake: {reason}");
@@ -222,7 +206,6 @@ pub async fn run_handshake(
                 }
             }
 
-            // Drain transmits and update deadline.
             drain_transmits(udp, conn, remote_addr).await?;
             deadline = conn
                 .poll_timeout()
@@ -279,6 +262,78 @@ async fn handle_datagram_event(
         }
     }
     Ok(())
+}
+
+/// Raw keys extracted from a quinn-proto handshake.
+struct RawHandshakeKeys {
+    keys: crypto::Keys,
+    key_gens: VecDeque<crypto::KeyPair<Box<dyn quinn_proto::crypto::PacketKey>>>,
+    local_cid: quinn_proto::ConnectionId,
+    remote_cid: quinn_proto::ConnectionId,
+    is_server: bool,
+    remote_addr: SocketAddr,
+}
+
+/// Extract 1-RTT keys and pre-compute key generations from a connected quinn-proto Connection.
+fn extract_keys(
+    conn: &mut quinn_proto::Connection,
+    is_server: bool,
+    remote_addr: SocketAddr,
+) -> Result<RawHandshakeKeys> {
+    let keys = conn
+        .take_1rtt_keys()
+        .context("Connected but no 1-RTT keys available")?;
+
+    let local_cid = *conn.local_cid();
+    let remote_cid = conn.remote_cid();
+
+    let mut key_gens = VecDeque::new();
+    if let Some(first) = conn.take_next_1rtt_keys() {
+        key_gens.push_back(first);
+    }
+    for _ in 0..999 {
+        if let Some(kp) = conn.produce_next_1rtt_keys() {
+            key_gens.push_back(kp);
+        } else {
+            break;
+        }
+    }
+    info!(
+        key_generations = key_gens.len(),
+        "pre-computed key update generations"
+    );
+
+    Ok(RawHandshakeKeys {
+        keys,
+        key_gens,
+        local_cid,
+        remote_cid,
+        is_server,
+        remote_addr,
+    })
+}
+
+/// Run the quinn-proto handshake, returning a `LocalConnectionState`.
+///
+/// Same handshake as `run_handshake`, but returns a single-owner state
+/// for the single-task forwarding loop.
+pub async fn run_handshake_local(
+    udp: &UdpSocket,
+    setup: &HandshakeSetup,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<LocalHandshakeResult> {
+    let raw = run_handshake_raw(udp, setup, shutdown).await?;
+    let connection_state = quictun_quic::local::LocalConnectionState::new(
+        raw.keys,
+        raw.key_gens,
+        raw.local_cid,
+        raw.remote_cid,
+        raw.is_server,
+    );
+    Ok(LocalHandshakeResult {
+        connection_state,
+        remote_addr: raw.remote_addr,
+    })
 }
 
 /// Drain all pending transmits from a quinn-proto connection.

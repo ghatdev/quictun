@@ -104,6 +104,9 @@ enum Command {
         /// Use quictun-quic fast data plane (bypass quinn high-level API after handshake)
         #[arg(long)]
         fast: bool,
+        /// Use legacy parallel forwarding with --fast (two tasks sharing Arc<ConnectionState>)
+        #[arg(long)]
+        legacy_parallel: bool,
     },
     /// Bring down a running tunnel by config file
     Down {
@@ -146,12 +149,13 @@ fn main() -> anyhow::Result<()> {
             no_udp_checksum,
             offload,
             fast,
+            legacy_parallel,
         } => up::run(
             &config, serial, &cc, recv_buf, send_buf, send_window, queues, iouring, sqpoll,
             sqpoll_cpu, iouring_cores, pool_size, zero_copy, initial_rtt, pin_mtu,
             dpdk, dpdk_local_ip, dpdk_remote_ip, dpdk_local_port, dpdk_gateway_mac,
             dpdk_eal_args, dpdk_port, no_adaptive_poll, dpdk_cores, no_udp_checksum, offload,
-            fast,
+            fast, legacy_parallel,
         ),
         Command::Down { config } => down::run(&config),
     }

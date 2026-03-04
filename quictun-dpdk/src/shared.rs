@@ -118,7 +118,7 @@ pub fn process_events(state: &mut QuicState, result: &mut DriveResult) {
                     info!(key_generations = key_gens.len(), "pre-computed key update generations");
 
                     let conn_state = quictun_quic::ConnectionState::new(
-                        keys, key_gens, local_cid, remote_cid, is_server, false,
+                        keys, key_gens, local_cid, remote_cid, is_server,
                     );
                     result.connection_state = Some(conn_state);
                 } else {

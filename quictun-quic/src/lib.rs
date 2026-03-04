@@ -1,17 +1,17 @@
 //! quictun-quic: Optimized QUIC 1-RTT data plane for DATAGRAM tunneling.
 //!
 //! Replaces quinn-proto for 1-RTT short header packets after handshake.
-//! Thread-safe: all state is atomic or behind `parking_lot` locks for
-//! `Arc`-sharing across cores in multi-core mode.
 //!
-//! quinn-proto still handles handshake (long headers). Once `Event::Connected`
-//! fires, keys are extracted via `Connection::take_1rtt_keys()` and handed to
-//! `ConnectionState` for the data plane.
+//! Two connection state types:
+//! - [`ConnectionState`]: Thread-safe (`Arc`-shared, atomic/RwLock). For DPDK multi-core.
+//! - [`LocalConnectionState`]: Single-owner (`&mut self`). For tokio single-task loop.
+//!
+//! Both share the same packet encrypt/decrypt core via free functions in this module.
 
 pub mod ack;
-pub mod cc;
+pub mod bitmap;
 pub mod frame;
-pub mod ordered_queue;
+pub mod local;
 pub mod packet;
 
 use std::collections::VecDeque;
@@ -27,14 +27,18 @@ use smallvec::SmallVec;
 use tracing::warn;
 
 use ack::{AtomicBitmap, generate_ack_ranges};
-use cc::{CongestionControl, SentPacketRing};
 use frame::AckFrame;
 
 /// Maximum ACK ranges to include in a single packet.
 const MAX_ACK_RANGES: usize = 8;
 
 /// Send an ACK every N received packets.
-const DEFAULT_ACK_INTERVAL: u32 = 2;
+///
+/// Higher values reduce CPU overhead from ACK-only packet encryption and
+/// sending, which is critical at high packet rates (>100K pps). Too low
+/// (e.g., 2) causes the receiver to spend most CPU encrypting ACK-onlys,
+/// starving the data receive path and causing UDP buffer overflow.
+const DEFAULT_ACK_INTERVAL: u32 = 64;
 
 /// Trigger key update after this many packets (well below AES-GCM 2^23 limit).
 const KEY_UPDATE_THRESHOLD: u64 = 7_000_000;
@@ -96,10 +100,242 @@ pub struct EncryptResult {
     pub pn: u64,
 }
 
+// ── Shared free functions for packet encrypt/decrypt ─────────────────────
+//
+// These are the pure "mechanical" operations, shared by both ConnectionState
+// (DPDK, multi-core) and LocalConnectionState (tokio, single-task).
+
+/// Unprotect header and parse short header fields.
+///
+/// Returns the parsed header. The caller must handle key phase rotation
+/// before calling [`decrypt_payload`].
+pub fn unprotect_header(
+    packet: &mut [u8],
+    cid_len: usize,
+    tag_len: usize,
+    rx_header_key: &dyn HeaderKey,
+    largest_rx_pn: u64,
+) -> Result<packet::ShortHeader, ParseError> {
+    let pkt_len = packet.len();
+    if pkt_len < 1 + cid_len + 4 + tag_len {
+        return Err(ParseError::BufferTooShort);
+    }
+    let pn_offset = 1 + cid_len;
+    let sample_offset = pn_offset + 4;
+    if pkt_len < sample_offset + rx_header_key.sample_size() {
+        return Err(ParseError::BufferTooShort);
+    }
+    rx_header_key.decrypt(pn_offset, packet);
+    packet::parse_short_header(packet, cid_len, largest_rx_pn)
+}
+
+/// AEAD-decrypt the payload and parse QUIC frames.
+///
+/// `packet` must have had header protection removed and header parsed.
+/// `scratch` is reused across calls (cleared internally).
+pub fn decrypt_payload(
+    packet: &[u8],
+    hdr: &packet::ShortHeader,
+    rx_packet_key: &dyn PacketKey,
+    scratch: &mut BytesMut,
+) -> Result<DecryptedPacket, ParseError> {
+    let header_bytes = &packet[..hdr.payload_offset];
+    scratch.clear();
+    scratch.extend_from_slice(&packet[hdr.payload_offset..]);
+
+    rx_packet_key
+        .decrypt(hdr.pn, header_bytes, scratch)
+        .map_err(|_| ParseError::CryptoError)?;
+
+    let decrypted = scratch.split().freeze();
+    parse_frames_bytes(decrypted, hdr.pn)
+}
+
+/// AEAD-decrypt the payload in-place and parse QUIC frames.
+///
+/// Returns byte ranges into `packet` for each DATAGRAM payload.
+pub fn decrypt_payload_in_place(
+    packet: &mut [u8],
+    hdr: &packet::ShortHeader,
+    rx_packet_key: &dyn PacketKey,
+) -> Result<DecryptedInPlace, ParseError> {
+    let payload_offset = hdr.payload_offset;
+    let plain_len = {
+        let (header, payload) = packet.split_at_mut(payload_offset);
+        rx_packet_key
+            .decrypt_in_place(hdr.pn, header, payload)
+            .map_err(|_| ParseError::CryptoError)?
+    };
+
+    let decrypted_end = payload_offset + plain_len;
+    let decrypted = &packet[payload_offset..decrypted_end];
+    parse_frames_in_place(decrypted, payload_offset, hdr.pn)
+}
+
+/// Build and encrypt a complete 1-RTT QUIC packet.
+///
+/// Writes the short header, frames (ACK + DATAGRAM), AEAD tag, and header
+/// protection into `buf`. Returns bytes written and the PN used.
+pub fn encrypt_packet(
+    payload: &[u8],
+    ack_ranges: Option<&[Range<u64>]>,
+    remote_cid: &ConnectionId,
+    pn: u64,
+    largest_acked: u64,
+    key_phase: bool,
+    tx_packet_key: &dyn PacketKey,
+    tx_header_key: &dyn HeaderKey,
+    tag_len: usize,
+    buf: &mut [u8],
+) -> Result<EncryptResult, ParseError> {
+    let (header_len, _pn_len) = packet::build_short_header(
+        remote_cid,
+        pn,
+        largest_acked,
+        key_phase,
+        false, // spin bit
+        buf,
+    );
+
+    let mut frame_pos = header_len;
+
+    if let Some(ranges) = ack_ranges {
+        if !ranges.is_empty() {
+            let ack_len = frame::build_ack(ranges, 0, &mut buf[frame_pos..]);
+            frame_pos += ack_len;
+        }
+    }
+
+    if !payload.is_empty() {
+        let dg_len = frame::build_datagram_no_len(payload, &mut buf[frame_pos..]);
+        frame_pos += dg_len;
+    } else if frame_pos == header_len {
+        buf[frame_pos] = 0x01; // PING
+        frame_pos += 1;
+    }
+
+    // Ensure minimum packet size for header protection sample.
+    let pn_offset = 1 + remote_cid.len();
+    let min_total = pn_offset + 4 + tx_header_key.sample_size();
+    let total_with_tag = frame_pos + tag_len;
+    if total_with_tag < min_total {
+        let pad_needed = min_total - total_with_tag;
+        buf[frame_pos..frame_pos + pad_needed].fill(0x00);
+        frame_pos += pad_needed;
+    }
+
+    let total_with_tag = frame_pos + tag_len;
+    if buf.len() < total_with_tag {
+        return Err(ParseError::BufferTooShort);
+    }
+
+    tx_packet_key.encrypt(pn, &mut buf[..total_with_tag], header_len);
+    tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
+
+    Ok(EncryptResult {
+        len: total_with_tag,
+        pn,
+    })
+}
+
+/// Parse frames from a decrypted payload (Bytes variant, zero-copy slicing).
+fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, ParseError> {
+    let mut datagrams: SmallVec<[Bytes; 4]> = SmallVec::new();
+    let mut ack_frame = None;
+    let mut pos = 0;
+    let decrypted_len = decrypted.len();
+
+    while pos < decrypted_len {
+        let frame_type = decrypted[pos];
+        match frame_type {
+            0x00 | 0x01 => pos += 1,
+            0x02 | 0x03 => {
+                let (ack, rest) = frame::parse_ack(&decrypted[pos..])?;
+                ack_frame = Some(ack);
+                pos = decrypted_len - rest.len();
+            }
+            0x30 | 0x31 => {
+                let remaining = &decrypted[pos..];
+                let (data, rest) = frame::parse_datagram(remaining)?;
+                let data_start =
+                    pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
+                let data_end = data_start + data.len();
+                datagrams.push(decrypted.slice(data_start..data_end));
+                pos = decrypted_len - rest.len();
+            }
+            0x1c | 0x1d => break,
+            other => {
+                warn!(frame_type = other, "unknown frame type, skipping rest of packet");
+                break;
+            }
+        }
+    }
+
+    Ok(DecryptedPacket {
+        datagrams,
+        ack: ack_frame,
+        pn,
+    })
+}
+
+/// Parse frames from a decrypted payload in-place (returns byte ranges).
+fn parse_frames_in_place(
+    decrypted: &[u8],
+    payload_offset: usize,
+    pn: u64,
+) -> Result<DecryptedInPlace, ParseError> {
+    let mut datagrams: SmallVec<[Range<usize>; 4]> = SmallVec::new();
+    let mut ack_frame = None;
+    let mut pos = 0;
+    let decrypted_len = decrypted.len();
+
+    while pos < decrypted_len {
+        let frame_type = decrypted[pos];
+        match frame_type {
+            0x00 | 0x01 => pos += 1,
+            0x02 | 0x03 => {
+                let (ack, rest) = frame::parse_ack(&decrypted[pos..])?;
+                ack_frame = Some(ack);
+                pos = decrypted_len - rest.len();
+            }
+            0x30 | 0x31 => {
+                let remaining = &decrypted[pos..];
+                let (data, rest) = frame::parse_datagram(remaining)?;
+                let data_start =
+                    payload_offset + pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
+                let data_end = data_start + data.len();
+                datagrams.push(data_start..data_end);
+                pos = decrypted_len - rest.len();
+            }
+            0x1c | 0x1d => break,
+            other => {
+                warn!(frame_type = other, "unknown frame type, skipping rest of packet");
+                break;
+            }
+        }
+    }
+
+    Ok(DecryptedInPlace {
+        datagrams,
+        ack: ack_frame,
+        pn,
+    })
+}
+
+/// Coarse monotonic timestamp in nanoseconds (shared epoch across threads).
+pub fn coarse_now_ns() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+// ── ConnectionState (thread-safe, for DPDK multi-core) ───────────────────
+
 /// QUIC 1-RTT connection state for the data plane.
 ///
 /// Created from quinn-proto keys after handshake completes. Handles
-/// encrypt/decrypt/ACK/CC for DATAGRAM-only tunnel traffic.
+/// encrypt/decrypt/ACK for DATAGRAM-only tunnel traffic.
 ///
 /// Thread-safe: packet keys use `RwLock` (read-heavy, ~3.4M reads/sec,
 /// write every 7M packets for key rotation). Pre-computed keys use `Mutex`.
@@ -134,17 +370,9 @@ pub struct ConnectionState {
     largest_rx_pn: AtomicU64,
     received: AtomicBitmap,
 
-    // Congestion control + loss detection
-    pub cc: CongestionControl,
-    sent_ring: SentPacketRing,
-
     // ACK generation
     rx_since_last_ack: AtomicU32,
     ack_interval: u32,
-
-    /// Whether ACK tracking is enabled. Phase 1: false (CC disabled, no consumer).
-    /// Phase 2: true (multi-core BBR needs ACK feedback).
-    ack_enabled: bool,
 }
 
 impl ConnectionState {
@@ -159,21 +387,14 @@ impl ConnectionState {
         local_cid: ConnectionId,
         remote_cid: ConnectionId,
         is_server: bool,
-        ack_enabled: bool,
     ) -> Arc<Self> {
         let tag_len = keys.packet.local.tag_len();
 
         // KeyPair.local = our encryption key, KeyPair.remote = our decryption key.
-        // This naming is from quinn-proto's perspective — "local" is what WE use.
-        // The local key encrypts, the remote key decrypts.
         let (tx_packet_key, rx_packet_key) = (keys.packet.local, keys.packet.remote);
         let (tx_header_key, rx_header_key) = (keys.header.local, keys.header.remote);
 
-        // Pre-computed key generations: each KeyPair has (local=our_tx, remote=our_rx)
-        let mut next_keys = VecDeque::with_capacity(key_generations.len());
-        for kp in key_generations {
-            next_keys.push_back((kp.remote, kp.local));
-        }
+        let next_keys = prepare_key_generations(key_generations);
 
         // Server starts with key_phase=false; initial phase matches.
         let _ = is_server;
@@ -196,57 +417,33 @@ impl ConnectionState {
             largest_acked: AtomicU64::new(0),
             largest_rx_pn: AtomicU64::new(0),
             received: AtomicBitmap::new(),
-            cc: CongestionControl::new(),
-            sent_ring: SentPacketRing::new(),
             rx_since_last_ack: AtomicU32::new(0),
             ack_interval: DEFAULT_ACK_INTERVAL,
-            ack_enabled,
         })
     }
 
     /// Decrypt an incoming 1-RTT packet (allocates a new BytesMut per call).
-    ///
-    /// Prefer `decrypt_packet_with_buf` in hot paths to reuse a scratch buffer.
     pub fn decrypt_packet(&self, packet: &mut [u8]) -> Result<DecryptedPacket, ParseError> {
         let mut scratch = BytesMut::with_capacity(packet.len());
         self.decrypt_packet_with_buf(packet, &mut scratch)
     }
 
     /// Decrypt an incoming 1-RTT packet, reusing a caller-provided BytesMut.
-    ///
-    /// Performs: header unprotection → PN decode → AEAD decrypt → frame parse.
-    /// Handles key phase changes (key update detection).
-    ///
-    /// `packet` is modified in-place (header unprotection + decryption).
-    /// `scratch` is cleared and reused (O(1) reset, avoids malloc/free per packet).
     pub fn decrypt_packet_with_buf(
         &self,
         packet: &mut [u8],
         scratch: &mut BytesMut,
     ) -> Result<DecryptedPacket, ParseError> {
-        let pkt_len = packet.len();
-        if pkt_len < 1 + self.local_cid_len + 4 + self.tag_len {
-            return Err(ParseError::BufferTooShort);
-        }
-
-        // Header protection removal needs the sample, which starts at
-        // pn_offset + 4 (maximum PN length).
-        let pn_offset = 1 + self.local_cid_len;
-        // The sample starts 4 bytes after pn_offset (RFC 9001 §5.4.2)
-        let sample_offset = pn_offset + 4;
-        if pkt_len < sample_offset + self.rx_header_key.sample_size() {
-            return Err(ParseError::BufferTooShort);
-        }
-
-        // Remove header protection
-        self.rx_header_key.decrypt(pn_offset, packet);
-
-        // Parse the unprotected short header
         let largest_pn = self.largest_rx_pn.load(Ordering::Relaxed);
-        let hdr = packet::parse_short_header(packet, self.local_cid_len, largest_pn)?;
+        let hdr = unprotect_header(
+            packet,
+            self.local_cid_len,
+            self.tag_len,
+            &*self.rx_header_key,
+            largest_pn,
+        )?;
 
-        // Check key phase and potentially rotate keys.
-        // CAS ensures only one thread triggers rotation in multi-core.
+        // Key phase rotation (CAS for multi-core safety).
         let current_peer_phase = self.peer_key_phase.load(Ordering::Acquire);
         if hdr.key_phase != current_peer_phase {
             if self
@@ -261,112 +458,36 @@ impl ConnectionState {
             {
                 self.handle_key_update_rx(hdr.key_phase);
             }
-            // If CAS failed, another thread already rotated — use new keys.
         }
 
-        // AEAD decrypt: reuse scratch buffer (clear + extend reuses allocation).
-        let header_bytes = &packet[..hdr.payload_offset];
-        scratch.clear();
-        scratch.extend_from_slice(&packet[hdr.payload_offset..]);
-
-        {
+        let result = {
             let rx_key = self.rx_packet_key.read();
-            rx_key
-                .decrypt(hdr.pn, header_bytes, scratch)
-                .map_err(|_| ParseError::CryptoError)?;
-        }
+            decrypt_payload(packet, &hdr, &**rx_key, scratch)?
+        };
 
-        // Update RX state
+        // Update RX state.
         self.received.set(hdr.pn);
-        // Update largest_rx_pn atomically (fetch_max)
         let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
-        if self.ack_enabled {
-            self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
-        }
+        self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
 
-        // Convert to Bytes for zero-copy slicing of datagram payloads.
-        let decrypted = scratch.split().freeze();
-
-        // Parse frames from decrypted payload
-        let mut datagrams: SmallVec<[Bytes; 4]> = SmallVec::new();
-        let mut ack_frame = None;
-        let mut pos = 0;
-        let decrypted_len = decrypted.len();
-
-        while pos < decrypted_len {
-            let frame_type = decrypted[pos];
-            match frame_type {
-                // PADDING (0x00) — skip
-                0x00 => {
-                    pos += 1;
-                }
-                // PING (0x01) — no payload
-                0x01 => {
-                    pos += 1;
-                }
-                // ACK (0x02 or 0x03)
-                0x02 | 0x03 => {
-                    let (ack, rest) = frame::parse_ack(&decrypted[pos..])?;
-                    ack_frame = Some(ack);
-                    pos = decrypted_len - rest.len();
-                }
-                // DATAGRAM (0x30 no len, 0x31 with len)
-                0x30 | 0x31 => {
-                    let remaining = &decrypted[pos..];
-                    let (data, rest) = frame::parse_datagram(remaining)?;
-                    // Zero-copy: slice into the frozen Bytes (no heap allocation).
-                    let data_start = pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
-                    let data_end = data_start + data.len();
-                    datagrams.push(decrypted.slice(data_start..data_end));
-                    pos = decrypted_len - rest.len();
-                }
-                // CONNECTION_CLOSE (0x1c, 0x1d) — just stop parsing
-                0x1c | 0x1d => break,
-                other => {
-                    // Unknown frame type: skip rest of packet (best-effort)
-                    warn!(frame_type = other, "unknown frame type, skipping rest of packet");
-                    break;
-                }
-            }
-        }
-
-        Ok(DecryptedPacket {
-            datagrams,
-            ack: ack_frame,
-            pn: hdr.pn,
-        })
+        Ok(result)
     }
 
     /// Decrypt an incoming 1-RTT packet fully in-place (zero heap allocation).
-    ///
-    /// The entire decrypt happens on the provided `packet` buffer:
-    /// header unprotection, AEAD decrypt, and frame parsing all in-place.
-    /// Returns byte ranges into `packet` for each DATAGRAM payload.
-    ///
-    /// This is the fastest decrypt path — no BytesMut, no memcpy.
     pub fn decrypt_packet_in_place(
         &self,
         packet: &mut [u8],
     ) -> Result<DecryptedInPlace, ParseError> {
-        let pkt_len = packet.len();
-        if pkt_len < 1 + self.local_cid_len + 4 + self.tag_len {
-            return Err(ParseError::BufferTooShort);
-        }
-
-        let pn_offset = 1 + self.local_cid_len;
-        let sample_offset = pn_offset + 4;
-        if pkt_len < sample_offset + self.rx_header_key.sample_size() {
-            return Err(ParseError::BufferTooShort);
-        }
-
-        // Remove header protection (in-place)
-        self.rx_header_key.decrypt(pn_offset, packet);
-
-        // Parse the unprotected short header
         let largest_pn = self.largest_rx_pn.load(Ordering::Relaxed);
-        let hdr = packet::parse_short_header(packet, self.local_cid_len, largest_pn)?;
+        let hdr = unprotect_header(
+            packet,
+            self.local_cid_len,
+            self.tag_len,
+            &*self.rx_header_key,
+            largest_pn,
+        )?;
 
-        // Key phase rotation (CAS for multi-core safety)
+        // Key phase rotation (CAS for multi-core safety).
         let current_peer_phase = self.peer_key_phase.load(Ordering::Acquire);
         if hdr.key_phase != current_peer_phase {
             if self
@@ -383,84 +504,26 @@ impl ConnectionState {
             }
         }
 
-        // AEAD decrypt in-place: header is AAD, payload+tag is decrypted in-place.
-        let payload_offset = hdr.payload_offset;
-        let plain_len = {
-            let (header, payload) = packet.split_at_mut(payload_offset);
+        let result = {
             let rx_key = self.rx_packet_key.read();
-            rx_key
-                .decrypt_in_place(hdr.pn, header, payload)
-                .map_err(|_| ParseError::CryptoError)?
+            decrypt_payload_in_place(packet, &hdr, &**rx_key)?
         };
 
-        // Update RX state
+        // Update RX state.
         self.received.set(hdr.pn);
         let _ = self.largest_rx_pn.fetch_max(hdr.pn, Ordering::Relaxed);
-        if self.ack_enabled {
-            self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
-        }
+        self.rx_since_last_ack.fetch_add(1, Ordering::Relaxed);
 
-        // Parse frames from decrypted payload (in-place, return ranges).
-        let decrypted_end = payload_offset + plain_len;
-        let decrypted = &packet[payload_offset..decrypted_end];
-        let mut datagrams: SmallVec<[Range<usize>; 4]> = SmallVec::new();
-        let mut ack_frame = None;
-        let mut pos = 0;
-        let decrypted_len = decrypted.len();
-
-        while pos < decrypted_len {
-            let frame_type = decrypted[pos];
-            match frame_type {
-                0x00 => {
-                    pos += 1;
-                }
-                0x01 => {
-                    pos += 1;
-                }
-                0x02 | 0x03 => {
-                    let (ack, rest) = frame::parse_ack(&decrypted[pos..])?;
-                    ack_frame = Some(ack);
-                    pos = decrypted_len - rest.len();
-                }
-                0x30 | 0x31 => {
-                    let remaining = &decrypted[pos..];
-                    let (data, rest) = frame::parse_datagram(remaining)?;
-                    // Compute absolute offset within the original packet buffer.
-                    let data_start =
-                        payload_offset + pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
-                    let data_end = data_start + data.len();
-                    datagrams.push(data_start..data_end);
-                    pos = decrypted_len - rest.len();
-                }
-                0x1c | 0x1d => break,
-                other => {
-                    warn!(frame_type = other, "unknown frame type, skipping rest of packet");
-                    break;
-                }
-            }
-        }
-
-        Ok(DecryptedInPlace {
-            datagrams,
-            ack: ack_frame,
-            pn: hdr.pn,
-        })
+        Ok(result)
     }
 
     /// Handle a key phase change from the peer.
-    ///
-    /// Called after CAS on peer_key_phase succeeds — only one thread enters.
-    /// If we initiated (pending_rx_key available), use the saved RX key.
-    /// If the peer initiated, pop a new key pair from next_keys.
     fn handle_key_update_rx(&self, new_phase: bool) {
         let pending = self.pending_rx_key.lock().take();
         if let Some(new_rx) = pending {
-            // We initiated this key update — TX key was already rotated.
-            // Apply the saved RX key now that the peer has responded.
             *self.rx_packet_key.write() = new_rx;
             tracing::debug!("key update: RX rotated (peer responded to our initiation)");
         } else {
-            // Peer initiated — pop a new pair and update both keys.
             let mut next_keys = self.next_keys.lock();
             if let Some((new_rx, new_tx)) = next_keys.pop_front() {
                 *self.rx_packet_key.write() = new_rx;
@@ -476,23 +539,13 @@ impl ConnectionState {
     }
 
     /// Initiate a key update (our side).
-    ///
-    /// Multi-core safety: only the thread whose fetch_add transitions
-    /// pkt_count to exactly KEY_UPDATE_THRESHOLD triggers rotation.
-    ///
-    /// Only updates TX key and flips key_phase. The new RX key is saved
-    /// as pending — applied when the peer responds with the new phase.
-    /// peer_key_phase is NOT updated (the peer hasn't rotated yet).
     fn initiate_key_update(&self) {
         let mut next_keys = self.next_keys.lock();
         if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-            // Save new RX key for when peer responds.
             *self.pending_rx_key.lock() = Some(new_rx);
-            // Update TX key immediately — start sending with new key.
             *self.tx_packet_key.write() = new_tx;
             let old = self.key_phase.load(Ordering::Relaxed);
             self.key_phase.store(!old, Ordering::Release);
-            // DO NOT flip peer_key_phase — peer still sends with old phase.
             self.packets_since_key_update.store(0, Ordering::Relaxed);
             tracing::debug!("key update: TX rotated, awaiting peer response");
         } else {
@@ -501,19 +554,12 @@ impl ConnectionState {
     }
 
     /// Encrypt a datagram payload into a complete 1-RTT QUIC packet.
-    ///
-    /// Assigns a PN via atomic fetch_add. Optionally piggybacks ACK frames.
-    /// `buf` must be large enough for header + frames + AEAD tag.
-    ///
-    /// Returns the bytes written and assigned PN.
     pub fn encrypt_datagram(
         &self,
         payload: &[u8],
         ack_ranges: Option<&[Range<u64>]>,
         buf: &mut [u8],
     ) -> Result<EncryptResult, ParseError> {
-        // Check key update threshold.
-        // Multi-core: exact equality ensures only one thread triggers rotation.
         let pkt_count = self.packets_since_key_update.fetch_add(1, Ordering::Relaxed);
         if pkt_count == KEY_UPDATE_THRESHOLD {
             self.initiate_key_update();
@@ -523,82 +569,19 @@ impl ConnectionState {
         let largest_acked = self.largest_acked.load(Ordering::Relaxed);
         let key_phase = self.key_phase.load(Ordering::Acquire);
 
-        // Build short header
-        let (header_len, _pn_len) = packet::build_short_header(
+        let tx_key = self.tx_packet_key.read();
+        encrypt_packet(
+            payload,
+            ack_ranges,
             &self.remote_cid,
             pn,
             largest_acked,
             key_phase,
-            false, // spin bit: not used
+            &**tx_key,
+            &*self.tx_header_key,
+            self.tag_len,
             buf,
-        );
-
-        // Build frames into the payload area (after header)
-        let mut frame_pos = header_len;
-
-        // Piggyback ACK if provided
-        if let Some(ranges) = ack_ranges {
-            if !ranges.is_empty() {
-                let ack_len = frame::build_ack(ranges, 0, &mut buf[frame_pos..]);
-                frame_pos += ack_len;
-            }
-        }
-
-        // DATAGRAM frame (no length field — last frame in packet).
-        // Skip if payload is empty (ACK-only packet).
-        if !payload.is_empty() {
-            let dg_len = frame::build_datagram_no_len(payload, &mut buf[frame_pos..]);
-            frame_pos += dg_len;
-        } else if frame_pos == header_len {
-            // No ACK and no datagram — add PING frame so packet isn't empty
-            buf[frame_pos] = 0x01; // PING
-            frame_pos += 1;
-        }
-
-        // Ensure minimum packet size for header protection sample.
-        // Header protection needs sample_size() bytes starting at pn_offset + 4.
-        // After AEAD, total = frame_pos + tag_len. Must be >= pn_offset + 4 + sample_size.
-        let pn_offset = 1 + self.remote_cid.len();
-        let min_total = pn_offset + 4 + self.tx_header_key.sample_size();
-        let total_with_tag = frame_pos + self.tag_len;
-        if total_with_tag < min_total {
-            let pad_needed = min_total - total_with_tag;
-            // PADDING frames are 0x00 bytes (RFC 9000 §19.1).
-            buf[frame_pos..frame_pos + pad_needed].fill(0x00);
-            frame_pos += pad_needed;
-        }
-
-        // Total plaintext = header + frames (+ padding)
-        // AEAD encrypt in-place: encrypts buf[header_len..frame_pos] and appends tag
-        let total_with_tag = frame_pos + self.tag_len;
-        // Ensure buf is large enough
-        if buf.len() < total_with_tag {
-            return Err(ParseError::BufferTooShort);
-        }
-
-        {
-            let tx_key = self.tx_packet_key.read();
-            tx_key.encrypt(pn, &mut buf[..total_with_tag], header_len);
-        }
-
-        // Apply header protection (must be done AFTER AEAD encryption)
-        self.tx_header_key.encrypt(pn_offset, &mut buf[..total_with_tag]);
-
-        // Track packets for congestion control.
-        if self.ack_enabled {
-            if !payload.is_empty() {
-                // Data packets: full CC tracking (inflight, size, timestamp).
-                self.cc.on_sent(&self.sent_ring, pn, total_with_tag as u16);
-            } else {
-                // ACK-only packets: register with size=0 so on_ack skips them.
-                self.cc.register_ack_only(&self.sent_ring, pn);
-            }
-        }
-
-        Ok(EncryptResult {
-            len: total_with_tag,
-            pn,
-        })
+        )
     }
 
     /// Check if an ACK should be sent (every N received packets).
@@ -610,10 +593,7 @@ impl ConnectionState {
     pub fn generate_ack_ranges(&self) -> SmallVec<[Range<u64>; 8]> {
         let largest = self.largest_rx_pn.load(Ordering::Relaxed);
         let ranges = generate_ack_ranges(&self.received, largest, MAX_ACK_RANGES);
-        // Reset the counter after generating ACK
         self.rx_since_last_ack.store(0, Ordering::Relaxed);
-        // Advance bitmap base to the start of the oldest range we reported.
-        // All PNs below this are implicitly acknowledged and don't need scanning.
         if let Some(last_range) = ranges.last() {
             if last_range.start > 0 {
                 self.received.advance_base(last_range.start);
@@ -622,39 +602,32 @@ impl ConnectionState {
         ranges
     }
 
-    /// Check if CC allows sending.
-    ///
-    /// When `ack_enabled`, delegates to AIMD congestion window check.
-    /// Otherwise always true (inner TCP handles its own CC).
+    /// Always returns true — no congestion control in tunnel mode.
     pub fn can_send(&self) -> bool {
-        if self.ack_enabled { self.cc.can_send() } else { true }
+        true
     }
 
-    /// Update the largest acknowledged PN (called when processing our sent ACKs).
+    /// Update the largest acknowledged PN.
     pub fn update_largest_acked(&self, pn: u64) {
         self.largest_acked.fetch_max(pn, Ordering::Relaxed);
     }
 
     /// Process an ACK frame received from the peer.
-    pub fn process_ack(&self, ack: &AckFrame, now_ns: u64) {
+    pub fn process_ack(&self, ack: &AckFrame) {
         self.update_largest_acked(ack.largest_acked);
-        if self.ack_enabled {
-            let largest_sent = self.pn_counter.load(Ordering::Relaxed);
-            self.cc.on_ack(&self.sent_ring, ack, now_ns, largest_sent);
-        }
     }
 
-    /// Get the local CID (for CID matching on incoming packets).
+    /// Get the local CID.
     pub fn local_cid(&self) -> &ConnectionId {
         &self.local_cid
     }
 
-    /// Get the remote CID (for building outer UDP/IP headers).
+    /// Get the remote CID.
     pub fn remote_cid(&self) -> &ConnectionId {
         &self.remote_cid
     }
 
-    /// Get the local CID length (for header parsing).
+    /// Get the local CID length.
     pub fn local_cid_len(&self) -> usize {
         self.local_cid_len
     }
@@ -663,4 +636,15 @@ impl ConnectionState {
     pub fn tag_len(&self) -> usize {
         self.tag_len
     }
+}
+
+/// Convert quinn-proto key generations to (rx, tx) pairs.
+pub fn prepare_key_generations(
+    key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
+) -> VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)> {
+    let mut next_keys = VecDeque::with_capacity(key_generations.len());
+    for kp in key_generations {
+        next_keys.push_back((kp.remote, kp.local));
+    }
+    next_keys
 }

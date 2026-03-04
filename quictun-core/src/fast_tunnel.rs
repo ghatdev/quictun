@@ -14,6 +14,7 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use quictun_quic::ConnectionState;
+use quictun_quic::local::LocalConnectionState;
 use quictun_tun::TunDevice;
 
 use crate::tunnel::TunnelResult;
@@ -69,35 +70,10 @@ pub async fn run_fast_forwarding_loop_parallel(
                         let mut gso_pos = 0usize;
                         let mut gso_segment_size = 0usize;
                         let mut gso_count = 0usize;
-                        let mut sent_ack_only = false;
-
-                        // When CC-blocked, send ACK unconditionally to maintain
-                        // feedback loop. Without this, both sides double-gate on
-                        // needs_ack() thresholds, making ACK feedback too slow to
-                        // ever drain inflight.
-                        if !conn_tx.can_send() {
-                            let ack_ranges = conn_tx.generate_ack_ranges();
-                            if !ack_ranges.is_empty() {
-                                if let Ok(result) = conn_tx.encrypt_datagram(
-                                    &[],
-                                    Some(&ack_ranges),
-                                    &mut encrypt_buf,
-                                ) {
-                                    let _ = udp_tx
-                                        .send_to(&encrypt_buf[..result.len], remote_addr)
-                                        .await;
-                                    sent_ack_only = true;
-                                }
-                            }
-                        }
 
                         loop {
                             if gso_count >= max_segs {
                                 break; // GSO segment limit
-                            }
-                            // CC check: stop sending data if congestion window is full.
-                            if !conn_tx.can_send() {
-                                break;
                             }
                             let mut packet = [0u8; 1500];
                             match tun_rx.try_recv(&mut packet) {
@@ -184,46 +160,12 @@ pub async fn run_fast_forwarding_loop_parallel(
                                     }
                                 }
                             }
-                        } else if !sent_ack_only {
-                            // CC blocked all data and no ACK-only was sent. Sleep
-                            // briefly to let the QUIC→TUN task process incoming ACKs
-                            // that will open the congestion window. Without this,
-                            // readable() returns immediately (edge-triggered, no data
-                            // consumed) creating a hot spin loop that starves the RX task.
-                            debug!(
-                                inflight = conn_tx.cc.inflight(),
-                                cwnd = conn_tx.cc.cwnd(),
-                                "CC blocked, waiting for ACKs"
-                            );
-                            tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                     }
 
                     #[cfg(not(target_os = "linux"))]
                     {
-                        let mut sent_anything = false;
-
-                        // When CC-blocked, send ACK unconditionally.
-                        if !conn_tx.can_send() {
-                            let ack_ranges = conn_tx.generate_ack_ranges();
-                            if !ack_ranges.is_empty() {
-                                if let Ok(result) = conn_tx.encrypt_datagram(
-                                    &[],
-                                    Some(&ack_ranges),
-                                    &mut encrypt_buf,
-                                ) {
-                                    let _ = udp_tx
-                                        .send_to(&encrypt_buf[..result.len], remote_addr)
-                                        .await;
-                                    sent_anything = true;
-                                }
-                            }
-                        }
-
                         loop {
-                            if !conn_tx.can_send() {
-                                break;
-                            }
                             let mut packet = [0u8; 1500];
                             match tun_rx.try_recv(&mut packet) {
                                 Ok(n) => {
@@ -249,7 +191,6 @@ pub async fn run_fast_forwarding_loop_parallel(
                                                 return TunnelResult::Fatal(e.into());
                                             }
                                             last_tx = Instant::now();
-                                            sent_anything = true;
                                             debug!(size = n, pn = result.pn, "TUN -> QUIC (fast)");
                                         }
                                         Err(e) => {
@@ -264,9 +205,6 @@ pub async fn run_fast_forwarding_loop_parallel(
                                 }
                             }
                         }
-                        if !sent_anything {
-                            tokio::task::yield_now().await;
-                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -274,9 +212,17 @@ pub async fn run_fast_forwarding_loop_parallel(
                     return TunnelResult::Fatal(e.into());
                 }
                 Err(_) => {
-                    // Keepalive timeout — send PING (empty datagram).
+                    // Keepalive timeout — send PING with piggybacked ACK ranges.
+                    // Always include ACK ranges on keepalive to maintain feedback
+                    // even when packet rate is below ACK_INTERVAL threshold.
                     if keepalive.is_some() {
-                        match conn_tx.encrypt_datagram(&[], None, &mut encrypt_buf) {
+                        let ack_ranges = conn_tx.generate_ack_ranges();
+                        let ack_ref = if !ack_ranges.is_empty() {
+                            Some(ack_ranges.as_slice())
+                        } else {
+                            None
+                        };
+                        match conn_tx.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
                             Ok(result) => {
                                 if let Err(e) =
                                     udp_tx.send_to(&encrypt_buf[..result.len], remote_addr).await
@@ -300,7 +246,6 @@ pub async fn run_fast_forwarding_loop_parallel(
     let conn_rx = conn_state.clone();
     let udp_rx = udp.clone();
     let tun_tx = tun.clone();
-    let rx_remote_addr = remote_addr;
 
     // QUIC -> TUN task: receive UDP, decrypt with quictun-quic, write to TUN.
     let quic_to_tun = tokio::spawn(async move {
@@ -314,7 +259,6 @@ pub async fn run_fast_forwarding_loop_parallel(
         #[cfg(not(target_os = "linux"))]
         let mut recv_buf = vec![0u8; MAX_PACKET];
         let mut scratch = BytesMut::with_capacity(MAX_PACKET);
-        let mut ack_buf = vec![0u8; MAX_PACKET];
         let mut last_rx = Instant::now();
 
         loop {
@@ -367,7 +311,7 @@ pub async fn run_fast_forwarding_loop_parallel(
                         Ok(decrypted) => {
                             got_data = true;
                             if let Some(ref ack) = decrypted.ack {
-                                conn_rx.process_ack(ack, quictun_quic::cc::coarse_now_ns());
+                                conn_rx.process_ack(ack);
                             }
                             for datagram in &decrypted.datagrams {
                                 if datagram.is_empty() {
@@ -387,24 +331,12 @@ pub async fn run_fast_forwarding_loop_parallel(
                 }
                 if got_data {
                     last_rx = Instant::now();
-                    // Send ACK-only packet back to peer if enough packets received.
-                    // Critical for unidirectional flows: the TX task only piggybacks
-                    // ACKs on TUN data, but if the peer is CC-blocked and we're the
-                    // receiver, there may be no reverse TUN data to carry ACKs.
-                    if conn_rx.needs_ack() {
-                        let ack_ranges = conn_rx.generate_ack_ranges();
-                        if !ack_ranges.is_empty() {
-                            if let Ok(result) = conn_rx.encrypt_datagram(
-                                &[],
-                                Some(&ack_ranges),
-                                &mut ack_buf,
-                            ) {
-                                let _ = udp_rx
-                                    .send_to(&ack_buf[..result.len], rx_remote_addr)
-                                    .await;
-                            }
-                        }
-                    }
+                    // ACK delivery is handled by the TX task, which piggybacks
+                    // ACK ranges on outgoing TUN data (TCP ACKs, keepalive PINGs).
+                    // Sending ACK-only packets from the RX task would block it
+                    // with send_to().await, causing UDP recv buffer overflow
+                    // under high throughput. The TX task's piggybacking is
+                    // sufficient for bidirectional flows (iperf3, normal TCP).
                 }
             }
 
@@ -420,7 +352,7 @@ pub async fn run_fast_forwarding_loop_parallel(
                             Ok(decrypted) => {
                                 last_rx = Instant::now();
                                 if let Some(ref ack) = decrypted.ack {
-                                    conn_rx.process_ack(ack, quictun_quic::cc::coarse_now_ns());
+                                    conn_rx.process_ack(ack);
                                 }
                                 for datagram in &decrypted.datagrams {
                                     if datagram.is_empty() {
@@ -430,21 +362,6 @@ pub async fn run_fast_forwarding_loop_parallel(
                                     if let Err(e) = tun_tx.send(datagram).await {
                                         tracing::error!(error = %e, "TUN send failed");
                                         return TunnelResult::Fatal(e.into());
-                                    }
-                                }
-                                // Send ACK-only packet back to peer if needed.
-                                if conn_rx.needs_ack() {
-                                    let ack_ranges = conn_rx.generate_ack_ranges();
-                                    if !ack_ranges.is_empty() {
-                                        if let Ok(result) = conn_rx.encrypt_datagram(
-                                            &[],
-                                            Some(&ack_ranges),
-                                            &mut ack_buf,
-                                        ) {
-                                            let _ = udp_rx
-                                                .send_to(&ack_buf[..result.len], rx_remote_addr)
-                                                .await;
-                                        }
                                     }
                                 }
                             }
@@ -543,29 +460,10 @@ pub async fn run_fast_forwarding_loop_offload(
             .await
             {
                 Ok(Ok(n_pkts)) => {
-                    // When CC-blocked, send ACK unconditionally.
-                    if !conn_tx.can_send() {
-                        let ack_ranges = conn_tx.generate_ack_ranges();
-                        if !ack_ranges.is_empty() {
-                            if let Ok(result) = conn_tx.encrypt_datagram(
-                                &[],
-                                Some(&ack_ranges),
-                                &mut keepalive_buf,
-                            ) {
-                                let _ = udp_tx
-                                    .send_to(&keepalive_buf[..result.len], remote_addr)
-                                    .await;
-                            }
-                        }
-                    }
-
                     // Encrypt all packets into batch buffers.
                     let mut batch_count = 0;
                     for i in 0..n_pkts {
                         if batch_count >= BATCH_SIZE {
-                            break;
-                        }
-                        if !conn_tx.can_send() {
                             break;
                         }
                         let pkt_len = sizes[i];
@@ -631,9 +529,15 @@ pub async fn run_fast_forwarding_loop_offload(
                     return TunnelResult::Fatal(e.into());
                 }
                 Err(_) => {
-                    // Keepalive timeout — send PING (single packet, not batched).
+                    // Keepalive timeout — send PING with piggybacked ACK ranges.
                     if keepalive.is_some() {
-                        match conn_tx.encrypt_datagram(&[], None, &mut keepalive_buf) {
+                        let ack_ranges = conn_tx.generate_ack_ranges();
+                        let ack_ref = if !ack_ranges.is_empty() {
+                            Some(ack_ranges.as_slice())
+                        } else {
+                            None
+                        };
+                        match conn_tx.encrypt_datagram(&[], ack_ref, &mut keepalive_buf) {
                             Ok(result) => {
                                 if let Err(e) = udp_tx
                                     .send_to(&keepalive_buf[..result.len], remote_addr)
@@ -658,7 +562,6 @@ pub async fn run_fast_forwarding_loop_offload(
     let conn_rx = conn_state.clone();
     let udp_rx = udp.clone();
     let tun_tx = tun.clone();
-    let rx_remote_addr = remote_addr;
 
     // QUIC → TUN task: recvmmsg batch recv → decrypt → send_multiple GRO.
     let quic_to_tun = tokio::spawn(async move {
@@ -666,7 +569,6 @@ pub async fn run_fast_forwarding_loop_offload(
             (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET]).collect();
         let mut recv_lens = vec![0usize; BATCH_SIZE];
         let mut scratch = BytesMut::with_capacity(MAX_PACKET);
-        let mut ack_buf = vec![0u8; MAX_PACKET];
         let mut last_rx = Instant::now();
         let mut gro_table = GROTable::new();
 
@@ -725,7 +627,7 @@ pub async fn run_fast_forwarding_loop_offload(
                     Ok(decrypted) => {
                         got_data = true;
                         if let Some(ref ack) = decrypted.ack {
-                            conn_rx.process_ack(ack, quictun_quic::cc::coarse_now_ns());
+                            conn_rx.process_ack(ack);
                         }
                         for datagram in &decrypted.datagrams {
                             if datagram.is_empty() {
@@ -745,21 +647,6 @@ pub async fn run_fast_forwarding_loop_offload(
 
             if got_data {
                 last_rx = Instant::now();
-                // Send ACK-only packet back to peer if enough packets received.
-                if conn_rx.needs_ack() {
-                    let ack_ranges = conn_rx.generate_ack_ranges();
-                    if !ack_ranges.is_empty() {
-                        if let Ok(result) = conn_rx.encrypt_datagram(
-                            &[],
-                            Some(&ack_ranges),
-                            &mut ack_buf,
-                        ) {
-                            let _ = udp_rx
-                                .send_to(&ack_buf[..result.len], rx_remote_addr)
-                                .await;
-                        }
-                    }
-                }
             }
 
             if !tun_batch.is_empty() {
@@ -846,31 +733,21 @@ pub async fn run_fast_forwarding_loop(
                     Ok(n) => n,
                     Err(e) => return TunnelResult::Fatal(e.into()),
                 };
-                if conn_state.can_send() {
-                    let ack_ranges = if conn_state.needs_ack() {
-                        Some(conn_state.generate_ack_ranges())
-                    } else {
-                        None
-                    };
-                    match conn_state.encrypt_datagram(&tun_buf[..n], ack_ranges.as_deref(), &mut encrypt_buf) {
-                        Ok(result) => {
-                            if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
-                                return TunnelResult::Fatal(e.into());
-                            }
-                            last_tx = Instant::now();
-                            debug!(size = n, pn = result.pn, "TUN -> QUIC (fast serial)");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "encrypt failed, dropping packet");
-                        }
-                    }
+                let ack_ranges = if conn_state.needs_ack() {
+                    Some(conn_state.generate_ack_ranges())
                 } else {
-                    // CC-blocked: send ACK unconditionally.
-                    let ack_ranges = conn_state.generate_ack_ranges();
-                    if !ack_ranges.is_empty() {
-                        if let Ok(result) = conn_state.encrypt_datagram(&[], Some(&ack_ranges), &mut encrypt_buf) {
-                            let _ = udp.send_to(&encrypt_buf[..result.len], remote_addr).await;
+                    None
+                };
+                match conn_state.encrypt_datagram(&tun_buf[..n], ack_ranges.as_deref(), &mut encrypt_buf) {
+                    Ok(result) => {
+                        if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
+                            return TunnelResult::Fatal(e.into());
                         }
+                        last_tx = Instant::now();
+                        debug!(size = n, pn = result.pn, "TUN -> QUIC (fast serial)");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "encrypt failed, dropping packet");
                     }
                 }
             }
@@ -887,7 +764,7 @@ pub async fn run_fast_forwarding_loop(
                     Ok(decrypted) => {
                         last_rx = Instant::now();
                         if let Some(ref ack) = decrypted.ack {
-                            conn_state.process_ack(ack, quictun_quic::cc::coarse_now_ns());
+                            conn_state.process_ack(ack);
                         }
                         for datagram in &decrypted.datagrams {
                             if datagram.is_empty() {
@@ -912,7 +789,13 @@ pub async fn run_fast_forwarding_loop(
                 }
                 // Keepalive.
                 if keepalive.is_some() && last_tx.elapsed() >= keepalive_interval {
-                    match conn_state.encrypt_datagram(&[], None, &mut encrypt_buf) {
+                    let ack_ranges = conn_state.generate_ack_ranges();
+                    let ack_ref = if !ack_ranges.is_empty() {
+                        Some(ack_ranges.as_slice())
+                    } else {
+                        None
+                    };
+                    match conn_state.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
                         Ok(result) => {
                             if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
                                 return TunnelResult::Fatal(e.into());
@@ -930,6 +813,312 @@ pub async fn run_fast_forwarding_loop(
                 if *shutdown.borrow() {
                     tracing::info!("shutdown signal received, closing fast tunnel");
                     return TunnelResult::Shutdown;
+                }
+            }
+        }
+    }
+}
+
+// ── New single-task fast loop (Phase 1) ──────────────────────────────────
+
+/// Single-task fast forwarding loop using `LocalConnectionState`.
+///
+/// No shared mutable state, no atomics, no cross-task coordination.
+/// Uses GSO send + recvmmsg batching on Linux for high throughput.
+/// Falls back to per-packet I/O on other platforms.
+pub async fn run_fast_loop(
+    mut conn: LocalConnectionState,
+    udp: &UdpSocket,
+    tun: &TunDevice,
+    remote_addr: SocketAddr,
+    idle_timeout: Duration,
+    keepalive: Option<Duration>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TunnelResult {
+    tracing::info!("fast forwarding loop started (single-task, LocalConnectionState)");
+
+    let keepalive_interval = keepalive.unwrap_or(Duration::from_secs(25));
+    let mut last_tx = Instant::now();
+    let mut last_rx = Instant::now();
+
+    let mut encrypt_buf = vec![0u8; MAX_PACKET];
+    let mut scratch = BytesMut::with_capacity(2048);
+
+    // Linux: GSO send buffer + recvmmsg batch buffers.
+    #[cfg(target_os = "linux")]
+    let mut gso_buf = vec![0u8; crate::batch_io::GSO_BUF_SIZE];
+    #[cfg(target_os = "linux")]
+    let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; crate::batch_io::BATCH_SIZE];
+    #[cfg(target_os = "linux")]
+    let mut recv_lens = vec![0usize; crate::batch_io::BATCH_SIZE];
+
+    // Non-Linux: simple per-packet buffer.
+    #[cfg(not(target_os = "linux"))]
+    let mut recv_buf = vec![0u8; MAX_PACKET];
+
+    loop {
+        let timeout = {
+            let since_tx = last_tx.elapsed();
+            let since_rx = last_rx.elapsed();
+            let keepalive_remaining = if keepalive.is_some() {
+                keepalive_interval.saturating_sub(since_tx)
+            } else {
+                Duration::from_secs(60)
+            };
+            let idle_remaining = idle_timeout.saturating_sub(since_rx);
+            keepalive_remaining.min(idle_remaining)
+        };
+
+        tokio::select! {
+            biased;
+
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("shutdown signal received, closing fast tunnel");
+                    return TunnelResult::Shutdown;
+                }
+            }
+
+            result = tun.readable() => {
+                if let Err(e) = result {
+                    return TunnelResult::Fatal(e.into());
+                }
+
+                // Drain TUN packets, encrypt, batch into GSO buffer.
+                #[cfg(target_os = "linux")]
+                {
+                    let max_segs = crate::batch_io::GSO_MAX_SEGMENTS;
+                    let mut gso_pos = 0usize;
+                    let mut gso_segment_size = 0usize;
+                    let mut gso_count = 0usize;
+
+                    loop {
+                        if gso_count >= max_segs {
+                            break;
+                        }
+                        let mut packet = [0u8; 1500];
+                        match tun.try_recv(&mut packet) {
+                            Ok(n) => {
+                                if gso_pos + MAX_PACKET > gso_buf.len() {
+                                    break;
+                                }
+                                let ack_ranges = if conn.needs_ack() {
+                                    Some(conn.generate_ack_ranges())
+                                } else {
+                                    None
+                                };
+                                match conn.encrypt_datagram(
+                                    &packet[..n],
+                                    ack_ranges.as_deref(),
+                                    &mut gso_buf[gso_pos..],
+                                ) {
+                                    Ok(result) => {
+                                        if gso_count == 0 {
+                                            gso_segment_size = result.len;
+                                            gso_pos += result.len;
+                                            gso_count += 1;
+                                        } else if result.len == gso_segment_size {
+                                            gso_pos += result.len;
+                                            gso_count += 1;
+                                        } else {
+                                            // Odd-sized packet: send individually.
+                                            let odd_end = gso_pos + result.len;
+                                            if let Err(e) = udp
+                                                .send_to(&gso_buf[gso_pos..odd_end], remote_addr)
+                                                .await
+                                            {
+                                                tracing::error!(error = %e, "UDP send failed (odd size)");
+                                                return TunnelResult::Fatal(e.into());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "encrypt failed, dropping packet");
+                                    }
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                tracing::error!(error = %e, "TUN recv failed");
+                                return TunnelResult::Fatal(e.into());
+                            }
+                        }
+                    }
+
+                    // Flush GSO batch.
+                    if gso_count > 0 {
+                        let seg = gso_segment_size as u16;
+                        loop {
+                            match crate::batch_io::send_gso(
+                                udp,
+                                &gso_buf[..gso_pos],
+                                seg,
+                                remote_addr,
+                            ) {
+                                Ok(_) => {
+                                    debug!(
+                                        count = gso_count,
+                                        segment_size = gso_segment_size,
+                                        total = gso_pos,
+                                        "TUN -> QUIC (GSO)"
+                                    );
+                                    last_tx = Instant::now();
+                                    break;
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    if let Err(e) = udp.writable().await {
+                                        return TunnelResult::Fatal(e.into());
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "send_gso failed");
+                                    return TunnelResult::Fatal(e.into());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Non-Linux: per-packet send.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    loop {
+                        let mut packet = [0u8; 1500];
+                        match tun.try_recv(&mut packet) {
+                            Ok(n) => {
+                                let ack_ranges = if conn.needs_ack() {
+                                    Some(conn.generate_ack_ranges())
+                                } else {
+                                    None
+                                };
+                                match conn.encrypt_datagram(
+                                    &packet[..n],
+                                    ack_ranges.as_deref(),
+                                    &mut encrypt_buf,
+                                ) {
+                                    Ok(result) => {
+                                        if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
+                                            return TunnelResult::Fatal(e.into());
+                                        }
+                                        last_tx = Instant::now();
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "encrypt failed, dropping packet");
+                                    }
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => return TunnelResult::Fatal(e.into()),
+                        }
+                    }
+                }
+            }
+
+            result = udp.readable() => {
+                if let Err(e) = result {
+                    return TunnelResult::Fatal(e.into());
+                }
+
+                // Linux: recvmmsg batch.
+                #[cfg(target_os = "linux")]
+                {
+                    let n_msgs = match crate::batch_io::recvmmsg_batch(
+                        udp,
+                        &mut recv_bufs,
+                        &mut recv_lens,
+                        crate::batch_io::BATCH_SIZE,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) => {
+                            tracing::error!(error = %e, "recvmmsg failed");
+                            return TunnelResult::Fatal(e.into());
+                        }
+                    };
+
+                    for i in 0..n_msgs {
+                        let n = recv_lens[i];
+                        if n == 0 { continue; }
+                        if recv_bufs[i][0] & 0x80 != 0 { continue; }
+
+                        match conn.decrypt_packet_with_buf(&mut recv_bufs[i][..n], &mut scratch) {
+                            Ok(decrypted) => {
+                                last_rx = Instant::now();
+                                if let Some(ref ack) = decrypted.ack {
+                                    conn.process_ack(ack);
+                                }
+                                for datagram in &decrypted.datagrams {
+                                    if datagram.is_empty() { continue; }
+                                    if let Err(e) = tun.send(datagram).await {
+                                        return TunnelResult::Fatal(e.into());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, size = n, "decrypt failed, dropping");
+                            }
+                        }
+                    }
+                }
+
+                // Non-Linux: single recv_from.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    match udp.try_recv_from(&mut recv_buf) {
+                        Ok((n, _from)) => {
+                            if n > 0 && recv_buf[0] & 0x80 != 0 {
+                                continue;
+                            }
+                            match conn.decrypt_packet_with_buf(&mut recv_buf[..n], &mut scratch) {
+                                Ok(decrypted) => {
+                                    last_rx = Instant::now();
+                                    if let Some(ref ack) = decrypted.ack {
+                                        conn.process_ack(ack);
+                                    }
+                                    for datagram in &decrypted.datagrams {
+                                        if datagram.is_empty() { continue; }
+                                        if let Err(e) = tun.send(datagram).await {
+                                            return TunnelResult::Fatal(e.into());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, size = n, "decrypt failed, dropping");
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return TunnelResult::Fatal(e.into()),
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep(timeout) => {
+                // Check idle timeout.
+                if last_rx.elapsed() >= idle_timeout {
+                    tracing::info!("idle timeout exceeded, connection lost");
+                    return TunnelResult::ConnectionLost(quinn::ConnectionError::TimedOut);
+                }
+                // Keepalive.
+                if keepalive.is_some() && last_tx.elapsed() >= keepalive_interval {
+                    let ack_ranges = conn.generate_ack_ranges();
+                    let ack_ref = if !ack_ranges.is_empty() {
+                        Some(ack_ranges.as_slice())
+                    } else {
+                        None
+                    };
+                    match conn.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
+                        Ok(result) => {
+                            if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
+                                return TunnelResult::Fatal(e.into());
+                            }
+                            last_tx = Instant::now();
+                            debug!(pn = result.pn, "sent keepalive PING");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "keepalive encrypt failed");
+                        }
+                    }
                 }
             }
         }
