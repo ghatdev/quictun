@@ -879,12 +879,16 @@ async fn run_async_fast(
     let private_key = PrivateKey::from_base64(&config.interface.private_key)
         .context("invalid interface private_key")?;
 
-    let peer = &config.peer[0];
-    let peer_pubkey =
-        PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
-
-    let keepalive = peer.keepalive.map(Duration::from_secs);
-    let reconnect_interval = peer.reconnect_interval;
+    // Parse all peer public keys.
+    let peer_pubkeys: Vec<PublicKey> = config
+        .peer
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            PublicKey::from_base64(&p.public_key)
+                .with_context(|| format!("invalid public_key for peer[{i}]"))
+        })
+        .collect::<Result<_>>()?;
 
     let tuning = TransportTuning {
         datagram_recv_buffer: recv_buf,
@@ -897,7 +901,7 @@ async fn run_async_fast(
         ..Default::default()
     };
 
-    let parallel = !serial;
+    let multi_client = role == Role::Listener && config.peer.len() > 1;
 
     #[cfg(not(target_os = "linux"))]
     if offload {
@@ -908,14 +912,13 @@ async fn run_async_fast(
         role = ?role,
         address = %addr,
         mtu = config.mtu(),
-        peer_fingerprint = %peer_pubkey.fingerprint(),
-        parallel,
+        peers = config.peer.len(),
+        multi_client,
         offload,
         cc = %cc,
         recv_buf,
         send_buf,
         send_window,
-        reconnect = reconnect_interval.is_some(),
         "starting quictun (fast data plane)"
     );
 
@@ -950,40 +953,12 @@ async fn run_async_fast(
         let _ = shutdown_tx.send(true);
     });
 
-    // Build quinn-proto configs.
-    let setup = match role {
-        Role::Connector => {
-            let client_config = proto_config::build_proto_client_config(
-                &private_key,
-                &peer_pubkey,
-                keepalive,
-                &tuning,
-            )?;
-            let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
-            proto_driver::HandshakeSetup::Connector {
-                remote_addr,
-                client_config,
-            }
-        }
-        Role::Listener => {
-            let server_config = proto_config::build_proto_server_config(
-                &private_key,
-                &[peer_pubkey],
-                keepalive,
-                &tuning,
-            )?;
-            proto_driver::HandshakeSetup::Listener { server_config }
-        }
-    };
-
     // Bind UDP socket.
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
     let udp = tokio::net::UdpSocket::bind(bind_addr)
         .await
         .context("failed to bind UDP socket")?;
-    // Increase socket buffers to 4MB for high-throughput burst tolerance.
-    // Prevents UDP packet drops during slow start ramp-up.
     let sock_ref = socket2::SockRef::from(&udp);
     let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
     let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
@@ -998,20 +973,150 @@ async fn run_async_fast(
         Duration::from_secs(30)
     };
 
+    let cid_len = config.interface.cid_length as usize;
+
+    // ── Multi-client listener path ──────────────────────────────────────
+    if multi_client {
+        use quictun_core::{dispatcher, proto_driver};
+
+        // Build server config with all peer public keys.
+        let first_keepalive = config.peer[0].keepalive.map(Duration::from_secs);
+        let server_config = proto_config::build_proto_server_config(
+            &private_key,
+            &peer_pubkeys,
+            first_keepalive,
+            &tuning,
+        )?;
+
+        // Resolve peer configs for identity matching.
+        let resolved_peers: Vec<proto_driver::ResolvedPeer> = config
+            .peer
+            .iter()
+            .zip(peer_pubkeys.iter())
+            .map(|(peer_cfg, pubkey)| {
+                // Parse first allowed_ip to get the peer's tunnel IP.
+                let tunnel_ip: std::net::Ipv4Addr = peer_cfg
+                    .allowed_ips
+                    .first()
+                    .and_then(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                    .map(|net| net.addr())
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+                proto_driver::ResolvedPeer {
+                    spki_der: pubkey.spki_der().to_vec(),
+                    tunnel_ip,
+                    keepalive: peer_cfg.keepalive.map(Duration::from_secs),
+                }
+            })
+            .collect();
+
+        tracing::info!(
+            peers = resolved_peers.len(),
+            "multi-client mode: spawning dispatcher + accept loop"
+        );
+
+        // Create shared dispatch table.
+        let table = Arc::new(std::sync::RwLock::new(dispatcher::DispatchTable::new()));
+
+        // Channels: UDP dispatcher → accept loop (handshake packets).
+        let (handshake_tx, handshake_rx) =
+            tokio::sync::mpsc::channel::<(bytes::BytesMut, SocketAddr)>(256);
+
+        // Channels: connection tasks → accept loop (cleanup notifications).
+        let (cleanup_tx, cleanup_rx) =
+            tokio::sync::mpsc::channel::<(quinn_proto::ConnectionId, std::net::Ipv4Addr)>(64);
+
+        // Spawn UDP dispatcher task.
+        let udp_d = udp.clone();
+        let table_d = table.clone();
+        let shutdown_d = shutdown_rx.clone();
+        tokio::spawn(async move {
+            dispatcher::run_udp_dispatcher(udp_d, table_d, handshake_tx, cid_len, shutdown_d).await;
+        });
+
+        // Spawn TUN router task.
+        let tun_r = tun.clone();
+        let table_r = table.clone();
+        let shutdown_r = shutdown_rx.clone();
+        tokio::spawn(async move {
+            dispatcher::run_tun_router(tun_r, table_r, shutdown_r).await;
+        });
+
+        // Run accept loop (blocks until shutdown).
+        let result = proto_driver::run_accept_loop(
+            udp,
+            server_config,
+            table,
+            tun,
+            resolved_peers,
+            cid_len,
+            idle_timeout,
+            handshake_rx,
+            cleanup_rx,
+            cleanup_tx,
+            shutdown_rx,
+        )
+        .await;
+
+        match result {
+            TunnelResult::Shutdown => {
+                tracing::info!("tunnel closed (shutdown)");
+            }
+            TunnelResult::Fatal(e) => {
+                return Err(e).context("fatal tunnel error");
+            }
+            TunnelResult::ConnectionLost(e) => {
+                tracing::info!(error = %e, "accept loop ended");
+            }
+        }
+
+        tracing::info!("tunnel closed");
+        return Ok(());
+    }
+
+    // ── Single-peer path (connector or single-peer listener) ────────────
+    let peer = &config.peer[0];
+    let peer_pubkey = &peer_pubkeys[0];
+    let keepalive = peer.keepalive.map(Duration::from_secs);
+    let reconnect_interval = peer.reconnect_interval;
+
+    let setup = match role {
+        Role::Connector => {
+            let client_config = proto_config::build_proto_client_config(
+                &private_key,
+                peer_pubkey,
+                keepalive,
+                &tuning,
+            )?;
+            let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+            proto_driver::HandshakeSetup::Connector {
+                remote_addr,
+                client_config,
+            }
+        }
+        Role::Listener => {
+            let server_config = proto_config::build_proto_server_config(
+                &private_key,
+                &[peer_pubkey.clone()],
+                keepalive,
+                &tuning,
+            )?;
+            proto_driver::HandshakeSetup::Listener { server_config }
+        }
+    };
+
     // Backoff state for reconnection.
     let mut backoff_secs: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
+
+    let parallel = !serial;
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        // Phase 1+2: Handshake + forwarding.
-        // Default: single-task loop with LocalConnectionState.
-        // --legacy-parallel: old two-task loop with Arc<ConnectionState>.
         let result = if legacy_parallel {
-            // Legacy path: thread-safe ConnectionState, two tasks.
             let handshake_result = match proto_driver::run_handshake(&udp, &setup, &shutdown_rx).await {
                 Ok(r) => {
                     backoff_secs = 1;
@@ -1080,7 +1185,6 @@ async fn run_async_fast(
                 .await
             }
         } else {
-            // New default: single-task loop with LocalConnectionState.
             let handshake_result = match proto_driver::run_handshake_local(&udp, &setup, &shutdown_rx).await {
                 Ok(r) => {
                     backoff_secs = 1;

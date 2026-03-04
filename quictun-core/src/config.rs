@@ -103,9 +103,11 @@ impl Config {
         if self.peer.is_empty() {
             return Err(ConfigError::Invalid("at least one peer is required".into()));
         }
-        if self.peer.len() > 1 {
+        // Connector mode requires exactly one peer (with endpoint).
+        // Listener mode supports multiple peers (multi-client).
+        if self.peer.len() > 1 && self.role() == Role::Connector {
             return Err(ConfigError::Invalid(
-                "phase 1 supports exactly one peer".into(),
+                "connector mode supports exactly one peer".into(),
             ));
         }
         // Validate address parses as IPv4 network
@@ -261,6 +263,49 @@ allowed_ips = ["10.0.0.2/32"]
             },
             peer: vec![],
         };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn multi_peer_listener_allowed() {
+        let toml = r#"
+[interface]
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[[peer]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+
+[[peer]]
+public_key = "dGVzdB=="
+allowed_ips = ["10.0.0.3/32"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.role(), Role::Listener);
+        assert_eq!(config.peer.len(), 2);
+    }
+
+    #[test]
+    fn multi_peer_connector_rejected() {
+        let toml = r#"
+[interface]
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+
+[[peer]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+
+[[peer]]
+public_key = "dGVzdB=="
+allowed_ips = ["10.0.0.3/32"]
+endpoint = "1.2.3.5:443"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
         assert!(config.validate().is_err());
     }
 

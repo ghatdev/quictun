@@ -819,6 +819,146 @@ pub async fn run_fast_forwarding_loop(
     }
 }
 
+// ── Multi-client channeled connection task (Phase 2) ─────────────────────
+
+/// Per-connection task for multi-client mode.
+///
+/// Receives packets via mpsc channels from the dispatcher instead of reading
+/// UDP/TUN directly. Loses GSO batching but supports N concurrent connections.
+/// Single-client mode should still use `run_fast_loop()` for max throughput.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_connection_task(
+    mut conn: LocalConnectionState,
+    mut udp_rx: tokio::sync::mpsc::Receiver<BytesMut>,
+    mut tun_rx: tokio::sync::mpsc::Receiver<BytesMut>,
+    udp: Arc<UdpSocket>,
+    tun: Arc<TunDevice>,
+    remote_addr: SocketAddr,
+    idle_timeout: Duration,
+    keepalive: Option<Duration>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TunnelResult {
+    tracing::info!(
+        remote = %remote_addr,
+        "connection task started (channeled)"
+    );
+
+    let keepalive_interval = keepalive.unwrap_or(Duration::from_secs(25));
+    let mut last_tx = Instant::now();
+    let mut last_rx = Instant::now();
+
+    let mut encrypt_buf = vec![0u8; MAX_PACKET];
+    let mut scratch = BytesMut::with_capacity(2048);
+
+    loop {
+        let timeout = {
+            let keepalive_remaining = if keepalive.is_some() {
+                keepalive_interval.saturating_sub(last_tx.elapsed())
+            } else {
+                Duration::from_secs(60)
+            };
+            let idle_remaining = idle_timeout.saturating_sub(last_rx.elapsed());
+            keepalive_remaining.min(idle_remaining)
+        };
+
+        tokio::select! {
+            biased;
+
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return TunnelResult::Shutdown;
+                }
+            }
+
+            // TUN packet from dispatcher → encrypt → send via UDP.
+            pkt = tun_rx.recv() => {
+                let Some(data) = pkt else {
+                    // Channel closed — dispatcher shut down.
+                    tracing::info!("TUN channel closed, connection ending");
+                    return TunnelResult::ConnectionLost(quinn::ConnectionError::TimedOut);
+                };
+
+                let ack_ranges = if conn.needs_ack() {
+                    Some(conn.generate_ack_ranges())
+                } else {
+                    None
+                };
+                match conn.encrypt_datagram(&data, ack_ranges.as_deref(), &mut encrypt_buf) {
+                    Ok(result) => {
+                        if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
+                            return TunnelResult::Fatal(e.into());
+                        }
+                        last_tx = Instant::now();
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "encrypt failed, dropping packet");
+                    }
+                }
+            }
+
+            // UDP packet from dispatcher → decrypt → write to TUN.
+            pkt = udp_rx.recv() => {
+                let Some(mut data) = pkt else {
+                    tracing::info!("UDP channel closed, connection ending");
+                    return TunnelResult::ConnectionLost(quinn::ConnectionError::TimedOut);
+                };
+
+                // Skip long-header packets (shouldn't arrive here, but be safe).
+                if !data.is_empty() && data[0] & 0x80 != 0 {
+                    continue;
+                }
+
+                match conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
+                    Ok(decrypted) => {
+                        last_rx = Instant::now();
+                        if let Some(ref ack) = decrypted.ack {
+                            conn.process_ack(ack);
+                        }
+                        for datagram in &decrypted.datagrams {
+                            if datagram.is_empty() { continue; }
+                            if let Err(e) = tun.send(datagram).await {
+                                return TunnelResult::Fatal(e.into());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "decrypt failed, dropping packet");
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep(timeout) => {
+                // Check idle timeout.
+                if last_rx.elapsed() >= idle_timeout {
+                    tracing::info!(remote = %remote_addr, "idle timeout, connection lost");
+                    return TunnelResult::ConnectionLost(quinn::ConnectionError::TimedOut);
+                }
+                // Keepalive.
+                if keepalive.is_some() && last_tx.elapsed() >= keepalive_interval {
+                    let ack_ranges = conn.generate_ack_ranges();
+                    let ack_ref = if !ack_ranges.is_empty() {
+                        Some(ack_ranges.as_slice())
+                    } else {
+                        None
+                    };
+                    match conn.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
+                        Ok(result) => {
+                            if let Err(e) = udp.send_to(&encrypt_buf[..result.len], remote_addr).await {
+                                return TunnelResult::Fatal(e.into());
+                            }
+                            last_tx = Instant::now();
+                            debug!(pn = result.pn, "sent keepalive PING (channeled)");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "keepalive encrypt failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── New single-task fast loop (Phase 1) ──────────────────────────────────
 
 /// Single-task fast forwarding loop using `LocalConnectionState`.

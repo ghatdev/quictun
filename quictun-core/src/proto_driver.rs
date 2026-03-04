@@ -336,6 +336,293 @@ pub async fn run_handshake_local(
     })
 }
 
+/// Resolved peer info for multi-client accept loop.
+pub struct ResolvedPeer {
+    /// Peer's public key SPKI DER (for identity matching after handshake).
+    pub spki_der: Vec<u8>,
+    /// Peer's tunnel IP (first IP from `allowed_ips`).
+    pub tunnel_ip: std::net::Ipv4Addr,
+    /// Keepalive interval.
+    pub keepalive: Option<std::time::Duration>,
+}
+
+/// Multi-client accept loop for the listener `--fast` data plane.
+///
+/// Drives a quinn-proto `Endpoint` that accepts N concurrent handshakes.
+/// Each completed handshake spawns a per-connection task with its own
+/// `LocalConnectionState`. The shared `DispatchTable` routes packets.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_accept_loop(
+    udp: std::sync::Arc<tokio::net::UdpSocket>,
+    server_config: std::sync::Arc<ServerConfig>,
+    table: std::sync::Arc<std::sync::RwLock<crate::dispatcher::DispatchTable>>,
+    tun: std::sync::Arc<quictun_tun::TunDevice>,
+    peers: Vec<ResolvedPeer>,
+    cid_len: usize,
+    idle_timeout: std::time::Duration,
+    mut handshake_rx: tokio::sync::mpsc::Receiver<(BytesMut, std::net::SocketAddr)>,
+    mut cleanup_rx: tokio::sync::mpsc::Receiver<(quinn_proto::ConnectionId, std::net::Ipv4Addr)>,
+    cleanup_tx: tokio::sync::mpsc::Sender<(quinn_proto::ConnectionId, std::net::Ipv4Addr)>,
+    mut shutdown: watch::Receiver<bool>,
+) -> crate::tunnel::TunnelResult {
+    use std::collections::HashMap;
+
+    let ep_config = {
+        let mut cfg = EndpointConfig::default();
+        cfg.cid_generator(move || Box::new(quinn_proto::RandomConnectionIdGenerator::new(cid_len)));
+        std::sync::Arc::new(cfg)
+    };
+    let mut endpoint = Endpoint::new(ep_config, Some(server_config.clone()), true, None);
+
+    // In-progress handshakes: quinn ConnectionHandle → state.
+    struct HandshakeState {
+        connection: quinn_proto::Connection,
+        remote_addr: std::net::SocketAddr,
+    }
+    let mut handshakes: HashMap<ConnectionHandle, HandshakeState> = HashMap::new();
+
+    let mut response_buf = vec![0u8; BUF_SIZE];
+
+    info!("accept loop started (multi-client)");
+
+    loop {
+        // Next timeout: earliest handshake timeout.
+        let next_timeout = handshakes
+            .values_mut()
+            .filter_map(|hs| hs.connection.poll_timeout())
+            .min()
+            .unwrap_or(Instant::now() + Duration::from_secs(5));
+        let timeout_dur = next_timeout.saturating_duration_since(Instant::now());
+
+        tokio::select! {
+            biased;
+
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("accept loop: shutdown");
+                    return crate::tunnel::TunnelResult::Shutdown;
+                }
+            }
+
+            // Handshake packet from UDP dispatcher.
+            pkt = handshake_rx.recv() => {
+                let Some((data, from)) = pkt else {
+                    info!("handshake channel closed");
+                    return crate::tunnel::TunnelResult::Shutdown;
+                };
+
+                let now = Instant::now();
+                if let Some(event) = endpoint.handle(now, from, None, None, data, &mut response_buf) {
+                    match event {
+                        DatagramEvent::NewConnection(incoming) => {
+                            match endpoint.accept(incoming, now, &mut response_buf, Some(server_config.clone())) {
+                                Ok((ch, conn)) => {
+                                    let remote = conn.remote_address();
+                                    info!(remote = %remote, "accepted incoming handshake");
+                                    handshakes.insert(ch, HandshakeState {
+                                        connection: conn,
+                                        remote_addr: remote,
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!(error = ?e.cause, "failed to accept connection");
+                                    if let Some(transmit) = e.response {
+                                        let _ = udp.send_to(&response_buf[..transmit.size], from).await;
+                                    }
+                                }
+                            }
+                        }
+                        DatagramEvent::ConnectionEvent(ch, event) => {
+                            if let Some(hs) = handshakes.get_mut(&ch) {
+                                hs.connection.handle_event(event);
+                            }
+                        }
+                        DatagramEvent::Response(transmit) => {
+                            let _ = udp.send_to(&response_buf[..transmit.size], from).await;
+                        }
+                    }
+                }
+            }
+
+            // Cleanup from finished connection tasks.
+            cleanup = cleanup_rx.recv() => {
+                if let Some((cid, tunnel_ip)) = cleanup {
+                    let mut t = table.write().expect("dispatch table poisoned");
+                    t.unregister(&cid, tunnel_ip);
+                    info!(
+                        active = t.len(),
+                        "connection cleaned up"
+                    );
+                }
+            }
+
+            // Handshake timeouts.
+            _ = tokio::time::sleep(timeout_dur) => {
+                let now = Instant::now();
+                for hs in handshakes.values_mut() {
+                    hs.connection.handle_timeout(now);
+                }
+            }
+        }
+
+        // Drive all handshakes: poll endpoint events, poll connection events, drain transmits.
+        let mut completed: Vec<ConnectionHandle> = Vec::new();
+        let mut failed: Vec<ConnectionHandle> = Vec::new();
+
+        for (&ch, hs) in handshakes.iter_mut() {
+            // Endpoint events.
+            while let Some(event) = hs.connection.poll_endpoint_events() {
+                if let Some(conn_event) = endpoint.handle_event(ch, event) {
+                    hs.connection.handle_event(conn_event);
+                }
+            }
+
+            // Connection events.
+            while let Some(event) = hs.connection.poll() {
+                match event {
+                    Event::Connected => {
+                        completed.push(ch);
+                    }
+                    Event::ConnectionLost { reason } => {
+                        warn!(error = %reason, "handshake connection lost");
+                        failed.push(ch);
+                    }
+                    Event::HandshakeDataReady
+                    | Event::DatagramReceived
+                    | Event::DatagramsUnblocked
+                    | Event::Stream(_) => {}
+                }
+            }
+
+            // Drain transmits.
+            let remote = hs.remote_addr;
+            let now = Instant::now();
+            let mut transmit_buf = Vec::with_capacity(BUF_SIZE);
+            loop {
+                transmit_buf.clear();
+                let Some(transmit) = hs.connection.poll_transmit(now, 1, &mut transmit_buf) else {
+                    break;
+                };
+                let _ = udp.send_to(&transmit_buf[..transmit.size], remote).await;
+            }
+        }
+
+        // Remove failed handshakes.
+        for ch in failed {
+            handshakes.remove(&ch);
+        }
+
+        // Promote completed handshakes to connection tasks.
+        for ch in completed {
+            let Some(mut hs) = handshakes.remove(&ch) else { continue };
+
+            // Extract keys.
+            let is_server = true;
+            let raw = match extract_keys(&mut hs.connection, is_server, hs.remote_addr) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "failed to extract keys after handshake");
+                    continue;
+                }
+            };
+
+            // Drain final transmits.
+            let now = Instant::now();
+            let mut transmit_buf = Vec::with_capacity(BUF_SIZE);
+            loop {
+                transmit_buf.clear();
+                let Some(transmit) = hs.connection.poll_transmit(now, 1, &mut transmit_buf) else {
+                    break;
+                };
+                let _ = udp.send_to(&transmit_buf[..transmit.size], hs.remote_addr).await;
+            }
+
+            // Match peer by certificate identity.
+            let tunnel_ip = match identify_peer(&hs.connection, &peers) {
+                Some(peer) => peer.tunnel_ip,
+                None => {
+                    warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                    continue;
+                }
+            };
+            let peer_keepalive = peers
+                .iter()
+                .find(|p| p.tunnel_ip == tunnel_ip)
+                .and_then(|p| p.keepalive);
+
+            // Create LocalConnectionState.
+            let conn = quictun_quic::local::LocalConnectionState::new(
+                raw.keys,
+                raw.key_gens,
+                raw.local_cid,
+                raw.remote_cid,
+                raw.is_server,
+            );
+
+            // Create channels and register in dispatch table.
+            let (handle, udp_chan_rx, tun_chan_rx) =
+                crate::dispatcher::new_connection_channels(hs.remote_addr, tunnel_ip);
+            {
+                let mut t = table.write().expect("dispatch table poisoned");
+                t.register(raw.local_cid, handle);
+            }
+
+            // Spawn the per-connection task.
+            let udp_clone = udp.clone();
+            let tun_clone = tun.clone();
+            let shutdown_clone = shutdown.clone();
+            let cleanup_tx_clone = cleanup_tx.clone();
+            let local_cid = raw.local_cid;
+
+            info!(
+                remote = %hs.remote_addr,
+                tunnel_ip = %tunnel_ip,
+                cid = %hex::encode(&local_cid[..]),
+                "spawning connection task"
+            );
+
+            tokio::spawn(async move {
+                let result = crate::fast_tunnel::run_connection_task(
+                    conn,
+                    udp_chan_rx,
+                    tun_chan_rx,
+                    udp_clone,
+                    tun_clone,
+                    hs.remote_addr,
+                    idle_timeout,
+                    peer_keepalive,
+                    shutdown_clone,
+                )
+                .await;
+
+                info!(
+                    tunnel_ip = %tunnel_ip,
+                    cid = %hex::encode(&local_cid[..]),
+                    result = ?result,
+                    "connection task ended"
+                );
+
+                // Signal cleanup.
+                let _ = cleanup_tx_clone.send((local_cid, tunnel_ip)).await;
+            });
+        }
+    }
+}
+
+/// Identify which peer connected by matching peer certificate against known peers.
+fn identify_peer<'a>(
+    conn: &quinn_proto::Connection,
+    peers: &'a [ResolvedPeer],
+) -> Option<&'a ResolvedPeer> {
+    let identity = conn.crypto_session().peer_identity()?;
+    let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity.downcast_ref()?;
+    let peer_cert = certs.first()?;
+    let peer_der: &[u8] = peer_cert.as_ref();
+
+    // Match against known peer SPKI DERs.
+    peers.iter().find(|p| p.spki_der == peer_der)
+}
+
 /// Drain all pending transmits from a quinn-proto connection.
 async fn drain_transmits(
     udp: &UdpSocket,
