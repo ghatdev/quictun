@@ -45,9 +45,6 @@ fn dpdk_build() {
         .allowlist_function("rte_eth_promiscuous_enable")
         .allowlist_function("rte_eth_link_get_nowait")
         .allowlist_function("rte_strerror")
-        // DPDK vdev functions (for AF_XDP PMD)
-        .allowlist_function("rte_vdev_init")
-        .allowlist_function("rte_vdev_uninit")
         .allowlist_function("rte_eth_dev_count_avail")
         // Our C shim wrappers (for inline DPDK functions)
         .allowlist_function("shim_.*")
@@ -82,7 +79,7 @@ fn dpdk_build() {
     // constructors survive static linking. (Demikernel does the same on Windows.)
     let pmd_libs = [
         ("rte_bus_pci", true),      // PCI bus (dep of net_virtio PCI driver)
-        ("rte_bus_vdev", true),     // vdev bus (rte_vdev_init/uninit)
+        ("rte_bus_vdev", true),     // vdev bus (TAP/virtio --vdev EAL args)
         ("rte_net_virtio", true),   // virtio-user PMD (--dpdk virtio)
         ("rte_net_tap", true),      // TAP PMD (--dpdk tap)
         ("rte_mempool_ring", true), // ring mempool (always needed)
@@ -91,10 +88,6 @@ fn dpdk_build() {
         if required || dpdk.libs.iter().any(|l| l.contains(lib)) {
             println!("cargo:rustc-link-lib=static:+whole-archive={lib}");
         }
-    }
-    // AF_XDP: only link if available (requires libxdp at DPDK build time).
-    if dpdk.libs.iter().any(|l| l.contains("af_xdp")) {
-        println!("cargo:rustc-link-lib=static:+whole-archive=rte_net_af_xdp");
     }
 
     // Track C source changes for incremental rebuilds (fixes cargo clean requirement).
