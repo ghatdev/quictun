@@ -31,9 +31,9 @@ const MAX_GSO_SEGMENTS: usize = 10;
 /// Ethernet header size (dst MAC + src MAC + EtherType).
 const ETH_HLEN: usize = 14;
 
-/// Pre-computed Ethernet header for the DPDK inner interface.
+/// Pre-computed Ethernet header for the AF_XDP inner interface.
 ///
-/// Packets between the engine and the inner port always use the same
+/// Packets between the engine and the app-facing veth end always use the same
 /// src/dst MACs, so we compute the header once and reuse it.
 pub struct InnerEthHeader {
     /// Header bytes: [dst_mac(6)][src_mac(6)][0x08, 0x00] (IPv4).
@@ -43,8 +43,8 @@ pub struct InnerEthHeader {
 impl InnerEthHeader {
     /// Build the Ethernet header for engine → app direction.
     ///
-    /// - `src_mac`: MAC of the DPDK inner port
-    /// - `dst_mac`: MAC of the kernel-facing TAP interface
+    /// - `src_mac`: MAC of the xdp-facing veth end (DPDK port)
+    /// - `dst_mac`: MAC of the app-facing veth end (kernel side)
     pub fn new(src_mac: [u8; 6], dst_mac: [u8; 6]) -> Self {
         let mut bytes = [0u8; ETH_HLEN];
         bytes[0..6].copy_from_slice(&dst_mac);
@@ -56,7 +56,7 @@ impl InnerEthHeader {
 
 /// Inner interface configuration for the L2 DPDK inner port.
 ///
-/// Used by both TAP PMD and virtio-user modes.
+/// Used by both AF_XDP (veth pair) and TAP PMD modes.
 pub struct InnerPort {
     pub port_id: u16,
     pub eth_hdr: InnerEthHeader,

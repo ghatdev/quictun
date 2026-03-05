@@ -26,6 +26,24 @@ Eth/IP/UDP headers (net.rs)
 NIC
 ```
 
+### AF_XDP Mode (`--dpdk xdp`)
+
+```
+App (iperf3, etc.)
+    | kernel routing
+    v
+veth pair (app end: quictun0)
+    | AF_XDP PMD (quictun0_xdp)
+    v
+DPDK engine (single polling loop)
+    | quinn-proto encrypt/decrypt
+    v
+Eth/IP/UDP headers (net.rs)
+    | DPDK PMD (kernel-bypass)
+    v
+NIC
+```
+
 ### Multi-Core Mode (`--dpdk-cores N`, TAP PMD only)
 
 ```
@@ -47,7 +65,7 @@ App (iperf3, etc.)
 ### Key Design Points
 
 - **Outer (network)**: DPDK PMD (kernel-bypass, zero syscalls)
-- **Inner (app-facing)**: TAP PMD or virtio-user (kernel-visible for routing)
+- **Inner (app-facing)**: TAP PMD or AF_XDP PMD (kernel-visible for routing)
 - **QUIC**: quinn-proto state machine driven directly
 - **Userland stack**: Eth/IPv4/UDP headers, ARP, IP checksums, UDP checksums
 - **ECN**: Full passthrough (IP TOS field to/from quinn-proto)
@@ -58,7 +76,8 @@ App (iperf3, etc.)
 
 | Backend | Throughput | Notes |
 |---------|-----------|-------|
-| **DPDK TAP PMD** | **3.98 Gbps** | Built-in TAP vdev, single polling loop |
+| **DPDK AF_XDP** | **2.24 Gbps** | veth + AF_XDP PMD, single polling loop |
+| **DPDK TAP PMD** | **1.94 Gbps** | Built-in TAP vdev, single polling loop |
 | Kernel WireGuard | 1.62 Gbps | Reference (range: 1.35-1.82 Gbps) |
 | tokio parallel | 1.30 Gbps | quinn internal parallelism |
 | io_uring (1-core) | 820 Mbps | SendZc zero-copy UDP sends |
@@ -82,6 +101,7 @@ quictun-dpdk/
     shared.rs       # QuicState, DriveResult, process_events
     quic.rs         # quinn-proto config builders
     engine.rs       # Main DPDK polling loop (3-phase, GSO, adaptive polling)
+    veth.rs         # Virtual Ethernet pair creation/cleanup (AF_XDP mode)
     event_loop.rs   # Setup, multi-core thread spawning, ARP resolution, signal handling
   build.rs          # bindgen + cc + pkg-config
   Cargo.toml
@@ -102,6 +122,12 @@ sudo quictun up tunnel.toml \
   --dpdk-local-ip 192.168.100.11 \
   --dpdk-remote-ip 192.168.100.10
 
+# AF_XDP mode (faster, requires libxdp-dev)
+sudo quictun up tunnel.toml \
+  --dpdk xdp \
+  --dpdk-local-ip 192.168.100.10 \
+  --dpdk-remote-ip 192.168.100.11
+
 # Multi-core (2 cores, TAP PMD, listener only)
 sudo quictun up tunnel.toml \
   --dpdk tap \
@@ -121,7 +147,7 @@ sudo quictun up tunnel.toml \
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--dpdk [MODE]` | Enable DPDK data plane (`tap` or `virtio`) | `tap` |
+| `--dpdk [MODE]` | Enable DPDK data plane (`tap` or `xdp`) | `tap` |
 | `--dpdk-local-ip` | IP for DPDK port (required) | -- |
 | `--dpdk-remote-ip` | Peer IP (required) | -- |
 | `--dpdk-local-port` | Override local UDP port | listen_port or 40000 |
@@ -169,6 +195,9 @@ Remaining copies are at quinn-proto API boundaries (BytesMut for input, Vec<u8> 
 ```bash
 # Install DPDK
 sudo apt install -y dpdk dpdk-dev libdpdk-dev pkg-config libclang-dev
+
+# For AF_XDP mode
+sudo apt install -y libxdp-dev
 
 # Hugepages (256 x 2MB = 512MB)
 echo 256 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
