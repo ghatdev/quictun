@@ -22,5 +22,3 @@ pub mod quic;
 mod ring;
 #[cfg(target_os = "linux")]
 mod shared;
-#[cfg(target_os = "linux")]
-mod veth;

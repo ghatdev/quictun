@@ -13,7 +13,6 @@ use crate::mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity};
 use crate::port;
 use crate::shared::MultiQuicState;
-use crate::veth::VethPair;
 use quictun_core::peer::PeerConfig;
 
 /// QUIC endpoint setup (connector or listener).
@@ -43,7 +42,7 @@ impl<T> SendPtr<T> {
 
 /// DPDK-specific configuration from CLI flags.
 pub struct DpdkConfig {
-    /// Inner interface mode: "tap" (default), "xdp", or "virtio".
+    /// Inner interface mode: "tap" (default) or "virtio".
     pub mode: String,
     /// EAL arguments (e.g., ["-l", "0", "-n", "4"]).
     pub eal_args: Vec<String>,
@@ -82,7 +81,6 @@ pub struct DpdkConfig {
 /// engine polling loop.  Returns when the connection is lost or SIGINT.
 ///
 /// - mode "tap" → TAP PMD (default, DPDK built-in TAP virtual device)
-/// - mode "xdp" → AF_XDP (veth pair + DPDK AF_XDP PMD)
 /// - mode "virtio" → virtio-user + vhost-net (kernel TAP with offload support)
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig) -> Result<()> {
     // ── 1. Initialize DPDK EAL ───────────────────────────────────
@@ -91,26 +89,6 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
     // Multi-core: N vdevs (quictun0, quictun1, ...).
     let n_cores = dpdk_config.n_cores.max(1);
     let mut eal_args = dpdk_config.eal_args.clone();
-
-    // AF_XDP: create veth pair BEFORE EAL init so the interface exists
-    // when the PMD binds to it.
-    let mut _veth_pair: Option<VethPair> = None;
-    if dpdk_config.mode == "xdp" {
-        if n_cores > 1 {
-            bail!("multi-core (--dpdk-cores > 1) is only supported with TAP PMD mode (--dpdk tap)");
-        }
-        let veth = VethPair::create(
-            &dpdk_config.tunnel_iface,
-            dpdk_config.tunnel_ip,
-            dpdk_config.tunnel_prefix,
-            dpdk_config.tunnel_mtu,
-        )?;
-        eal_args.push(format!(
-            "--vdev=net_af_xdp0,iface={},start_queue=0,queue_count=1,busy_budget=64",
-            veth.xdp_iface
-        ));
-        _veth_pair = Some(veth);
-    }
 
     if dpdk_config.mode == "tap" {
         for i in 0..n_cores {
@@ -135,11 +113,6 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
              packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1"
         ));
         // Enable AVX-512 SIMD for virtio descriptor batch processing.
-        eal_args.push("--force-max-simd-bitwidth=512".to_string());
-    }
-
-    // Enable AVX-512 SIMD for AF_XDP ring operations too.
-    if dpdk_config.mode == "xdp" {
         eal_args.push("--force-max-simd-bitwidth=512".to_string());
     }
 
@@ -276,27 +249,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         );
     }
 
-    if dpdk_config.mode == "xdp" {
-        // AF_XDP mode: veth pair already created, PMD bound via --vdev.
-        let veth = _veth_pair.as_ref().expect("veth pair must exist for xdp mode");
-        let inner_port_id = total_ports - 1;
-        let (inner_mac, _inner_hw_udp, _inner_hw_ip) =
-            port::configure_port(inner_port_id, mempool)?;
-
-        tracing::info!(
-            inner_port = inner_port_id,
-            inner_mac = %format_mac(&inner_mac),
-            xdp_iface = %veth.xdp_iface,
-            "AF_XDP inner port configured"
-        );
-
-        let eth_hdr = InnerEthHeader::new(inner_mac, veth.app_mac);
-        inner_ports.push(InnerPort {
-            port_id: inner_port_id,
-            eth_hdr,
-        });
-        tracing::info!("inner interface: AF_XDP (veth pair)");
-    } else {
+    {
         // TAP PMD or virtio-user mode: DPDK created device(s) via --vdev in EAL args.
         // Both create kernel-visible TAP interfaces that need IP configuration.
 
@@ -527,7 +480,6 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
     shutdown.store(true, Ordering::Release);
     port::close_port(dpdk_config.port_id);
-    // _veth_pair dropped here → deletes veth pair (AF_XDP mode only).
 
     result
 }

@@ -89,10 +89,6 @@ fn dpdk_build() {
             println!("cargo:rustc-link-lib=static:+whole-archive={lib}");
         }
     }
-    // AF_XDP: only link if available (requires libxdp at DPDK build time).
-    if dpdk.libs.iter().any(|l| l.contains("af_xdp")) {
-        println!("cargo:rustc-link-lib=static:+whole-archive=rte_net_af_xdp");
-    }
 
     // Track C source changes for incremental rebuilds (fixes cargo clean requirement).
     println!("cargo:rerun-if-changed=csrc/shim.h");
