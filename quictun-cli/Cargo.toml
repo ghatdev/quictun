@@ -16,15 +16,11 @@ quictun-crypto = { workspace = true }
 quictun-core = { workspace = true }
 quictun-tun = { workspace = true }
 quictun-net = { workspace = true }
-quinn = { workspace = true }
-tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ipnet = { workspace = true }
-bytes = { workspace = true }
-quinn-proto = { workspace = true }
 libc = "0.2"
 mimalloc = "0.1"
 socket2 = "0.5"

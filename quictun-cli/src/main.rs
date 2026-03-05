@@ -27,9 +27,6 @@ enum Command {
     Up {
         /// Path to the TOML config file
         config: String,
-        /// Use serial forwarding (single select loop) instead of parallel
-        #[arg(long)]
-        serial: bool,
         /// Congestion control algorithm: bbr, cubic, newreno, none
         #[arg(long, default_value = "bbr")]
         cc: String,
@@ -42,9 +39,6 @@ enum Command {
         /// QUIC send window in bytes (0 = default)
         #[arg(long, default_value = "0")]
         send_window: u64,
-        /// Number of TUN queues (Linux multi-queue; requires --queues > 1)
-        #[arg(long, default_value = "1")]
-        queues: usize,
         /// Use io_uring data plane (Linux only)
         #[arg(long)]
         iouring: bool,
@@ -102,9 +96,6 @@ enum Command {
         /// Enable TUN GSO/GRO offload for batched I/O (Linux only, kernel 6.2+)
         #[arg(long)]
         offload: bool,
-        /// Use tokio-based forwarding (legacy, for comparison)
-        #[arg(long)]
-        legacy: bool,
         /// Number of threads for the net engine (1 = single-thread, N = dispatcher + N-1 workers)
         #[arg(long, default_value = "1")]
         threads: usize,
@@ -124,12 +115,10 @@ fn main() -> anyhow::Result<()> {
         Command::Pubkey => pubkey::run(),
         Command::Up {
             config,
-            serial,
             cc,
             recv_buf,
             send_buf,
             send_window,
-            queues,
             iouring,
             sqpoll,
             sqpoll_cpu,
@@ -149,16 +138,13 @@ fn main() -> anyhow::Result<()> {
             dpdk_cores,
             no_udp_checksum,
             offload,
-            legacy,
             threads,
         } => up::run(
             &config,
-            serial,
             &cc,
             recv_buf,
             send_buf,
             send_window,
-            queues,
             iouring,
             sqpoll,
             sqpoll_cpu,
@@ -178,7 +164,6 @@ fn main() -> anyhow::Result<()> {
             dpdk_cores,
             no_udp_checksum,
             offload,
-            legacy,
             threads,
         ),
         Command::Down { config } => down::run(&config),

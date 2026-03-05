@@ -1058,7 +1058,6 @@ name = "quictun-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "clap",
  "ipnet",
  "libc",
@@ -1069,10 +1068,7 @@ dependencies = [
  "quictun-net",
  "quictun-tun",
  "quictun-uring",
- "quinn",
- "quinn-proto",
  "socket2 0.5.10",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]

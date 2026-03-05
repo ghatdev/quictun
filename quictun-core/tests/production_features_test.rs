@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use quictun_core::connection::{self, TransportTuning};
-use quictun_core::tunnel::TunnelResult;
 use quictun_crypto::PrivateKey;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -149,18 +148,16 @@ async fn connection_lost_returns_retriable() -> Result<()> {
     assert!(result.is_err(), "expected error after server close");
 
     let err = result.unwrap_err();
-    // Classify it like the tunnel does
-    let tunnel_result = match &err {
-        quinn::ConnectionError::ApplicationClosed(_)
-        | quinn::ConnectionError::ConnectionClosed(_)
-        | quinn::ConnectionError::Reset
-        | quinn::ConnectionError::TimedOut => TunnelResult::ConnectionLost(err),
-        _ => TunnelResult::Fatal(err.into()),
-    };
-
+    // Verify the error is a recoverable connection-lost variant
     assert!(
-        matches!(tunnel_result, TunnelResult::ConnectionLost(_)),
-        "expected ConnectionLost, got {tunnel_result:?}"
+        matches!(
+            err,
+            quinn::ConnectionError::ApplicationClosed(_)
+                | quinn::ConnectionError::ConnectionClosed(_)
+                | quinn::ConnectionError::Reset
+                | quinn::ConnectionError::TimedOut
+        ),
+        "expected recoverable connection error, got {err:?}"
     );
 
     server_handle.await?;

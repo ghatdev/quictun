@@ -11,7 +11,6 @@ fips = ["quictun-crypto/fips"]
 quictun-crypto = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
-tokio = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 base64 = { workspace = true }
@@ -32,3 +31,4 @@ hex = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true }
