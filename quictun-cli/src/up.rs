@@ -47,9 +47,7 @@ pub fn run(
     legacy: bool,
     threads: usize,
 ) -> Result<()> {
-    let cc: CongestionControl = cc
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let cc: CongestionControl = cc.parse().map_err(|e: String| anyhow::anyhow!(e))?;
 
     if let Some(dpdk_mode) = dpdk {
         return run_dpdk(
@@ -104,7 +102,16 @@ pub fn run(
         ));
     }
 
-    run_net(config_path, cc, recv_buf, send_buf, send_window, initial_rtt, pin_mtu, threads)
+    run_net(
+        config_path,
+        cc,
+        recv_buf,
+        send_buf,
+        send_window,
+        initial_rtt,
+        pin_mtu,
+        threads,
+    )
 }
 
 /// Run the synchronous blocking engine (quictun-net, default path).
@@ -415,7 +422,10 @@ fn run_dpdk(
     let setup = match role {
         Role::Connector => {
             let cc = quictun_dpdk::quic::build_proto_client_config(
-                &private_key, &peer_pubkey, keepalive, &tuning,
+                &private_key,
+                &peer_pubkey,
+                keepalive,
+                &tuning,
             )?;
             let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
             // Override remote_addr IP with DPDK IP, keep the port.
@@ -428,11 +438,12 @@ fn run_dpdk(
         Role::Listener => {
             // Always pass ALL peer public keys (not just peer[0]).
             let sc = quictun_dpdk::quic::build_proto_server_config(
-                &private_key, &all_peer_pubkeys, keepalive, &tuning,
+                &private_key,
+                &all_peer_pubkeys,
+                keepalive,
+                &tuning,
             )?;
-            quictun_dpdk::event_loop::EndpointSetup::Listener {
-                server_config: sc,
-            }
+            quictun_dpdk::event_loop::EndpointSetup::Listener { server_config: sc }
         }
     };
 
@@ -486,8 +497,8 @@ fn parse_mac(s: &str) -> Result<[u8; 6]> {
     }
     let mut mac = [0u8; 6];
     for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16)
-            .with_context(|| format!("invalid MAC octet: {part}"))?;
+        mac[i] =
+            u8::from_str_radix(part, 16).with_context(|| format!("invalid MAC octet: {part}"))?;
     }
     Ok(mac)
 }
@@ -603,13 +614,19 @@ fn run_iouring(
     let (client_config, server_config) = match role {
         Role::Connector => {
             let cc = quictun_uring::quic::build_proto_client_config(
-                &private_key, &peer_pubkey, keepalive, &tuning,
+                &private_key,
+                &peer_pubkey,
+                keepalive,
+                &tuning,
             )?;
             (Some(cc), None)
         }
         Role::Listener => {
             let sc = quictun_uring::quic::build_proto_server_config(
-                &private_key, &[peer_pubkey], keepalive, &tuning,
+                &private_key,
+                &[peer_pubkey],
+                keepalive,
+                &tuning,
             )?;
             (None, Some(sc))
         }
@@ -633,7 +650,9 @@ fn run_iouring(
 
     // Run the io_uring event loop (no tokio).
     // tun_devices must outlive the event loop (they own the fds).
-    quictun_uring::event_loop::run(tun_fds, local_addr, setup, sqpoll, sqpoll_cpu, pool_size, zero_copy)
+    quictun_uring::event_loop::run(
+        tun_fds, local_addr, setup, sqpoll, sqpoll_cpu, pool_size, zero_copy,
+    )
 }
 
 async fn run_async(
@@ -728,8 +747,7 @@ async fn run_async(
         opts
     };
 
-    let tun = TunDevice::create_with_options(&tun_opts)
-        .context("failed to create TUN device")?;
+    let tun = TunDevice::create_with_options(&tun_opts).context("failed to create TUN device")?;
 
     // Write PID file (guard removes it on exit/panic).
     state::write_pid_file(&iface_name)?;
@@ -752,9 +770,7 @@ async fn run_async(
         qs.push(tun_arc);
         #[cfg(target_os = "linux")]
         for _ in 1..queues {
-            let cloned = qs[0]
-                .try_clone()
-                .context("failed to clone TUN queue")?;
+            let cloned = qs[0].try_clone().context("failed to clone TUN queue")?;
             qs.push(Arc::new(cloned));
         }
         tracing::info!(queues = qs.len(), "multi-queue TUN ready");
@@ -786,11 +802,20 @@ async fn run_async(
 
             let server_config = match auth_mode {
                 "x509" => {
-                    let cert_file = config.interface.cert_file.as_ref()
+                    let cert_file = config
+                        .interface
+                        .cert_file
+                        .as_ref()
                         .context("x509 mode requires cert_file")?;
-                    let key_file = config.interface.key_file.as_ref()
+                    let key_file = config
+                        .interface
+                        .key_file
+                        .as_ref()
                         .context("x509 mode requires key_file")?;
-                    let ca_file = config.interface.ca_file.as_ref()
+                    let ca_file = config
+                        .interface
+                        .ca_file
+                        .as_ref()
                         .context("x509 mode requires ca_file")?;
                     connection::build_server_config_x509(
                         Path::new(cert_file),
@@ -802,20 +827,18 @@ async fn run_async(
                     )
                     .context("failed to build X.509 server config")?
                 }
-                _ => {
-                    connection::build_server_config_ext(
-                        &private_key,
-                        &[peer_pubkey.clone()],
-                        keepalive,
-                        &tuning,
-                        fips_mode,
-                    )
-                    .context("failed to build RPK server config")?
-                }
+                _ => connection::build_server_config_ext(
+                    &private_key,
+                    &[peer_pubkey.clone()],
+                    keepalive,
+                    &tuning,
+                    fips_mode,
+                )
+                .context("failed to build RPK server config")?,
             };
 
-            let socket = std::net::UdpSocket::bind(bind_addr)
-                .context("failed to bind UDP socket")?;
+            let socket =
+                std::net::UdpSocket::bind(bind_addr).context("failed to bind UDP socket")?;
             quinn::Endpoint::new(
                 endpoint_config,
                 Some(server_config),
@@ -827,11 +850,20 @@ async fn run_async(
         Role::Connector => {
             let client_config = match auth_mode {
                 "x509" => {
-                    let cert_file = config.interface.cert_file.as_ref()
+                    let cert_file = config
+                        .interface
+                        .cert_file
+                        .as_ref()
                         .context("x509 mode requires cert_file")?;
-                    let key_file = config.interface.key_file.as_ref()
+                    let key_file = config
+                        .interface
+                        .key_file
+                        .as_ref()
                         .context("x509 mode requires key_file")?;
-                    let ca_file = config.interface.ca_file.as_ref()
+                    let ca_file = config
+                        .interface
+                        .ca_file
+                        .as_ref()
                         .context("x509 mode requires ca_file")?;
                     connection::build_client_config_x509(
                         Path::new(cert_file),
@@ -844,28 +876,22 @@ async fn run_async(
                     )
                     .context("failed to build X.509 client config")?
                 }
-                _ => {
-                    connection::build_client_config_ext(
-                        &private_key,
-                        &peer_pubkey,
-                        keepalive,
-                        &tuning,
-                        fips_mode,
-                        enable_session_resumption,
-                    )
-                    .context("failed to build RPK client config")?
-                }
+                _ => connection::build_client_config_ext(
+                    &private_key,
+                    &peer_pubkey,
+                    keepalive,
+                    &tuning,
+                    fips_mode,
+                    enable_session_resumption,
+                )
+                .context("failed to build RPK client config")?,
             };
 
             let socket = std::net::UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>()?)
                 .context("failed to bind UDP socket")?;
-            let mut ep = quinn::Endpoint::new(
-                endpoint_config,
-                None,
-                socket,
-                Arc::new(quinn::TokioRuntime),
-            )
-            .context("failed to create QUIC endpoint")?;
+            let mut ep =
+                quinn::Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+                    .context("failed to create QUIC endpoint")?;
             ep.set_default_client_config(client_config);
             ep
         }
@@ -958,9 +984,14 @@ async fn run_async(
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .subsec_nanos()
-                                        % 1000) as u64;
-                                    let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
-                                    tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
+                                        % 1000)
+                                        as u64;
+                                    let delay =
+                                        Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                                    tracing::info!(
+                                        delay_ms = delay.as_millis(),
+                                        "reconnecting after backoff"
+                                    );
                                     tokio::time::sleep(delay).await;
                                     backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                                     continue;
@@ -1129,8 +1160,7 @@ async fn run_async_fast(
         opts
     };
 
-    let tun = TunDevice::create_with_options(&tun_opts)
-        .context("failed to create TUN device")?;
+    let tun = TunDevice::create_with_options(&tun_opts).context("failed to create TUN device")?;
 
     // Write PID file.
     state::write_pid_file(&iface_name)?;
@@ -1235,12 +1265,8 @@ async fn run_async_fast(
     let keepalive = peer.keepalive.map(Duration::from_secs);
     let reconnect_interval = peer.reconnect_interval;
 
-    let client_config = proto_config::build_proto_client_config(
-        &private_key,
-        peer_pubkey,
-        keepalive,
-        &tuning,
-    )?;
+    let client_config =
+        proto_config::build_proto_client_config(&private_key, peer_pubkey, keepalive, &tuning)?;
     let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
     let setup = proto_driver::HandshakeSetup::Connector {
         remote_addr,
@@ -1257,28 +1283,32 @@ async fn run_async_fast(
         }
 
         let result = {
-            let handshake_result = match proto_driver::run_handshake_local(&udp, &setup, &shutdown_rx).await {
-                Ok(r) => {
-                    backoff_secs = 1;
-                    r
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "handshake failed");
-                    if reconnect_interval.is_some() {
-                        let jitter_ms = (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos()
-                            % 1000) as u64;
-                        let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
-                        tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
-                        tokio::time::sleep(delay).await;
-                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                        continue;
+            let handshake_result =
+                match proto_driver::run_handshake_local(&udp, &setup, &shutdown_rx).await {
+                    Ok(r) => {
+                        backoff_secs = 1;
+                        r
                     }
-                    return Err(e).context("handshake failed");
-                }
-            };
+                    Err(e) => {
+                        tracing::warn!(error = %e, "handshake failed");
+                        if reconnect_interval.is_some() {
+                            let jitter_ms = (std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .subsec_nanos()
+                                % 1000) as u64;
+                            let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
+                            tracing::info!(
+                                delay_ms = delay.as_millis(),
+                                "reconnecting after backoff"
+                            );
+                            tokio::time::sleep(delay).await;
+                            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                            continue;
+                        }
+                        return Err(e).context("handshake failed");
+                    }
+                };
 
             tracing::info!(
                 remote = %handshake_result.remote_addr,

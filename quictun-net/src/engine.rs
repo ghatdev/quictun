@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -81,11 +81,7 @@ struct ConnEntry {
 /// Main entry point for the synchronous blocking engine.
 ///
 /// Routes to single-thread or multi-thread path based on `config.threads`.
-pub fn run(
-    local_addr: SocketAddr,
-    setup: EndpointSetup,
-    config: NetConfig,
-) -> Result<RunResult> {
+pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
     if config.threads > 1 {
         run_multi(local_addr, setup, config)
     } else {
@@ -110,8 +106,7 @@ fn run_single(
     // 2. Create sync TUN device.
     let mut tun_opts = TunOptions::new(config.tunnel_ip, config.tunnel_prefix, config.tunnel_mtu);
     tun_opts.name = config.tunnel_name;
-    let tun = quictun_tun::create_sync(&tun_opts)
-        .context("failed to create sync TUN device")?;
+    let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
 
     // Set TUN fd non-blocking.
     set_nonblocking(tun.as_raw_fd())?;
@@ -127,18 +122,12 @@ fn run_single(
     let mut events = Events::with_capacity(64);
 
     let udp_raw_fd = udp_socket.as_raw_fd();
-    poll.registry().register(
-        &mut SourceFd(&udp_raw_fd),
-        TOKEN_UDP,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register(&mut SourceFd(&udp_raw_fd), TOKEN_UDP, Interest::READABLE)?;
 
     let tun_raw_fd = tun.as_raw_fd();
-    poll.registry().register(
-        &mut SourceFd(&tun_raw_fd),
-        TOKEN_TUN,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register(&mut SourceFd(&tun_raw_fd), TOKEN_TUN, Interest::READABLE)?;
 
     poll.registry().register(
         &mut SourceFd(&sig_read_fd),
@@ -148,15 +137,15 @@ fn run_single(
 
     // 5. Create MultiQuicState and initiate connection if connector.
     let mut multi_state = match &setup {
-        EndpointSetup::Listener { server_config } => {
-            MultiQuicState::new(server_config.clone())
-        }
-        EndpointSetup::Connector { .. } => {
-            MultiQuicState::new_connector()
-        }
+        EndpointSetup::Listener { server_config } => MultiQuicState::new(server_config.clone()),
+        EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
 
-    if let EndpointSetup::Connector { remote_addr, client_config } = setup {
+    if let EndpointSetup::Connector {
+        remote_addr,
+        client_config,
+    } = setup
+    {
         multi_state.connect(client_config, remote_addr)?;
 
         // Drain initial handshake transmits.
@@ -180,7 +169,8 @@ fn run_single(
     #[cfg(target_os = "linux")]
     let mut recv_lens = vec![0usize; quictun_core::batch_io::BATCH_SIZE];
     #[cfg(target_os = "linux")]
-    let mut recv_addrs = vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); quictun_core::batch_io::BATCH_SIZE];
+    let mut recv_addrs =
+        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); quictun_core::batch_io::BATCH_SIZE];
 
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -217,20 +207,29 @@ fn run_single(
             #[cfg(target_os = "linux")]
             {
                 handle_udp_rx_linux(
-                    &udp_socket, &tun,
-                    &mut connections, config.cid_len,
+                    &udp_socket,
+                    &tun,
+                    &mut connections,
+                    config.cid_len,
                     &mut multi_state,
-                    &mut recv_bufs, &mut recv_lens, &mut recv_addrs,
-                    &mut scratch, &mut response_buf,
+                    &mut recv_bufs,
+                    &mut recv_lens,
+                    &mut recv_addrs,
+                    &mut scratch,
+                    &mut response_buf,
                 )?;
             }
             #[cfg(not(target_os = "linux"))]
             {
                 handle_udp_rx(
-                    &udp_socket, &tun,
-                    &mut connections, config.cid_len,
+                    &udp_socket,
+                    &tun,
+                    &mut connections,
+                    config.cid_len,
                     &mut multi_state,
-                    &mut recv_buf, &mut scratch, &mut response_buf,
+                    &mut recv_buf,
+                    &mut scratch,
+                    &mut response_buf,
                 )?;
             }
         }
@@ -240,16 +239,21 @@ fn run_single(
             #[cfg(target_os = "linux")]
             {
                 handle_tun_rx_linux(
-                    &udp_socket, &tun,
-                    &mut connections, &ip_to_cid,
-                    &mut gso_buf, &mut encrypt_buf,
+                    &udp_socket,
+                    &tun,
+                    &mut connections,
+                    &ip_to_cid,
+                    &mut gso_buf,
+                    &mut encrypt_buf,
                 )?;
             }
             #[cfg(not(target_os = "linux"))]
             {
                 handle_tun_rx(
-                    &udp_socket, &tun,
-                    &mut connections, &ip_to_cid,
+                    &udp_socket,
+                    &tun,
+                    &mut connections,
+                    &ip_to_cid,
                     &mut encrypt_buf,
                 )?;
             }
@@ -258,7 +262,8 @@ fn run_single(
         // ── Timeouts ────────────────────────────────────────────────────
         handle_timeouts(
             &udp_socket,
-            &mut connections, &mut ip_to_cid,
+            &mut connections,
+            &mut ip_to_cid,
             &mut multi_state,
             config.idle_timeout,
             &mut encrypt_buf,
@@ -268,7 +273,8 @@ fn run_single(
         drive_handshakes(
             &udp_socket,
             &mut multi_state,
-            &mut connections, &mut ip_to_cid,
+            &mut connections,
+            &mut ip_to_cid,
             &config.peers,
         )?;
     }
@@ -276,7 +282,11 @@ fn run_single(
 
 // ── UDP socket creation ──────────────────────────────────────────────────
 
-fn create_udp_socket(addr: SocketAddr, recv_buf: usize, send_buf: usize) -> Result<std::net::UdpSocket> {
+fn create_udp_socket(
+    addr: SocketAddr,
+    recv_buf: usize,
+    send_buf: usize,
+) -> Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -368,7 +378,9 @@ fn compute_timeout(
     let mut min_timeout = Duration::from_secs(5);
 
     for entry in connections.values() {
-        let keepalive_remaining = entry.keepalive_interval.saturating_sub(entry.last_tx.elapsed());
+        let keepalive_remaining = entry
+            .keepalive_interval
+            .saturating_sub(entry.last_tx.elapsed());
         let idle_remaining = idle_timeout.saturating_sub(entry.last_rx.elapsed());
         min_timeout = min_timeout.min(keepalive_remaining).min(idle_remaining);
     }
@@ -386,10 +398,7 @@ fn compute_timeout(
 
 // ── Drain transmits from MultiQuicState ──────────────────────────────────
 
-fn drain_transmits(
-    udp: &std::net::UdpSocket,
-    state: &mut MultiQuicState,
-) -> Result<()> {
+fn drain_transmits(udp: &std::net::UdpSocket, state: &mut MultiQuicState) -> Result<()> {
     let now = Instant::now();
     let mut buf = Vec::with_capacity(HANDSHAKE_BUF_SIZE);
 
@@ -424,7 +433,11 @@ fn handle_udp_rx_linux(
     // Loop recvmmsg until WouldBlock — required for edge-triggered epoll (mio).
     loop {
         let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
-            udp, recv_bufs, recv_lens, recv_addrs, quictun_core::batch_io::BATCH_SIZE,
+            udp,
+            recv_bufs,
+            recv_lens,
+            recv_addrs,
+            quictun_core::batch_io::BATCH_SIZE,
         ) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -434,7 +447,9 @@ fn handle_udp_rx_linux(
 
         for i in 0..n_msgs {
             let n = recv_lens[i];
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
             let first_byte = recv_bufs[i][0];
 
             if first_byte & 0x80 != 0 {
@@ -449,18 +464,25 @@ fn handle_udp_rx_linux(
             }
 
             // Short header → CID routing.
-            if cid_len == 0 || n < 1 + cid_len { continue; }
+            if cid_len == 0 || n < 1 + cid_len {
+                continue;
+            }
             let cid_bytes = &recv_bufs[i][1..1 + cid_len];
 
             if let Some(entry) = connections.get_mut(cid_bytes) {
-                match entry.conn.decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch) {
+                match entry
+                    .conn
+                    .decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch)
+                {
                     Ok(decrypted) => {
                         entry.last_rx = Instant::now();
                         if let Some(ref ack) = decrypted.ack {
                             entry.conn.process_ack(ack);
                         }
                         for datagram in &decrypted.datagrams {
-                            if datagram.is_empty() { continue; }
+                            if datagram.is_empty() {
+                                continue;
+                            }
                             tun_write_sync(tun, datagram);
                         }
                     }
@@ -495,28 +517,36 @@ fn handle_udp_rx(
     loop {
         match udp.recv_from(recv_buf) {
             Ok((n, from)) => {
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
 
                 if recv_buf[0] & 0x80 != 0 {
                     // Long header → handshake.
                     let mut data = BytesMut::with_capacity(n);
                     data.extend_from_slice(&recv_buf[..n]);
                     let now = Instant::now();
-                    let responses = multi_state.handle_incoming(now, from, None, data, response_buf);
+                    let responses =
+                        multi_state.handle_incoming(now, from, None, data, response_buf);
                     send_responses(udp, &responses, from)?;
                 } else {
                     // Short header → CID routing.
                     if cid_len > 0 && n > cid_len {
                         let cid_bytes = &recv_buf[1..1 + cid_len];
                         if let Some(entry) = connections.get_mut(cid_bytes) {
-                            match entry.conn.decrypt_packet_with_buf(&mut recv_buf[..n], scratch) {
+                            match entry
+                                .conn
+                                .decrypt_packet_with_buf(&mut recv_buf[..n], scratch)
+                            {
                                 Ok(decrypted) => {
                                     entry.last_rx = Instant::now();
                                     if let Some(ref ack) = decrypted.ack {
                                         entry.conn.process_ack(ack);
                                     }
                                     for datagram in &decrypted.datagrams {
-                                        if datagram.is_empty() { continue; }
+                                        if datagram.is_empty() {
+                                            continue;
+                                        }
                                         tun_write_sync(tun, datagram);
                                     }
                                 }
@@ -557,14 +587,20 @@ fn handle_tun_rx_linux(
         let mut packet = [0u8; 1500];
         match tun.recv(&mut packet) {
             Ok(n) => {
-                if n < 20 { continue; }
+                if n < 20 {
+                    continue;
+                }
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
                 let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
                     cid.clone()
                 } else if connections.len() == 1 {
-                    connections.keys().next().expect("single connection").clone()
+                    connections
+                        .keys()
+                        .next()
+                        .expect("single connection")
+                        .clone()
                 } else {
                     debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
                     continue;
@@ -572,9 +608,18 @@ fn handle_tun_rx_linux(
 
                 // Flush current GSO batch if connection changed or batch full.
                 if let Some(ref cur_cid) = current_cid {
-                    if *cur_cid != cid || gso_count >= max_segs || gso_pos + MAX_PACKET > gso_buf.len() {
+                    if *cur_cid != cid
+                        || gso_count >= max_segs
+                        || gso_pos + MAX_PACKET > gso_buf.len()
+                    {
                         if gso_count > 0 {
-                            flush_gso_sync(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"))?;
+                            flush_gso_sync(
+                                udp,
+                                gso_buf,
+                                gso_pos,
+                                gso_segment_size,
+                                current_remote.expect("remote set"),
+                            )?;
                             if let Some(entry) = connections.get_mut(cur_cid.as_slice()) {
                                 entry.last_tx = Instant::now();
                             }
@@ -629,7 +674,13 @@ fn handle_tun_rx_linux(
 
     // Flush remaining GSO batch.
     if gso_count > 0 {
-        flush_gso_sync(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"))?;
+        flush_gso_sync(
+            udp,
+            gso_buf,
+            gso_pos,
+            gso_segment_size,
+            current_remote.expect("remote set"),
+        )?;
         if let Some(ref cid) = current_cid {
             if let Some(entry) = connections.get_mut(cid.as_slice()) {
                 entry.last_tx = Instant::now();
@@ -691,14 +742,20 @@ fn handle_tun_rx(
         let mut packet = [0u8; 1500];
         match tun.recv(&mut packet) {
             Ok(n) => {
-                if n < 20 { continue; }
+                if n < 20 {
+                    continue;
+                }
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
                 let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
                     cid.clone()
                 } else if connections.len() == 1 {
-                    connections.keys().next().expect("single connection").clone()
+                    connections
+                        .keys()
+                        .next()
+                        .expect("single connection")
+                        .clone()
                 } else {
                     continue;
                 };
@@ -713,11 +770,10 @@ fn handle_tun_rx(
                 } else {
                     None
                 };
-                match entry.conn.encrypt_datagram(
-                    &packet[..n],
-                    ack_ranges.as_deref(),
-                    encrypt_buf,
-                ) {
+                match entry
+                    .conn
+                    .encrypt_datagram(&packet[..n], ack_ranges.as_deref(), encrypt_buf)
+                {
                     Ok(result) => {
                         udp.send_to(&encrypt_buf[..result.len], entry.remote_addr)?;
                         entry.last_tx = Instant::now();
@@ -854,14 +910,17 @@ fn drive_handshakes(
         );
 
         ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
-        connections.insert(cid_bytes, ConnEntry {
-            conn: conn_state,
-            tunnel_ip,
-            remote_addr: hs.remote_addr,
-            keepalive_interval,
-            last_tx: now_inst,
-            last_rx: now_inst,
-        });
+        connections.insert(
+            cid_bytes,
+            ConnEntry {
+                conn: conn_state,
+                tunnel_ip,
+                remote_addr: hs.remote_addr,
+                keepalive_interval,
+                last_tx: now_inst,
+                last_rx: now_inst,
+            },
+        );
     }
 
     Ok(())
@@ -907,13 +966,13 @@ fn dup_fd(fd: RawFd) -> Result<RawFd> {
 }
 
 /// Multi-thread engine: dispatcher thread 0 + N-1 worker threads.
-fn run_multi(
-    local_addr: SocketAddr,
-    setup: EndpointSetup,
-    config: NetConfig,
-) -> Result<RunResult> {
+fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
     let n_workers = config.threads - 1;
-    info!(threads = config.threads, workers = n_workers, "starting multi-thread engine");
+    info!(
+        threads = config.threads,
+        workers = n_workers,
+        "starting multi-thread engine"
+    );
 
     // 1. Create UDP socket, TUN device, signal pipe (same as single-thread).
     let udp_socket = create_udp_socket(local_addr, config.recv_buf, config.send_buf)?;
@@ -921,8 +980,7 @@ fn run_multi(
 
     let mut tun_opts = TunOptions::new(config.tunnel_ip, config.tunnel_prefix, config.tunnel_mtu);
     tun_opts.name = config.tunnel_name.clone();
-    let tun = quictun_tun::create_sync(&tun_opts)
-        .context("failed to create sync TUN device")?;
+    let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
     set_nonblocking(tun.as_raw_fd())?;
 
     let (sig_read_fd, sig_write_fd) = create_signal_pipe()?;
@@ -930,15 +988,15 @@ fn run_multi(
 
     // 2. Create MultiQuicState.
     let mut multi_state = match &setup {
-        EndpointSetup::Listener { server_config } => {
-            MultiQuicState::new(server_config.clone())
-        }
-        EndpointSetup::Connector { .. } => {
-            MultiQuicState::new_connector()
-        }
+        EndpointSetup::Listener { server_config } => MultiQuicState::new(server_config.clone()),
+        EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
 
-    if let EndpointSetup::Connector { remote_addr, client_config } = setup {
+    if let EndpointSetup::Connector {
+        remote_addr,
+        client_config,
+    } = setup
+    {
         multi_state.connect(client_config, remote_addr)?;
         drain_transmits(&udp_socket, &mut multi_state)?;
     }
@@ -978,16 +1036,28 @@ fn run_multi(
             let cid_len = config.cid_len;
 
             let handle = s.spawn(move || {
-                run_worker(i, channels, udp_fd, tun_fd, idle_timeout, cid_len, shutdown_flag)
+                run_worker(
+                    i,
+                    channels,
+                    udp_fd,
+                    tun_fd,
+                    idle_timeout,
+                    cid_len,
+                    shutdown_flag,
+                )
             });
             worker_handles.push(handle);
         }
 
         // Run dispatcher on this thread (thread 0).
         let dispatch_result = run_dispatcher(
-            &udp_socket, &tun, sig_read_fd,
-            &mut multi_state, &mut dispatch_table,
-            &worker_channels, &config,
+            &udp_socket,
+            &tun,
+            sig_read_fd,
+            &mut multi_state,
+            &mut dispatch_table,
+            &worker_channels,
+            &config,
             &shutdown,
         );
 
@@ -1008,10 +1078,14 @@ fn run_multi(
 
     // Close dup'd fds.
     for fd in &worker_udp_fds {
-        unsafe { libc::close(*fd); }
+        unsafe {
+            libc::close(*fd);
+        }
     }
     for fd in &worker_tun_fds {
-        unsafe { libc::close(*fd); }
+        unsafe {
+            libc::close(*fd);
+        }
     }
 
     result
@@ -1035,18 +1109,12 @@ fn run_dispatcher(
     let mut events = Events::with_capacity(64);
 
     let udp_raw_fd = udp.as_raw_fd();
-    poll.registry().register(
-        &mut SourceFd(&udp_raw_fd),
-        TOKEN_UDP,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register(&mut SourceFd(&udp_raw_fd), TOKEN_UDP, Interest::READABLE)?;
 
     let tun_raw_fd = tun.as_raw_fd();
-    poll.registry().register(
-        &mut SourceFd(&tun_raw_fd),
-        TOKEN_TUN,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register(&mut SourceFd(&tun_raw_fd), TOKEN_TUN, Interest::READABLE)?;
 
     poll.registry().register(
         &mut SourceFd(&sig_read_fd),
@@ -1062,7 +1130,8 @@ fn run_dispatcher(
     #[cfg(target_os = "linux")]
     let mut recv_lens = vec![0usize; quictun_core::batch_io::BATCH_SIZE];
     #[cfg(target_os = "linux")]
-    let mut recv_addrs = vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); quictun_core::batch_io::BATCH_SIZE];
+    let mut recv_addrs =
+        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); quictun_core::batch_io::BATCH_SIZE];
 
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -1105,16 +1174,27 @@ fn run_dispatcher(
             #[cfg(target_os = "linux")]
             {
                 dispatch_udp_rx_linux(
-                    udp, config.cid_len, multi_state, dispatch_table,
-                    worker_channels, &mut recv_bufs, &mut recv_lens,
-                    &mut recv_addrs, &mut response_buf,
+                    udp,
+                    config.cid_len,
+                    multi_state,
+                    dispatch_table,
+                    worker_channels,
+                    &mut recv_bufs,
+                    &mut recv_lens,
+                    &mut recv_addrs,
+                    &mut response_buf,
                 )?;
             }
             #[cfg(not(target_os = "linux"))]
             {
                 dispatch_udp_rx(
-                    udp, config.cid_len, multi_state, dispatch_table,
-                    worker_channels, &mut recv_buf, &mut response_buf,
+                    udp,
+                    config.cid_len,
+                    multi_state,
+                    dispatch_table,
+                    worker_channels,
+                    &mut recv_buf,
+                    &mut response_buf,
                 )?;
             }
         }
@@ -1132,8 +1212,11 @@ fn run_dispatcher(
 
         // ── Drive handshakes → assign to workers ─────────────────────
         dispatch_drive_handshakes(
-            udp, multi_state, dispatch_table,
-            worker_channels, &config.peers,
+            udp,
+            multi_state,
+            dispatch_table,
+            worker_channels,
+            &config.peers,
         )?;
     }
 }
@@ -1155,7 +1238,11 @@ fn dispatch_udp_rx_linux(
 ) -> Result<()> {
     loop {
         let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
-            udp, recv_bufs, recv_lens, recv_addrs, quictun_core::batch_io::BATCH_SIZE,
+            udp,
+            recv_bufs,
+            recv_lens,
+            recv_addrs,
+            quictun_core::batch_io::BATCH_SIZE,
         ) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -1165,7 +1252,9 @@ fn dispatch_udp_rx_linux(
 
         for i in 0..n_msgs {
             let n = recv_lens[i];
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
 
             if recv_bufs[i][0] & 0x80 != 0 {
                 // Long header → handshake (dispatcher handles).
@@ -1179,7 +1268,9 @@ fn dispatch_udp_rx_linux(
             }
 
             // Short header → CID routing to worker.
-            if cid_len == 0 || n < 1 + cid_len { continue; }
+            if cid_len == 0 || n < 1 + cid_len {
+                continue;
+            }
             let cid_bytes = &recv_bufs[i][1..1 + cid_len];
 
             if let Some(worker_id) = dispatch_table.lookup_cid(cid_bytes) {
@@ -1213,24 +1304,25 @@ fn dispatch_udp_rx(
     loop {
         match udp.recv_from(recv_buf) {
             Ok((n, from)) => {
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
 
                 if recv_buf[0] & 0x80 != 0 {
                     let mut data = BytesMut::with_capacity(n);
                     data.extend_from_slice(&recv_buf[..n]);
                     let now = Instant::now();
-                    let responses = multi_state.handle_incoming(now, from, None, data, response_buf);
+                    let responses =
+                        multi_state.handle_incoming(now, from, None, data, response_buf);
                     send_responses(udp, &responses, from)?;
-                } else {
-                    if cid_len > 0 && n > cid_len {
-                        let cid_bytes = &recv_buf[1..1 + cid_len];
-                        if let Some(worker_id) = dispatch_table.lookup_cid(cid_bytes) {
-                            let pkt = OuterPacket {
-                                data: recv_buf[..n].to_vec(),
-                                from,
-                            };
-                            let _ = worker_channels[worker_id].outer_tx.try_send(pkt);
-                        }
+                } else if cid_len > 0 && n > cid_len {
+                    let cid_bytes = &recv_buf[1..1 + cid_len];
+                    if let Some(worker_id) = dispatch_table.lookup_cid(cid_bytes) {
+                        let pkt = OuterPacket {
+                            data: recv_buf[..n].to_vec(),
+                            from,
+                        };
+                        let _ = worker_channels[worker_id].outer_tx.try_send(pkt);
                     }
                 }
             }
@@ -1252,7 +1344,9 @@ fn dispatch_tun_rx(
         let mut packet = [0u8; 1500];
         match tun.recv(&mut packet) {
             Ok(n) => {
-                if n < 20 { continue; }
+                if n < 20 {
+                    continue;
+                }
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
                 if let Some(worker_id) = dispatch_table.lookup_ip(dest_ip) {
@@ -1332,12 +1426,16 @@ fn dispatch_drive_handshakes(
 
         // Push control message to worker.
         let msg = ControlMessage::AddConnection {
-            conn: conn_state,
+            conn: Box::new(conn_state),
             tunnel_ip,
             remote_addr: hs.remote_addr,
             keepalive_interval,
         };
-        worker_channels[worker_id].control.lock().unwrap().push(msg);
+        worker_channels[worker_id]
+            .control
+            .lock()
+            .expect("worker control mutex poisoned — worker panicked")
+            .push(msg);
     }
 
     Ok(())
@@ -1364,7 +1462,8 @@ fn run_worker(
 
     // SAFETY: dup'd fds are valid and owned by this worker.
     // ManuallyDrop prevents double-close (run_multi closes dup'd fds).
-    let udp_socket = std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(udp_fd) });
+    let udp_socket =
+        std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(udp_fd) });
 
     // Connection table (worker-local, no locking).
     let mut connections: HashMap<Vec<u8>, ConnEntry> = HashMap::new();
@@ -1387,7 +1486,13 @@ fn run_worker(
         if let Ok(mut ctrl) = channels.control.try_lock() {
             for msg in ctrl.drain(..) {
                 match msg {
-                    ControlMessage::AddConnection { conn, tunnel_ip, remote_addr, keepalive_interval } => {
+                    ControlMessage::AddConnection {
+                        conn,
+                        tunnel_ip,
+                        remote_addr,
+                        keepalive_interval,
+                    } => {
+                        let conn = *conn;
                         let cid_bytes = conn.local_cid().to_vec();
                         info!(
                             worker = worker_id,
@@ -1397,14 +1502,17 @@ fn run_worker(
                         );
                         ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
                         let now_inst = Instant::now();
-                        connections.insert(cid_bytes, ConnEntry {
-                            conn,
-                            tunnel_ip,
-                            remote_addr,
-                            keepalive_interval,
-                            last_tx: now_inst,
-                            last_rx: now_inst,
-                        });
+                        connections.insert(
+                            cid_bytes,
+                            ConnEntry {
+                                conn,
+                                tunnel_ip,
+                                remote_addr,
+                                keepalive_interval,
+                                last_tx: now_inst,
+                                last_rx: now_inst,
+                            },
+                        );
                     }
                     ControlMessage::RemoveConnection { cid } => {
                         if let Some(entry) = connections.remove(&cid) {
@@ -1426,7 +1534,9 @@ fn run_worker(
             match channels.outer_rx.try_recv() {
                 Ok(pkt) => {
                     did_work = true;
-                    if pkt.data.len() < 1 + cid_len { continue; }
+                    if pkt.data.len() < 1 + cid_len {
+                        continue;
+                    }
                     let cid_bytes = &pkt.data[1..1 + cid_len];
 
                     if let Some(entry) = connections.get_mut(cid_bytes) {
@@ -1438,7 +1548,9 @@ fn run_worker(
                                     entry.conn.process_ack(ack);
                                 }
                                 for datagram in &decrypted.datagrams {
-                                    if datagram.is_empty() { continue; }
+                                    if datagram.is_empty() {
+                                        continue;
+                                    }
                                     // Write to TUN via dup'd fd.
                                     let ret = unsafe {
                                         libc::write(
@@ -1471,16 +1583,21 @@ fn run_worker(
             match channels.inner_rx.try_recv() {
                 Ok(pkt) => {
                     did_work = true;
-                    if pkt.data.len() < 20 { continue; }
+                    if pkt.data.len() < 20 {
+                        continue;
+                    }
 
-                    let dest_ip = Ipv4Addr::new(
-                        pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19],
-                    );
+                    let dest_ip =
+                        Ipv4Addr::new(pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19]);
 
                     let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
                         cid.clone()
                     } else if connections.len() == 1 {
-                        connections.keys().next().expect("single connection").clone()
+                        connections
+                            .keys()
+                            .next()
+                            .expect("single connection")
+                            .clone()
                     } else {
                         continue;
                     };
@@ -1501,10 +1618,8 @@ fn run_worker(
                         &mut encrypt_buf,
                     ) {
                         Ok(result) => {
-                            let _ = udp_socket.send_to(
-                                &encrypt_buf[..result.len],
-                                entry.remote_addr,
-                            );
+                            let _ =
+                                udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
                             entry.last_tx = Instant::now();
                         }
                         Err(e) => {
@@ -1533,10 +1648,7 @@ fn run_worker(
                 };
                 match entry.conn.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
                     Ok(result) => {
-                        let _ = udp_socket.send_to(
-                            &encrypt_buf[..result.len],
-                            entry.remote_addr,
-                        );
+                        let _ = udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
                         entry.last_tx = Instant::now();
                         debug!(worker = worker_id, pn = result.pn, "sent keepalive");
                     }

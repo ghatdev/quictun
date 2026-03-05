@@ -30,15 +30,13 @@ pub struct InnerPacket {
 pub enum ControlMessage {
     /// Assign a new connection to this worker.
     AddConnection {
-        conn: LocalConnectionState,
+        conn: Box<LocalConnectionState>,
         tunnel_ip: Ipv4Addr,
         remote_addr: SocketAddr,
         keepalive_interval: Duration,
     },
     /// Remove a connection from this worker.
-    RemoveConnection {
-        cid: Vec<u8>,
-    },
+    RemoveConnection { cid: Vec<u8> },
 }
 
 /// Per-worker channel bundle.
@@ -48,6 +46,12 @@ pub struct WorkerChannels {
     pub inner_tx: Sender<InnerPacket>,
     pub inner_rx: Receiver<InnerPacket>,
     pub control: Mutex<Vec<ControlMessage>>,
+}
+
+impl Default for WorkerChannels {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerChannels {
