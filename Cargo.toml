@@ -86,4 +86,4 @@ quinn-proto = { path = "third_party/quinn/quinn-proto" }
 
 [profile.release]
 lto = "thin"
-debug = 1
+debug = false

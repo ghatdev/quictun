@@ -607,7 +607,7 @@ fn handle_udp_rx_linux(
 
         // Flush accumulated GRO TX buffers.
         if offload && !gro_tx_bufs.is_empty() {
-            if let Some(ref mut gro) = gro_table {
+            if let Some(gro) = gro_table {
                 match tun.send_multiple(gro, gro_tx_bufs, quictun_tun::VIRTIO_NET_HDR_LEN) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1157,24 +1157,6 @@ fn worker_tun_write(tun_fd: RawFd, datagram: &[u8], offload: bool) {
             if err.kind() != io::ErrorKind::WouldBlock {
                 warn!(error = %err, "worker TUN write failed");
             }
-        }
-    }
-}
-
-// ── TUN write with offload (Linux — prepend zeroed virtio_net_hdr) ────────
-
-#[cfg(target_os = "linux")]
-fn tun_write_sync_offload(tun: &tun_rs::SyncDevice, datagram: &[u8], hdr_buf: &mut Vec<u8>) {
-    hdr_buf.clear();
-    hdr_buf.extend_from_slice(&[0u8; quictun_tun::VIRTIO_NET_HDR_LEN]);
-    hdr_buf.extend_from_slice(datagram);
-    match tun.send(hdr_buf) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            debug!("TUN write would block, dropping packet");
-        }
-        Err(e) => {
-            debug!(error = %e, "TUN write failed");
         }
     }
 }
