@@ -72,6 +72,8 @@ pub struct DecryptedPacket {
     pub ack: Option<AckFrame>,
     /// The decoded packet number.
     pub pn: u64,
+    /// True if a CONNECTION_CLOSE frame was received.
+    pub close_received: bool,
 }
 
 /// Result of decrypting a 1-RTT packet fully in-place (zero-copy).
@@ -85,6 +87,8 @@ pub struct DecryptedInPlace {
     pub ack: Option<AckFrame>,
     /// The decoded packet number.
     pub pn: u64,
+    /// True if a CONNECTION_CLOSE frame was received.
+    pub close_received: bool,
 }
 
 /// Result of encrypting a datagram into a 1-RTT packet.
@@ -236,6 +240,7 @@ pub fn encrypt_packet(
 fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, ParseError> {
     let mut datagrams: SmallVec<[Bytes; 4]> = SmallVec::new();
     let mut ack_frame = None;
+    let mut close_received = false;
     let mut pos = 0;
     let decrypted_len = decrypted.len();
 
@@ -251,15 +256,20 @@ fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, Pars
             0x30 | 0x31 => {
                 let remaining = &decrypted[pos..];
                 let (data, rest) = frame::parse_datagram(remaining)?;
-                let data_start =
-                    pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
+                let data_start = pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
                 let data_end = data_start + data.len();
                 datagrams.push(decrypted.slice(data_start..data_end));
                 pos = decrypted_len - rest.len();
             }
-            0x1c | 0x1d => break,
+            0x1c | 0x1d => {
+                close_received = true;
+                break;
+            }
             other => {
-                warn!(frame_type = other, "unknown frame type, skipping rest of packet");
+                warn!(
+                    frame_type = other,
+                    "unknown frame type, skipping rest of packet"
+                );
                 break;
             }
         }
@@ -269,6 +279,7 @@ fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, Pars
         datagrams,
         ack: ack_frame,
         pn,
+        close_received,
     })
 }
 
@@ -280,6 +291,7 @@ fn parse_frames_in_place(
 ) -> Result<DecryptedInPlace, ParseError> {
     let mut datagrams: SmallVec<[Range<usize>; 4]> = SmallVec::new();
     let mut ack_frame = None;
+    let mut close_received = false;
     let mut pos = 0;
     let decrypted_len = decrypted.len();
 
@@ -301,9 +313,15 @@ fn parse_frames_in_place(
                 datagrams.push(data_start..data_end);
                 pos = decrypted_len - rest.len();
             }
-            0x1c | 0x1d => break,
+            0x1c | 0x1d => {
+                close_received = true;
+                break;
+            }
             other => {
-                warn!(frame_type = other, "unknown frame type, skipping rest of packet");
+                warn!(
+                    frame_type = other,
+                    "unknown frame type, skipping rest of packet"
+                );
                 break;
             }
         }
@@ -313,6 +331,7 @@ fn parse_frames_in_place(
         datagrams,
         ack: ack_frame,
         pn,
+        close_received,
     })
 }
 

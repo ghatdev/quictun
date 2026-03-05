@@ -19,7 +19,7 @@ use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
 
 use crate::dispatch::{
-    InnerPacket, NetDispatchTable, NewConnection, OuterPacket, RemovedConnection, WorkerChannels,
+    ControlMessage, InnerPacket, NetDispatchTable, OuterPacket, RemovedConnection, WorkerChannels,
 };
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::{BUF_SIZE, MultiQuicState};
@@ -198,9 +198,14 @@ fn run_single(
         }
 
         if signal_received {
-            // Drain signal pipe.
             drain_signal_pipe(sig_read_fd);
             info!("received signal, shutting down");
+            // Graceful shutdown: send CONNECTION_CLOSE to all connections.
+            for entry in connections.values_mut() {
+                if let Ok(result) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
+                    let _ = udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
+                }
+            }
             return Ok(RunResult::Shutdown);
         }
 
@@ -469,9 +474,9 @@ fn handle_udp_rx_linux(
             if cid_len == 0 || n < 1 + cid_len {
                 continue;
             }
-            let cid_bytes = &recv_bufs[i][1..1 + cid_len];
+            let cid_key: Vec<u8> = recv_bufs[i][1..1 + cid_len].to_vec();
 
-            if let Some(entry) = connections.get_mut(cid_bytes) {
+            let close_received = if let Some(entry) = connections.get_mut(cid_key.as_slice()) {
                 match entry
                     .conn
                     .decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch)
@@ -481,17 +486,30 @@ fn handle_udp_rx_linux(
                         if let Some(ref ack) = decrypted.ack {
                             entry.conn.process_ack(ack);
                         }
-                        for datagram in &decrypted.datagrams {
-                            if datagram.is_empty() {
-                                continue;
+                        if !decrypted.close_received {
+                            for datagram in &decrypted.datagrams {
+                                if datagram.is_empty() {
+                                    continue;
+                                }
+                                tun_write_sync(tun, datagram);
                             }
-                            tun_write_sync(tun, datagram);
                         }
+                        decrypted.close_received
                     }
                     Err(e) => {
                         debug!(error = %e, "decrypt failed, dropping");
+                        false
                     }
                 }
+            } else {
+                false
+            };
+            if close_received && let Some(entry) = connections.remove(&cid_key) {
+                info!(
+                    tunnel_ip = %entry.tunnel_ip,
+                    cid = %hex::encode(&cid_key),
+                    "peer sent CONNECTION_CLOSE, removed"
+                );
             }
         }
 
@@ -534,28 +552,42 @@ fn handle_udp_rx(
                 } else {
                     // Short header → CID routing.
                     if cid_len > 0 && n > cid_len {
-                        let cid_bytes = &recv_buf[1..1 + cid_len];
-                        if let Some(entry) = connections.get_mut(cid_bytes) {
-                            match entry
-                                .conn
-                                .decrypt_packet_with_buf(&mut recv_buf[..n], scratch)
-                            {
-                                Ok(decrypted) => {
-                                    entry.last_rx = Instant::now();
-                                    if let Some(ref ack) = decrypted.ack {
-                                        entry.conn.process_ack(ack);
-                                    }
-                                    for datagram in &decrypted.datagrams {
-                                        if datagram.is_empty() {
-                                            continue;
+                        let cid_key: Vec<u8> = recv_buf[1..1 + cid_len].to_vec();
+                        let close_received =
+                            if let Some(entry) = connections.get_mut(cid_key.as_slice()) {
+                                match entry
+                                    .conn
+                                    .decrypt_packet_with_buf(&mut recv_buf[..n], scratch)
+                                {
+                                    Ok(decrypted) => {
+                                        entry.last_rx = Instant::now();
+                                        if let Some(ref ack) = decrypted.ack {
+                                            entry.conn.process_ack(ack);
                                         }
-                                        tun_write_sync(tun, datagram);
+                                        if !decrypted.close_received {
+                                            for datagram in &decrypted.datagrams {
+                                                if datagram.is_empty() {
+                                                    continue;
+                                                }
+                                                tun_write_sync(tun, datagram);
+                                            }
+                                        }
+                                        decrypted.close_received
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "decrypt failed, dropping");
+                                        false
                                     }
                                 }
-                                Err(e) => {
-                                    debug!(error = %e, "decrypt failed, dropping");
-                                }
-                            }
+                            } else {
+                                false
+                            };
+                        if close_received && let Some(entry) = connections.remove(&cid_key) {
+                            info!(
+                                tunnel_ip = %entry.tunnel_ip,
+                                cid = %hex::encode(&cid_key),
+                                "peer sent CONNECTION_CLOSE, removed"
+                            );
                         }
                     }
                 }
@@ -1177,7 +1209,14 @@ fn run_dispatcher(
 
         if signal_received {
             drain_signal_pipe(sig_read_fd);
-            info!("received signal, shutting down");
+            info!("received signal, shutting down dispatcher");
+            // Push Shutdown to all workers so they send CONNECTION_CLOSE.
+            for wc in worker_channels {
+                wc.control
+                    .lock()
+                    .expect("worker control mutex poisoned")
+                    .push(ControlMessage::Shutdown);
+            }
             return Ok(RunResult::Shutdown);
         }
 
@@ -1450,7 +1489,7 @@ fn dispatch_drive_handshakes(
             .control
             .lock()
             .expect("worker control mutex poisoned — worker panicked")
-            .push(NewConnection {
+            .push(ControlMessage::AddConnection {
                 conn: conn_state,
                 tunnel_ip,
                 remote_addr: hs.remote_addr,
@@ -1505,74 +1544,117 @@ fn run_worker(
         let mut did_work = false;
 
         // ── Poll control channel ─────────────────────────────────────
+        let mut got_shutdown = false;
         if let Ok(mut ctrl) = channels.control.try_lock() {
-            for new_conn in ctrl.drain(..) {
-                let cid_bytes = new_conn.conn.local_cid().to_vec();
-                info!(
-                    worker = worker_id,
-                    tunnel_ip = %new_conn.tunnel_ip,
-                    cid = %hex::encode(&cid_bytes),
-                    "worker received connection"
-                );
-                ip_to_cid.insert(new_conn.tunnel_ip, cid_bytes.clone());
-                let now_inst = Instant::now();
-                connections.insert(
-                    cid_bytes,
-                    ConnEntry {
-                        conn: new_conn.conn,
-                        tunnel_ip: new_conn.tunnel_ip,
-                        remote_addr: new_conn.remote_addr,
-                        keepalive_interval: new_conn.keepalive_interval,
-                        last_tx: now_inst,
-                        last_rx: now_inst,
-                    },
-                );
-                did_work = true;
+            for msg in ctrl.drain(..) {
+                match msg {
+                    ControlMessage::AddConnection {
+                        conn,
+                        tunnel_ip,
+                        remote_addr,
+                        keepalive_interval,
+                    } => {
+                        let cid_bytes = conn.local_cid().to_vec();
+                        info!(
+                            worker = worker_id,
+                            tunnel_ip = %tunnel_ip,
+                            cid = %hex::encode(&cid_bytes),
+                            "worker received connection"
+                        );
+                        ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
+                        let now_inst = Instant::now();
+                        connections.insert(
+                            cid_bytes,
+                            ConnEntry {
+                                conn,
+                                tunnel_ip,
+                                remote_addr,
+                                keepalive_interval,
+                                last_tx: now_inst,
+                                last_rx: now_inst,
+                            },
+                        );
+                        did_work = true;
+                    }
+                    ControlMessage::Shutdown => {
+                        got_shutdown = true;
+                    }
+                }
             }
+        }
+        if got_shutdown {
+            // Graceful shutdown: send CONNECTION_CLOSE to all connections.
+            for entry in connections.values_mut() {
+                if let Ok(result) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
+                    let _ = udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
+                }
+            }
+            info!(worker = worker_id, "worker shutting down gracefully");
+            break;
         }
 
         // ── Drain outer_rx (UDP packets from dispatcher) ─────────────
         for _ in 0..WORKER_DRAIN_BATCH {
             match channels.outer_rx.try_recv() {
-                Ok(pkt) => {
+                Ok(mut pkt) => {
                     did_work = true;
                     if pkt.data.len() < 1 + cid_len {
                         continue;
                     }
-                    let cid_bytes = &pkt.data[1..1 + cid_len];
+                    let cid_key: Vec<u8> = pkt.data[1..1 + cid_len].to_vec();
 
-                    if let Some(entry) = connections.get_mut(cid_bytes) {
-                        let mut data = pkt.data;
-                        match entry.conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
-                            Ok(decrypted) => {
-                                entry.last_rx = Instant::now();
-                                if let Some(ref ack) = decrypted.ack {
-                                    entry.conn.process_ack(ack);
-                                }
-                                for datagram in &decrypted.datagrams {
-                                    if datagram.is_empty() {
-                                        continue;
+                    let close_received =
+                        if let Some(entry) = connections.get_mut(cid_key.as_slice()) {
+                            match entry
+                                .conn
+                                .decrypt_packet_with_buf(&mut pkt.data, &mut scratch)
+                            {
+                                Ok(decrypted) => {
+                                    entry.last_rx = Instant::now();
+                                    if let Some(ref ack) = decrypted.ack {
+                                        entry.conn.process_ack(ack);
                                     }
-                                    // Write to TUN via dup'd fd.
-                                    let ret = unsafe {
-                                        libc::write(
-                                            tun_fd,
-                                            datagram.as_ptr() as *const libc::c_void,
-                                            datagram.len(),
-                                        )
-                                    };
-                                    if ret < 0 {
-                                        let err = io::Error::last_os_error();
-                                        if err.kind() != io::ErrorKind::WouldBlock {
-                                            warn!(error = %err, "worker TUN write failed");
+                                    if !decrypted.close_received {
+                                        for datagram in &decrypted.datagrams {
+                                            if datagram.is_empty() {
+                                                continue;
+                                            }
+                                            let ret = unsafe {
+                                                libc::write(
+                                                    tun_fd,
+                                                    datagram.as_ptr() as *const libc::c_void,
+                                                    datagram.len(),
+                                                )
+                                            };
+                                            if ret < 0 {
+                                                let err = io::Error::last_os_error();
+                                                if err.kind() != io::ErrorKind::WouldBlock {
+                                                    warn!(error = %err, "worker TUN write failed");
+                                                }
+                                            }
                                         }
                                     }
+                                    decrypted.close_received
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "worker decrypt failed, dropping");
+                                    false
                                 }
                             }
-                            Err(e) => {
-                                debug!(error = %e, "worker decrypt failed, dropping");
-                            }
-                        }
+                        } else {
+                            false
+                        };
+                    if close_received && let Some(entry) = connections.remove(&cid_key) {
+                        ip_to_cid.remove(&entry.tunnel_ip);
+                        let _ = removal_tx.try_send(RemovedConnection {
+                            cid: cid_key.clone(),
+                            tunnel_ip: entry.tunnel_ip,
+                        });
+                        info!(
+                            worker = worker_id,
+                            cid = %hex::encode(&cid_key),
+                            "peer sent CONNECTION_CLOSE, removed"
+                        );
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,

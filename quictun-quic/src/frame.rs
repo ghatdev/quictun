@@ -244,13 +244,39 @@ pub fn build_ack(ranges: &[Range<u64>], ack_delay: u64, buf: &mut [u8]) -> usize
     pos
 }
 
+// ── CONNECTION_CLOSE frame (RFC 9000 §19.19) ─────────────────────────────
+
+/// Build a CONNECTION_CLOSE frame (type 0x1c) into `buf`.
+///
+/// Writes: frame type (0x1c), error code (varint), frame type 0x00, reason length 0.
+/// Returns bytes written.
+pub fn build_connection_close(error_code: u64, buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+    buf[pos] = 0x1c; // CONNECTION_CLOSE frame type
+    pos += 1;
+    pos += write_varint(error_code, &mut buf[pos..]); // Error Code
+    pos += write_varint(0, &mut buf[pos..]); // Frame Type (no specific frame)
+    pos += write_varint(0, &mut buf[pos..]); // Reason Phrase Length (empty)
+    pos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn varint_roundtrip() {
-        let cases: &[u64] = &[0, 1, 63, 64, 16383, 16384, 1073741823, 1073741824, u64::MAX >> 2];
+        let cases: &[u64] = &[
+            0,
+            1,
+            63,
+            64,
+            16383,
+            16384,
+            1073741823,
+            1073741824,
+            u64::MAX >> 2,
+        ];
         for &val in cases {
             let mut buf = [0u8; 8];
             let written = write_varint(val, &mut buf);
@@ -292,6 +318,27 @@ mod tests {
         assert_eq!(ack.ranges.len(), 1);
         assert_eq!(ack.ranges[0], 10..15);
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn connection_close_no_error() {
+        let mut buf = [0u8; 16];
+        let written = build_connection_close(0x00, &mut buf);
+        // 0x1c (type) + 0x00 (error) + 0x00 (frame type) + 0x00 (reason len) = 4 bytes
+        assert_eq!(written, 4);
+        assert_eq!(buf[0], 0x1c);
+        assert_eq!(buf[1], 0x00);
+        assert_eq!(buf[2], 0x00);
+        assert_eq!(buf[3], 0x00);
+    }
+
+    #[test]
+    fn connection_close_large_error_code() {
+        let mut buf = [0u8; 16];
+        let written = build_connection_close(0x0a, &mut buf);
+        assert_eq!(written, 4);
+        assert_eq!(buf[0], 0x1c);
+        assert_eq!(buf[1], 0x0a); // error code
     }
 
     #[test]

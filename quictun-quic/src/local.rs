@@ -16,9 +16,9 @@ use tracing::warn;
 use crate::bitmap::Bitmap;
 use crate::frame::AckFrame;
 use crate::{
-    DecryptedInPlace, DecryptedPacket, EncryptResult, ParseError,
-    decrypt_payload, decrypt_payload_in_place, encrypt_packet, prepare_key_generations,
-    unprotect_header, KEY_UPDATE_THRESHOLD, MAX_ACK_RANGES, DEFAULT_ACK_INTERVAL,
+    DEFAULT_ACK_INTERVAL, DecryptedInPlace, DecryptedPacket, EncryptResult, KEY_UPDATE_THRESHOLD,
+    MAX_ACK_RANGES, ParseError, decrypt_payload, decrypt_payload_in_place, encrypt_packet,
+    prepare_key_generations, unprotect_header,
 };
 
 /// Non-atomic QUIC 1-RTT connection state for single-task use.
@@ -188,6 +188,54 @@ impl LocalConnectionState {
         )
     }
 
+    /// Encrypt a CONNECTION_CLOSE frame (error code 0x00 = No Error) into a 1-RTT packet.
+    ///
+    /// Used during graceful shutdown. Does not increment the key update counter.
+    pub fn encrypt_connection_close(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<EncryptResult, ParseError> {
+        let pn = self.pn_counter;
+        self.pn_counter += 1;
+
+        let (header_len, _pn_len) = crate::packet::build_short_header(
+            &self.remote_cid,
+            pn,
+            self.largest_acked,
+            self.key_phase,
+            false,
+            buf,
+        );
+
+        let mut frame_pos = header_len;
+        frame_pos += crate::frame::build_connection_close(0x00, &mut buf[frame_pos..]);
+
+        // Ensure minimum packet size for header protection sample.
+        let pn_offset = 1 + self.remote_cid.len();
+        let min_total = pn_offset + 4 + self.tx_header_key.sample_size();
+        let total_with_tag = frame_pos + self.tag_len;
+        if total_with_tag < min_total {
+            let pad_needed = min_total - total_with_tag;
+            buf[frame_pos..frame_pos + pad_needed].fill(0x00);
+            frame_pos += pad_needed;
+        }
+
+        let total_with_tag = frame_pos + self.tag_len;
+        if buf.len() < total_with_tag {
+            return Err(ParseError::BufferTooShort);
+        }
+
+        self.tx_packet_key
+            .encrypt(pn, &mut buf[..total_with_tag], header_len);
+        self.tx_header_key
+            .encrypt(pn_offset, &mut buf[..total_with_tag]);
+
+        Ok(EncryptResult {
+            len: total_with_tag,
+            pn,
+        })
+    }
+
     /// Check if an ACK should be sent.
     pub fn needs_ack(&self) -> bool {
         self.rx_since_last_ack >= self.ack_interval
@@ -267,10 +315,7 @@ impl LocalConnectionState {
 /// Scans 64 bits at a time instead of bit-by-bit. For nearly-contiguous bitmaps
 /// (common in VPN tunnels with in-order delivery), most words are 0xFFFF...
 /// and are skipped in one comparison.
-fn generate_ack_ranges_from_bitmap(
-    bitmap: &Bitmap,
-    largest_pn: u64,
-) -> SmallVec<[Range<u64>; 8]> {
+fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec<[Range<u64>; 8]> {
     let mut ranges: SmallVec<[Range<u64>; 8]> = SmallVec::new();
     let base = bitmap.base();
     if largest_pn < base {
@@ -282,7 +327,11 @@ fn generate_ack_ranges_from_bitmap(
     let mut word_idx = (largest_offset >> 6) as usize;
     // Mask: only bits <= largest_pn's bit position in the top word.
     let top_bit = (largest_offset & 63) as u32;
-    let top_mask = if top_bit == 63 { u64::MAX } else { (1u64 << (top_bit + 1)) - 1 };
+    let top_mask = if top_bit == 63 {
+        u64::MAX
+    } else {
+        (1u64 << (top_bit + 1)) - 1
+    };
 
     let bitmap_word_count = bitmap.word_count();
 
@@ -445,20 +494,29 @@ mod tests {
         fn reference_scan(bitmap: &Bitmap, largest_pn: u64) -> SmallVec<[Range<u64>; 8]> {
             let mut ranges: SmallVec<[Range<u64>; 8]> = SmallVec::new();
             let base = bitmap.base();
-            if largest_pn < base { return ranges; }
+            if largest_pn < base {
+                return ranges;
+            }
             let mut pn = largest_pn;
             let mut in_range = false;
             let mut range_end = 0u64;
             loop {
                 if bitmap.test(pn) {
-                    if !in_range { range_end = pn + 1; in_range = true; }
+                    if !in_range {
+                        range_end = pn + 1;
+                        in_range = true;
+                    }
                 } else if in_range {
                     ranges.push(pn + 1..range_end);
                     in_range = false;
-                    if ranges.len() >= MAX_ACK_RANGES { break; }
+                    if ranges.len() >= MAX_ACK_RANGES {
+                        break;
+                    }
                 }
                 if pn == base {
-                    if in_range { ranges.push(pn..range_end); }
+                    if in_range {
+                        ranges.push(pn..range_end);
+                    }
                     break;
                 }
                 pn -= 1;
@@ -480,7 +538,9 @@ mod tests {
         // Test 2: Periodic gaps (every 100th packet missing).
         let mut bm = Bitmap::new();
         for pn in 0..2000 {
-            if pn % 100 != 50 { bm.set(pn); }
+            if pn % 100 != 50 {
+                bm.set(pn);
+            }
         }
         assert_eq!(
             generate_ack_ranges_from_bitmap(&bm, 1999),
@@ -491,7 +551,9 @@ mod tests {
         // Test 3: Gap at word boundary.
         let mut bm = Bitmap::new();
         for pn in 0..500 {
-            if pn != 64 && pn != 128 && pn != 192 { bm.set(pn); }
+            if pn != 64 && pn != 128 && pn != 192 {
+                bm.set(pn);
+            }
         }
         assert_eq!(
             generate_ack_ranges_from_bitmap(&bm, 499),

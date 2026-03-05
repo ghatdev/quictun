@@ -26,12 +26,18 @@ pub struct InnerPacket {
     pub data: Vec<u8>,
 }
 
-/// New connection assignment from dispatcher to worker.
-pub struct NewConnection {
-    pub conn: LocalConnectionState,
-    pub tunnel_ip: Ipv4Addr,
-    pub remote_addr: SocketAddr,
-    pub keepalive_interval: Duration,
+/// Dispatcher → worker control message.
+#[allow(clippy::large_enum_variant)]
+pub enum ControlMessage {
+    /// Assign a new connection to this worker.
+    AddConnection {
+        conn: LocalConnectionState,
+        tunnel_ip: Ipv4Addr,
+        remote_addr: SocketAddr,
+        keepalive_interval: Duration,
+    },
+    /// Graceful shutdown: send CONNECTION_CLOSE to all connections and exit.
+    Shutdown,
 }
 
 /// Removed connection notification from worker to dispatcher.
@@ -46,7 +52,7 @@ pub struct WorkerChannels {
     pub outer_rx: Receiver<OuterPacket>,
     pub inner_tx: Sender<InnerPacket>,
     pub inner_rx: Receiver<InnerPacket>,
-    pub control: Mutex<Vec<NewConnection>>,
+    pub control: Mutex<Vec<ControlMessage>>,
 }
 
 impl Default for WorkerChannels {
