@@ -1426,7 +1426,7 @@ fn dispatch_drive_handshakes(
 
         // Push control message to worker.
         let msg = ControlMessage::AddConnection {
-            conn: Box::new(conn_state),
+            conn: conn_state,
             tunnel_ip,
             remote_addr: hs.remote_addr,
             keepalive_interval,
@@ -1492,7 +1492,6 @@ fn run_worker(
                         remote_addr,
                         keepalive_interval,
                     } => {
-                        let conn = *conn;
                         let cid_bytes = conn.local_cid().to_vec();
                         info!(
                             worker = worker_id,

@@ -27,10 +27,11 @@ pub struct InnerPacket {
 }
 
 /// Control message sent from dispatcher to worker (rare, via Mutex<Vec>).
+#[allow(clippy::large_enum_variant)]
 pub enum ControlMessage {
     /// Assign a new connection to this worker.
     AddConnection {
-        conn: Box<LocalConnectionState>,
+        conn: LocalConnectionState,
         tunnel_ip: Ipv4Addr,
         remote_addr: SocketAddr,
         keepalive_interval: Duration,
