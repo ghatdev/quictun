@@ -62,6 +62,7 @@ pub struct NetConfig {
     pub recv_buf: usize,
     pub send_buf: usize,
     pub threads: usize,
+    pub offload: bool,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -98,6 +99,8 @@ fn run_single(
     setup: EndpointSetup,
     config: NetConfig,
 ) -> Result<RunResult> {
+    let is_connector = matches!(&setup, EndpointSetup::Connector { .. });
+
     // 1. Create UDP socket (non-blocking).
     let udp_socket = create_udp_socket(local_addr, config.recv_buf, config.send_buf)?;
     info!(local_addr = %udp_socket.local_addr()?, "UDP socket bound");
@@ -109,6 +112,10 @@ fn run_single(
     // 2. Create sync TUN device.
     let mut tun_opts = TunOptions::new(config.tunnel_ip, config.tunnel_prefix, config.tunnel_mtu);
     tun_opts.name = config.tunnel_name;
+    #[cfg(target_os = "linux")]
+    {
+        tun_opts.offload = config.offload;
+    }
     let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
 
     // Set TUN fd non-blocking.
@@ -158,6 +165,7 @@ fn run_single(
     // 6. Connection table.
     let mut connections: HashMap<Vec<u8>, ConnEntry> = HashMap::new();
     let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
+    let mut had_connection = false;
 
     // Buffers.
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
@@ -178,6 +186,37 @@ fn run_single(
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
     let mut recv_buf = vec![0u8; MAX_PACKET];
+
+    // Linux: TUN offload buffers (for recv_multiple / send_multiple).
+    #[cfg(target_os = "linux")]
+    let offload_enabled = config.offload;
+    #[cfg(target_os = "linux")]
+    let mut tun_original_buf = if offload_enabled {
+        vec![0u8; quictun_tun::VIRTIO_NET_HDR_LEN + 65535]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun_split_bufs = if offload_enabled {
+        vec![vec![0u8; 1500]; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun_split_sizes = if offload_enabled {
+        vec![0usize; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut gro_table = if offload_enabled {
+        Some(quictun_tun::GROTable::default())
+    } else {
+        None
+    };
+    // GRO TX accumulation buffers: each has VIRTIO_NET_HDR_LEN offset for the header.
+    #[cfg(target_os = "linux")]
+    let mut gro_tx_bufs: Vec<Vec<u8>> = Vec::new();
 
     // 7. Main poll loop.
     loop {
@@ -225,6 +264,9 @@ fn run_single(
                     &mut recv_addrs,
                     &mut scratch,
                     &mut response_buf,
+                    offload_enabled,
+                    &mut gro_tx_bufs,
+                    &mut gro_table,
                 )?;
             }
             #[cfg(not(target_os = "linux"))]
@@ -246,14 +288,27 @@ fn run_single(
         if tun_readable {
             #[cfg(target_os = "linux")]
             {
-                handle_tun_rx_linux(
-                    &udp_socket,
-                    &tun,
-                    &mut connections,
-                    &ip_to_cid,
-                    &mut gso_buf,
-                    &mut encrypt_buf,
-                )?;
+                if offload_enabled {
+                    handle_tun_rx_linux_offload(
+                        &udp_socket,
+                        &tun,
+                        &mut connections,
+                        &ip_to_cid,
+                        &mut gso_buf,
+                        &mut tun_original_buf,
+                        &mut tun_split_bufs,
+                        &mut tun_split_sizes,
+                    )?;
+                } else {
+                    handle_tun_rx_linux(
+                        &udp_socket,
+                        &tun,
+                        &mut connections,
+                        &ip_to_cid,
+                        &mut gso_buf,
+                        &mut encrypt_buf,
+                    )?;
+                }
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -285,6 +340,21 @@ fn run_single(
             &mut ip_to_cid,
             &config.peers,
         )?;
+
+        // Track whether we ever had a connection (for ConnectionLost detection).
+        if !had_connection && !connections.is_empty() {
+            had_connection = true;
+        }
+
+        // ── ConnectionLost detection (connector only) ────────────────────
+        if is_connector
+            && had_connection
+            && connections.is_empty()
+            && multi_state.handshakes.is_empty()
+        {
+            info!("all connections lost, returning ConnectionLost for reconnect");
+            return Ok(RunResult::ConnectionLost);
+        }
     }
 }
 
@@ -436,6 +506,9 @@ fn handle_udp_rx_linux(
     recv_addrs: &mut [SocketAddr],
     scratch: &mut BytesMut,
     response_buf: &mut Vec<u8>,
+    offload: bool,
+    gro_tx_bufs: &mut Vec<Vec<u8>>,
+    gro_table: &mut Option<quictun_tun::GROTable>,
 ) -> Result<()> {
     // Loop recvmmsg until WouldBlock — required for edge-triggered epoll (mio).
     loop {
@@ -501,7 +574,16 @@ fn handle_udp_rx_linux(
                                     debug!(src = %src_ip, "dropping packet: source IP not in allowed_ips");
                                     continue;
                                 }
-                                tun_write_sync(tun, datagram);
+                                if offload {
+                                    // Accumulate for GRO coalescing via send_multiple.
+                                    let mut buf =
+                                        vec![0u8; quictun_tun::VIRTIO_NET_HDR_LEN + datagram.len()];
+                                    buf[quictun_tun::VIRTIO_NET_HDR_LEN..]
+                                        .copy_from_slice(datagram);
+                                    gro_tx_bufs.push(buf);
+                                } else {
+                                    tun_write_sync(tun, datagram);
+                                }
                             }
                         }
                         decrypted.close_received
@@ -520,6 +602,22 @@ fn handle_udp_rx_linux(
                     cid = %hex::encode(&cid_key),
                     "peer sent CONNECTION_CLOSE, removed"
                 );
+            }
+        }
+
+        // Flush accumulated GRO TX buffers.
+        if offload && !gro_tx_bufs.is_empty() {
+            if let Some(ref mut gro) = gro_table {
+                match tun.send_multiple(gro, gro_tx_bufs, quictun_tun::VIRTIO_NET_HDR_LEN) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        debug!("TUN send_multiple would block, dropping batch");
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "TUN send_multiple failed");
+                    }
+                }
+                gro_tx_bufs.clear();
             }
         }
 
@@ -1029,6 +1127,200 @@ fn tun_write_sync(tun: &tun_rs::SyncDevice, buf: &[u8]) {
     }
 }
 
+/// TUN write for workers using raw fd. Prepends zeroed virtio_net_hdr when offload is enabled.
+fn worker_tun_write(tun_fd: RawFd, datagram: &[u8], offload: bool) {
+    if offload {
+        #[cfg(target_os = "linux")]
+        {
+            let hdr_len = quictun_tun::VIRTIO_NET_HDR_LEN;
+            let mut buf = vec![0u8; hdr_len + datagram.len()];
+            buf[hdr_len..].copy_from_slice(datagram);
+            let ret =
+                unsafe { libc::write(tun_fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    warn!(error = %err, "worker TUN write (offload) failed");
+                }
+            }
+        }
+    } else {
+        let ret = unsafe {
+            libc::write(
+                tun_fd,
+                datagram.as_ptr() as *const libc::c_void,
+                datagram.len(),
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::WouldBlock {
+                warn!(error = %err, "worker TUN write failed");
+            }
+        }
+    }
+}
+
+// ── TUN write with offload (Linux — prepend zeroed virtio_net_hdr) ────────
+
+#[cfg(target_os = "linux")]
+fn tun_write_sync_offload(tun: &tun_rs::SyncDevice, datagram: &[u8], hdr_buf: &mut Vec<u8>) {
+    hdr_buf.clear();
+    hdr_buf.extend_from_slice(&[0u8; quictun_tun::VIRTIO_NET_HDR_LEN]);
+    hdr_buf.extend_from_slice(datagram);
+    match tun.send(hdr_buf) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            debug!("TUN write would block, dropping packet");
+        }
+        Err(e) => {
+            debug!(error = %e, "TUN write failed");
+        }
+    }
+}
+
+// ── TUN RX with offload (Linux — recv_multiple GSO splitting) ────────────
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn handle_tun_rx_linux_offload(
+    udp: &std::net::UdpSocket,
+    tun: &tun_rs::SyncDevice,
+    connections: &mut HashMap<Vec<u8>, ConnEntry>,
+    ip_to_cid: &HashMap<Ipv4Addr, Vec<u8>>,
+    gso_buf: &mut [u8],
+    original_buf: &mut [u8],
+    split_bufs: &mut [Vec<u8>],
+    split_sizes: &mut [usize],
+) -> Result<()> {
+    let max_segs = quictun_core::batch_io::GSO_MAX_SEGMENTS;
+
+    // GSO batching state for UDP send.
+    let mut gso_pos = 0usize;
+    let mut gso_segment_size = 0usize;
+    let mut gso_count = 0usize;
+    let mut current_cid: Option<Vec<u8>> = None;
+    let mut current_remote: Option<SocketAddr> = None;
+
+    loop {
+        let n_pkts = match tun.recv_multiple(original_buf, split_bufs, split_sizes, 0) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e).context("TUN recv_multiple failed"),
+        };
+
+        for i in 0..n_pkts {
+            let pkt_len = split_sizes[i];
+            if pkt_len < 20 {
+                continue;
+            }
+            let packet = &split_bufs[i][..pkt_len];
+
+            let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+
+            let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
+                cid.clone()
+            } else if connections.len() == 1 {
+                connections
+                    .keys()
+                    .next()
+                    .expect("single connection")
+                    .clone()
+            } else {
+                debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
+                continue;
+            };
+
+            // Flush current GSO batch if connection changed or batch full.
+            if let Some(ref cur_cid) = current_cid {
+                if *cur_cid != cid || gso_count >= max_segs || gso_pos + MAX_PACKET > gso_buf.len()
+                {
+                    if gso_count > 0 {
+                        flush_gso_sync(
+                            udp,
+                            gso_buf,
+                            gso_pos,
+                            gso_segment_size,
+                            current_remote.expect("remote set"),
+                        )?;
+                        if let Some(entry) = connections.get_mut(cur_cid.as_slice()) {
+                            entry.last_tx = Instant::now();
+                        }
+                    }
+                    gso_pos = 0;
+                    gso_segment_size = 0;
+                    gso_count = 0;
+                }
+            }
+
+            let entry = match connections.get_mut(cid.as_slice()) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            current_cid = Some(cid);
+            current_remote = Some(entry.remote_addr);
+
+            let ack_ranges = if entry.conn.needs_ack() {
+                Some(entry.conn.generate_ack_ranges())
+            } else {
+                None
+            };
+            match entry.conn.encrypt_datagram(
+                packet,
+                ack_ranges.as_deref(),
+                &mut gso_buf[gso_pos..],
+            ) {
+                Ok(result) => {
+                    if gso_count == 0 {
+                        gso_segment_size = result.len;
+                        gso_pos += result.len;
+                        gso_count += 1;
+                    } else if result.len == gso_segment_size {
+                        gso_pos += result.len;
+                        gso_count += 1;
+                    } else {
+                        if gso_count > 0 {
+                            flush_gso_sync(
+                                udp,
+                                gso_buf,
+                                gso_pos,
+                                gso_segment_size,
+                                entry.remote_addr,
+                            )?;
+                        }
+                        gso_buf.copy_within(gso_pos..gso_pos + result.len, 0);
+                        gso_segment_size = result.len;
+                        gso_pos = result.len;
+                        gso_count = 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "encrypt failed, dropping packet");
+                }
+            }
+        }
+    }
+
+    // Flush remaining GSO batch.
+    if gso_count > 0 {
+        flush_gso_sync(
+            udp,
+            gso_buf,
+            gso_pos,
+            gso_segment_size,
+            current_remote.expect("remote set"),
+        )?;
+        if let Some(ref cid) = current_cid {
+            if let Some(entry) = connections.get_mut(cid.as_slice()) {
+                entry.last_tx = Instant::now();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Multi-thread dispatcher-worker engine
 // ══════════════════════════════════════════════════════════════════════════
@@ -1044,6 +1336,7 @@ fn dup_fd(fd: RawFd) -> Result<RawFd> {
 
 /// Multi-thread engine: dispatcher thread 0 + N-1 worker threads.
 fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
+    let is_connector = matches!(&setup, EndpointSetup::Connector { .. });
     let n_workers = config.threads - 1;
     info!(
         threads = config.threads,
@@ -1057,6 +1350,10 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
 
     let mut tun_opts = TunOptions::new(config.tunnel_ip, config.tunnel_prefix, config.tunnel_mtu);
     tun_opts.name = config.tunnel_name.clone();
+    #[cfg(target_os = "linux")]
+    {
+        tun_opts.offload = config.offload;
+    }
     let tun = quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
     set_nonblocking(tun.as_raw_fd())?;
 
@@ -1122,6 +1419,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
             let tun_fd = worker_tun_fds[i];
             let idle_timeout = config.idle_timeout;
             let cid_len = config.cid_len;
+            let worker_offload = config.offload;
 
             let handle = s.spawn(move || {
                 run_worker(
@@ -1133,6 +1431,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
                     cid_len,
                     removal,
                     shutdown_flag,
+                    worker_offload,
                 )
             });
             worker_handles.push(handle);
@@ -1152,6 +1451,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
             &config,
             &shutdown,
             &removal_rx,
+            is_connector,
         );
 
         // Signal shutdown to workers.
@@ -1197,6 +1497,7 @@ fn run_dispatcher(
     config: &NetConfig,
     _shutdown: &AtomicBool,
     removal_rx: &crossbeam_channel::Receiver<RemovedConnection>,
+    is_connector: bool,
 ) -> Result<RunResult> {
     // Register with mio.
     let mut poll = Poll::new().context("failed to create mio::Poll")?;
@@ -1217,6 +1518,8 @@ fn run_dispatcher(
     )?;
 
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
+    let mut active_connections: usize = 0;
+    let mut had_connection = false;
 
     // Linux: batch RX buffers.
     #[cfg(target_os = "linux")]
@@ -1230,6 +1533,28 @@ fn run_dispatcher(
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
     let mut recv_buf = vec![0u8; MAX_PACKET];
+
+    // Linux: TUN offload buffers for dispatcher.
+    #[cfg(target_os = "linux")]
+    let dispatch_offload = config.offload;
+    #[cfg(target_os = "linux")]
+    let mut dispatch_tun_original_buf = if config.offload {
+        vec![0u8; quictun_tun::VIRTIO_NET_HDR_LEN + 65535]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut dispatch_tun_split_bufs = if config.offload {
+        vec![vec![0u8; 1500]; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut dispatch_tun_split_sizes = if config.offload {
+        vec![0usize; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
 
     loop {
         // Handshake-only timeout (workers handle their own connection timeouts).
@@ -1302,7 +1627,25 @@ fn run_dispatcher(
 
         // ── TUN RX: dispatch by dest IP ──────────────────────────────
         if tun_readable {
-            dispatch_tun_rx(tun, dispatch_table, worker_channels)?;
+            #[cfg(target_os = "linux")]
+            {
+                if dispatch_offload {
+                    dispatch_tun_rx_offload(
+                        tun,
+                        dispatch_table,
+                        worker_channels,
+                        &mut dispatch_tun_original_buf,
+                        &mut dispatch_tun_split_bufs,
+                        &mut dispatch_tun_split_sizes,
+                    )?;
+                } else {
+                    dispatch_tun_rx(tun, dispatch_table, worker_channels)?;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                dispatch_tun_rx(tun, dispatch_table, worker_channels)?;
+            }
         }
 
         // ── Handshake timeouts ───────────────────────────────────────
@@ -1312,22 +1655,43 @@ fn run_dispatcher(
         }
 
         // ── Drive handshakes → assign to workers ─────────────────────
-        dispatch_drive_handshakes(
+        let promoted = dispatch_drive_handshakes(
             udp,
             multi_state,
             dispatch_table,
             worker_channels,
             &config.peers,
         )?;
+        active_connections += promoted;
+        if promoted > 0 {
+            had_connection = true;
+        }
 
         // ── Drain removal notifications from workers ─────────────────
         while let Ok(removed) = removal_rx.try_recv() {
             dispatch_table.unregister(&removed.cid, removed.tunnel_ip);
+            active_connections = active_connections.saturating_sub(1);
             debug!(
                 cid = %hex::encode(&removed.cid),
                 tunnel_ip = %removed.tunnel_ip,
                 "dispatcher unregistered connection"
             );
+        }
+
+        // ── ConnectionLost detection (connector only) ────────────────
+        if is_connector
+            && had_connection
+            && active_connections == 0
+            && multi_state.handshakes.is_empty()
+        {
+            info!("all connections lost, returning ConnectionLost for reconnect");
+            for wc in worker_channels {
+                wc.control
+                    .lock()
+                    .expect("worker control mutex poisoned")
+                    .push(ControlMessage::Shutdown);
+            }
+            return Ok(RunResult::ConnectionLost);
         }
     }
 }
@@ -1460,26 +1824,12 @@ fn dispatch_tun_rx(
                 }
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                if let Some(workers) = dispatch_table.lookup_ip(dest_ip) {
-                    let worker_id = if workers.len() == 1 {
-                        workers[0]
-                    } else {
-                        let hash = crate::dispatch::flow_hash_5tuple(&packet[..n]);
-                        workers[(hash as usize) % workers.len()]
-                    };
-                    let pkt = InnerPacket {
-                        data: packet[..n].to_vec(),
-                    };
-                    let _ = worker_channels[worker_id].inner_tx.try_send(pkt);
-                } else if worker_channels.len() == 1 {
-                    // Single worker: send everything to it (connector case).
-                    let pkt = InnerPacket {
-                        data: packet[..n].to_vec(),
-                    };
-                    let _ = worker_channels[0].inner_tx.try_send(pkt);
-                } else {
-                    debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
-                }
+                dispatch_tun_packet_to_worker(
+                    &packet[..n],
+                    dest_ip,
+                    dispatch_table,
+                    worker_channels,
+                );
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e).context("TUN recv failed"),
@@ -1488,17 +1838,75 @@ fn dispatch_tun_rx(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn dispatch_tun_rx_offload(
+    tun: &tun_rs::SyncDevice,
+    dispatch_table: &NetDispatchTable,
+    worker_channels: &[Arc<WorkerChannels>],
+    original_buf: &mut [u8],
+    split_bufs: &mut [Vec<u8>],
+    split_sizes: &mut [usize],
+) -> Result<()> {
+    loop {
+        let n_pkts = match tun.recv_multiple(original_buf, split_bufs, split_sizes, 0) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e).context("TUN recv_multiple failed"),
+        };
+
+        for i in 0..n_pkts {
+            let pkt_len = split_sizes[i];
+            if pkt_len < 20 {
+                continue;
+            }
+            let packet = &split_bufs[i][..pkt_len];
+            let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+
+            dispatch_tun_packet_to_worker(packet, dest_ip, dispatch_table, worker_channels);
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_tun_packet_to_worker(
+    packet: &[u8],
+    dest_ip: Ipv4Addr,
+    dispatch_table: &NetDispatchTable,
+    worker_channels: &[Arc<WorkerChannels>],
+) {
+    if let Some(workers) = dispatch_table.lookup_ip(dest_ip) {
+        let worker_id = if workers.len() == 1 {
+            workers[0]
+        } else {
+            let hash = crate::dispatch::flow_hash_5tuple(packet);
+            (hash as usize) % workers.len()
+        };
+        let pkt = InnerPacket {
+            data: packet.to_vec(),
+        };
+        let _ = worker_channels[worker_id].inner_tx.try_send(pkt);
+    } else if worker_channels.len() == 1 {
+        let pkt = InnerPacket {
+            data: packet.to_vec(),
+        };
+        let _ = worker_channels[0].inner_tx.try_send(pkt);
+    } else {
+        debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
+    }
+}
+
 // ── Dispatcher: drive handshakes → assign to workers ─────────────────────
 
+/// Returns the number of connections promoted to workers.
 fn dispatch_drive_handshakes(
     udp: &std::net::UdpSocket,
     multi_state: &mut MultiQuicState,
     dispatch_table: &mut NetDispatchTable,
     worker_channels: &[Arc<WorkerChannels>],
     peers: &[PeerConfig],
-) -> Result<()> {
+) -> Result<usize> {
     if multi_state.handshakes.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     drain_transmits(udp, multi_state)?;
@@ -1507,6 +1915,7 @@ fn dispatch_drive_handshakes(
 
     drain_transmits(udp, multi_state)?;
 
+    let mut promoted = 0usize;
     for ch in result.completed {
         let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
             continue;
@@ -1553,9 +1962,10 @@ fn dispatch_drive_handshakes(
                 remote_addr: hs.remote_addr,
                 keepalive_interval,
             });
+        promoted += 1;
     }
 
-    Ok(())
+    Ok(promoted)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1576,6 +1986,7 @@ fn run_worker(
     cid_len: usize,
     removal_tx: crossbeam_channel::Sender<RemovedConnection>,
     shutdown: Arc<AtomicBool>,
+    offload: bool,
 ) -> Result<()> {
     info!(worker = worker_id, "worker started");
 
@@ -1589,6 +2000,23 @@ fn run_worker(
     let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
 
     let mut scratch = BytesMut::with_capacity(2048);
+    #[cfg(not(target_os = "linux"))]
+    let mut encrypt_buf = vec![0u8; MAX_PACKET];
+
+    // Linux: per-worker GSO batching state for TUN→UDP path.
+    #[cfg(target_os = "linux")]
+    let mut worker_gso_buf = vec![0u8; quictun_core::batch_io::GSO_BUF_SIZE];
+    #[cfg(target_os = "linux")]
+    let mut worker_gso_pos = 0usize;
+    #[cfg(target_os = "linux")]
+    let mut worker_gso_segment_size = 0usize;
+    #[cfg(target_os = "linux")]
+    let mut worker_gso_count = 0usize;
+    #[cfg(target_os = "linux")]
+    let mut worker_gso_remote: Option<SocketAddr> = None;
+
+    // encrypt_buf still needed on Linux for keepalives and CONNECTION_CLOSE.
+    #[cfg(target_os = "linux")]
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
 
     // Adaptive sleep: start at 1μs, backoff to 100μs when idle.
@@ -1690,19 +2118,7 @@ fn run_worker(
                                             debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
                                             continue;
                                         }
-                                        let ret = unsafe {
-                                            libc::write(
-                                                tun_fd,
-                                                datagram.as_ptr() as *const libc::c_void,
-                                                datagram.len(),
-                                            )
-                                        };
-                                        if ret < 0 {
-                                            let err = io::Error::last_os_error();
-                                            if err.kind() != io::ErrorKind::WouldBlock {
-                                                warn!(error = %err, "worker TUN write failed");
-                                            }
-                                        }
+                                        worker_tun_write(tun_fd, datagram, offload);
                                     }
                                 }
                                 decrypted.close_received
@@ -1734,56 +2150,177 @@ fn run_worker(
         }
 
         // ── Drain inner_rx (TUN packets from dispatcher) ─────────────
-        for _ in 0..WORKER_DRAIN_BATCH {
-            match channels.inner_rx.try_recv() {
-                Ok(pkt) => {
-                    did_work = true;
-                    if pkt.data.len() < 20 {
-                        continue;
-                    }
-
-                    let dest_ip =
-                        Ipv4Addr::new(pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19]);
-
-                    let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
-                        cid.clone()
-                    } else if connections.len() == 1 {
-                        connections
-                            .keys()
-                            .next()
-                            .expect("single connection")
-                            .clone()
-                    } else {
-                        continue;
-                    };
-
-                    let entry = match connections.get_mut(cid.as_slice()) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-
-                    let ack_ranges = if entry.conn.needs_ack() {
-                        Some(entry.conn.generate_ack_ranges())
-                    } else {
-                        None
-                    };
-                    match entry.conn.encrypt_datagram(
-                        &pkt.data,
-                        ack_ranges.as_deref(),
-                        &mut encrypt_buf,
-                    ) {
-                        Ok(result) => {
-                            let _ =
-                                udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
-                            entry.last_tx = Instant::now();
+        #[cfg(target_os = "linux")]
+        {
+            let max_segs = quictun_core::batch_io::GSO_MAX_SEGMENTS;
+            for _ in 0..WORKER_DRAIN_BATCH {
+                match channels.inner_rx.try_recv() {
+                    Ok(pkt) => {
+                        did_work = true;
+                        if pkt.data.len() < 20 {
+                            continue;
                         }
-                        Err(e) => {
-                            warn!(error = %e, "worker encrypt failed, dropping");
+
+                        let dest_ip =
+                            Ipv4Addr::new(pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19]);
+
+                        let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
+                            cid.clone()
+                        } else if connections.len() == 1 {
+                            connections
+                                .keys()
+                                .next()
+                                .expect("single connection")
+                                .clone()
+                        } else {
+                            continue;
+                        };
+
+                        let entry = match connections.get_mut(cid.as_slice()) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+
+                        // Flush GSO batch if remote changed or batch full.
+                        if let Some(ref cur_remote) = worker_gso_remote {
+                            if *cur_remote != entry.remote_addr
+                                || worker_gso_count >= max_segs
+                                || worker_gso_pos + MAX_PACKET > worker_gso_buf.len()
+                            {
+                                if worker_gso_count > 0 {
+                                    flush_gso_sync(
+                                        &udp_socket,
+                                        &worker_gso_buf,
+                                        worker_gso_pos,
+                                        worker_gso_segment_size,
+                                        *cur_remote,
+                                    )?;
+                                }
+                                worker_gso_pos = 0;
+                                worker_gso_segment_size = 0;
+                                worker_gso_count = 0;
+                            }
+                        }
+
+                        worker_gso_remote = Some(entry.remote_addr);
+
+                        let ack_ranges = if entry.conn.needs_ack() {
+                            Some(entry.conn.generate_ack_ranges())
+                        } else {
+                            None
+                        };
+                        match entry.conn.encrypt_datagram(
+                            &pkt.data,
+                            ack_ranges.as_deref(),
+                            &mut worker_gso_buf[worker_gso_pos..],
+                        ) {
+                            Ok(result) => {
+                                if worker_gso_count == 0 {
+                                    worker_gso_segment_size = result.len;
+                                    worker_gso_pos += result.len;
+                                    worker_gso_count += 1;
+                                } else if result.len == worker_gso_segment_size {
+                                    worker_gso_pos += result.len;
+                                    worker_gso_count += 1;
+                                } else {
+                                    // Odd-sized: flush current, start new batch.
+                                    if worker_gso_count > 0 {
+                                        flush_gso_sync(
+                                            &udp_socket,
+                                            &worker_gso_buf,
+                                            worker_gso_pos,
+                                            worker_gso_segment_size,
+                                            entry.remote_addr,
+                                        )?;
+                                    }
+                                    worker_gso_buf.copy_within(
+                                        worker_gso_pos..worker_gso_pos + result.len,
+                                        0,
+                                    );
+                                    worker_gso_segment_size = result.len;
+                                    worker_gso_pos = result.len;
+                                    worker_gso_count = 1;
+                                }
+                                entry.last_tx = Instant::now();
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "worker encrypt failed, dropping");
+                            }
                         }
                     }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
+            }
+            // Flush remaining GSO batch after drain loop.
+            if worker_gso_count > 0 {
+                if let Some(remote) = worker_gso_remote {
+                    flush_gso_sync(
+                        &udp_socket,
+                        &worker_gso_buf,
+                        worker_gso_pos,
+                        worker_gso_segment_size,
+                        remote,
+                    )?;
+                }
+                worker_gso_pos = 0;
+                worker_gso_segment_size = 0;
+                worker_gso_count = 0;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for _ in 0..WORKER_DRAIN_BATCH {
+                match channels.inner_rx.try_recv() {
+                    Ok(pkt) => {
+                        did_work = true;
+                        if pkt.data.len() < 20 {
+                            continue;
+                        }
+
+                        let dest_ip =
+                            Ipv4Addr::new(pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19]);
+
+                        let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
+                            cid.clone()
+                        } else if connections.len() == 1 {
+                            connections
+                                .keys()
+                                .next()
+                                .expect("single connection")
+                                .clone()
+                        } else {
+                            continue;
+                        };
+
+                        let entry = match connections.get_mut(cid.as_slice()) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+
+                        let ack_ranges = if entry.conn.needs_ack() {
+                            Some(entry.conn.generate_ack_ranges())
+                        } else {
+                            None
+                        };
+                        match entry.conn.encrypt_datagram(
+                            &pkt.data,
+                            ack_ranges.as_deref(),
+                            &mut encrypt_buf,
+                        ) {
+                            Ok(result) => {
+                                let _ = udp_socket
+                                    .send_to(&encrypt_buf[..result.len], entry.remote_addr);
+                                entry.last_tx = Instant::now();
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "worker encrypt failed, dropping");
+                            }
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
+                }
             }
         }
 

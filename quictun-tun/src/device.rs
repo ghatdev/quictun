@@ -223,6 +223,11 @@ pub fn create_sync(opts: &TunOptions) -> Result<tun_rs::SyncDevice, TunError> {
         builder = builder.multi_queue(true);
     }
 
+    #[cfg(target_os = "linux")]
+    if opts.offload {
+        builder = builder.offload(true);
+    }
+
     let device = builder
         .ipv4(opts.address, opts.prefix_len, None)
         .mtu(opts.mtu)
@@ -231,6 +236,17 @@ pub fn create_sync(opts: &TunOptions) -> Result<tun_rs::SyncDevice, TunError> {
     let actual_name = device
         .name()
         .unwrap_or_else(|_| opts.name.as_deref().unwrap_or("tun?").to_string());
+
+    #[cfg(target_os = "linux")]
+    if opts.offload {
+        tracing::info!(
+            name = %actual_name,
+            tcp_gso = device.tcp_gso(),
+            udp_gso = device.udp_gso(),
+            "sync TUN offload capabilities"
+        );
+    }
+
     tracing::info!(
         name = %actual_name,
         address = %opts.address,

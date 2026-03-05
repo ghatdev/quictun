@@ -111,6 +111,7 @@ pub fn run(
         initial_rtt,
         pin_mtu,
         threads,
+        offload,
     )
 }
 
@@ -125,6 +126,7 @@ fn run_net(
     _initial_rtt: u64,
     _pin_mtu: bool,
     threads: usize,
+    offload: bool,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -236,6 +238,7 @@ fn run_net(
         recv_buf,
         send_buf,
         threads,
+        offload,
     };
 
     // Backoff state for reconnection.
