@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use quictun_quic::local::LocalConnectionState;
+use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use tracing::{info, warn};
 
 use crate::peer;
@@ -79,12 +79,15 @@ impl MultiQuicState {
             .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
         let local_cid = *conn.local_cid();
         info!(remote = %remote_addr, cid = %hex_cid(&local_cid), "QUIC connection initiated");
-        self.handshakes.insert(ch, HandshakeState {
-            connection: conn,
+        self.handshakes.insert(
             ch,
-            local_cid,
-            remote_addr,
-        });
+            HandshakeState {
+                connection: conn,
+                ch,
+                local_cid,
+                remote_addr,
+            },
+        );
         Ok(())
     }
 
@@ -101,7 +104,9 @@ impl MultiQuicState {
     ) -> Vec<(usize, [u8; BUF_SIZE])> {
         let mut response_transmits = Vec::new();
 
-        let Some(event) = self.endpoint.handle(now, remote_addr, None, ecn, data, response_buf)
+        let Some(event) = self
+            .endpoint
+            .handle(now, remote_addr, None, ecn, data, response_buf)
         else {
             return response_transmits;
         };
@@ -113,21 +118,22 @@ impl MultiQuicState {
                 }
             }
             DatagramEvent::NewConnection(incoming) => {
-                match self.endpoint.accept(
-                    incoming,
-                    now,
-                    response_buf,
-                    self.server_config.clone(),
-                ) {
+                match self
+                    .endpoint
+                    .accept(incoming, now, response_buf, self.server_config.clone())
+                {
                     Ok((ch, conn)) => {
                         let local_cid = *conn.local_cid();
                         info!(remote = %remote_addr, cid = %hex_cid(&local_cid), "accepted new connection");
-                        self.handshakes.insert(ch, HandshakeState {
-                            connection: conn,
+                        self.handshakes.insert(
                             ch,
-                            local_cid,
-                            remote_addr,
-                        });
+                            HandshakeState {
+                                connection: conn,
+                                ch,
+                                local_cid,
+                                remote_addr,
+                            },
+                        );
                     }
                     Err(e) => {
                         warn!(error = ?e.cause, "failed to accept connection");

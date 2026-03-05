@@ -8,8 +8,8 @@ use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use quinn_proto::ConnectionId;
 use quictun_quic::local::LocalConnectionState;
+use quinn_proto::ConnectionId;
 
 use crate::ffi;
 use crate::ring::SpscRing;
@@ -47,7 +47,8 @@ impl DpdkDispatchTable {
 
     /// Register a CID → worker mapping (called at accept time).
     pub fn register_cid(&mut self, cid: &ConnectionId, worker_id: usize) {
-        self.connections.insert(cid.to_vec(), DispatchEntry { worker_id });
+        self.connections
+            .insert(cid.to_vec(), DispatchEntry { worker_id });
         self.worker_load[worker_id] += 1;
     }
 
@@ -82,8 +83,7 @@ impl DpdkDispatchTable {
     pub fn unregister(&mut self, cid: &ConnectionId, tunnel_ip: Ipv4Addr) {
         let key: &[u8] = cid.as_ref();
         if let Some(entry) = self.connections.remove(key) {
-            self.worker_load[entry.worker_id] =
-                self.worker_load[entry.worker_id].saturating_sub(1);
+            self.worker_load[entry.worker_id] = self.worker_load[entry.worker_id].saturating_sub(1);
         }
         self.routes.remove(&tunnel_ip);
     }
@@ -124,9 +124,7 @@ pub enum ControlMessage {
         remote_mac: [u8; 6],
     },
     /// Remove a connection from this worker.
-    RemoveConnection {
-        cid: ConnectionId,
-    },
+    RemoveConnection { cid: ConnectionId },
 }
 
 /// Per-connection state held by a worker core.

@@ -112,8 +112,7 @@ fn spawn_echo_server(
 
 #[tokio::test]
 async fn connection_lost_returns_retriable() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) =
-        make_endpoints(8, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, false)?;
 
     // Use a oneshot to coordinate: server waits for client signal before closing.
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
@@ -230,8 +229,7 @@ async fn idle_timeout_config() -> Result<()> {
 #[tokio::test]
 async fn fips_mode_echo_round_trip() -> Result<()> {
     // FIPS mode: only AES-GCM + P-256/P-384, no ChaCha20/x25519
-    let (_, _, server_endpoint, client_endpoint, server_addr) =
-        make_endpoints(8, true)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, true)?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -247,8 +245,7 @@ async fn fips_mode_echo_round_trip() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_0_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) =
-        make_endpoints(0, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(0, false)?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -262,8 +259,7 @@ async fn cid_length_0_works() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_4_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) =
-        make_endpoints(4, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(4, false)?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -277,8 +273,7 @@ async fn cid_length_4_works() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_8_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) =
-        make_endpoints(8, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, false)?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -521,8 +516,7 @@ async fn x509_rejects_untrusted_client() -> Result<()> {
         }
         Ok(conn) => {
             // May appear to succeed briefly, but server should reject
-            let result =
-                tokio::time::timeout(Duration::from_secs(2), conn.read_datagram()).await;
+            let result = tokio::time::timeout(Duration::from_secs(2), conn.read_datagram()).await;
             match result {
                 Ok(Ok(_)) => panic!("rogue client should have been rejected"),
                 Ok(Err(_)) => {} // server closed it

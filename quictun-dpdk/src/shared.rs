@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use quictun_core::peer;
 use quictun_quic::local::LocalConnectionState;
+use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use tracing::{info, warn};
 
 // Re-export multi-client types from quictun-core (shared with quictun-net).
@@ -27,10 +27,7 @@ pub struct QuicState {
 }
 
 impl QuicState {
-    pub fn new(
-        remote_addr: SocketAddr,
-        server_config: Option<Arc<ServerConfig>>,
-    ) -> Self {
+    pub fn new(remote_addr: SocketAddr, server_config: Option<Arc<ServerConfig>>) -> Self {
         let ep_config = Arc::new(EndpointConfig::default());
         let endpoint = Endpoint::new(ep_config, server_config.clone(), true, None);
         Self {
@@ -119,11 +116,13 @@ pub fn process_events(state: &mut QuicState, result: &mut DriveResult) {
                             break;
                         }
                     }
-                    info!(key_generations = key_gens.len(), "pre-computed key update generations");
-
-                    let conn_state = LocalConnectionState::new(
-                        keys, key_gens, local_cid, remote_cid, is_server,
+                    info!(
+                        key_generations = key_gens.len(),
+                        "pre-computed key update generations"
                     );
+
+                    let conn_state =
+                        LocalConnectionState::new(keys, key_gens, local_cid, remote_cid, is_server);
                     result.connection_state = Some(conn_state);
                 } else {
                     warn!("quic: Connected but no 1-RTT keys available");

@@ -1,6 +1,6 @@
 use std::ffi::CString;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::ffi;
 
@@ -20,11 +20,13 @@ impl Eal {
         let mut c_args: Vec<CString> = Vec::with_capacity(args.len() + 1);
         c_args.push(CString::new("quictun").expect("program name"));
         for arg in args {
-            c_args
-                .push(CString::new(arg.as_str()).with_context(|| format!("invalid EAL arg: {arg}"))?);
+            c_args.push(
+                CString::new(arg.as_str()).with_context(|| format!("invalid EAL arg: {arg}"))?,
+            );
         }
 
-        let mut c_ptrs: Vec<*mut libc::c_char> = c_args.iter().map(|s| s.as_ptr() as *mut _).collect();
+        let mut c_ptrs: Vec<*mut libc::c_char> =
+            c_args.iter().map(|s| s.as_ptr() as *mut _).collect();
         let argc = c_ptrs.len() as libc::c_int;
 
         // SAFETY: c_ptrs contains valid CString pointers; argc matches the array length.

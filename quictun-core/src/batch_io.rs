@@ -18,9 +18,7 @@ pub const GSO_MAX_SEGMENTS: usize = 44;
 pub const GSO_BUF_SIZE: usize = GSO_MAX_SEGMENTS * 2048;
 
 /// Build a sockaddr_in from a SocketAddr::V4.
-fn build_sockaddr_v4(
-    remote_addr: SocketAddr,
-) -> io::Result<(libc::sockaddr_in, libc::socklen_t)> {
+fn build_sockaddr_v4(remote_addr: SocketAddr) -> io::Result<(libc::sockaddr_in, libc::socklen_t)> {
     match remote_addr {
         SocketAddr::V4(addr) => {
             let sa = libc::sockaddr_in {
@@ -31,7 +29,10 @@ fn build_sockaddr_v4(
                 },
                 sin_zero: [0; 8],
             };
-            Ok((sa, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t))
+            Ok((
+                sa,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ))
         }
         SocketAddr::V6(_) => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -96,7 +97,11 @@ pub fn recvmmsg_batch(
     addrs: &mut [SocketAddr],
     max_count: usize,
 ) -> io::Result<usize> {
-    let count = max_count.min(bufs.len()).min(lens.len()).min(addrs.len()).min(BATCH_SIZE);
+    let count = max_count
+        .min(bufs.len())
+        .min(lens.len())
+        .min(addrs.len())
+        .min(BATCH_SIZE);
     if count == 0 {
         return Ok(0);
     }

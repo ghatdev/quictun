@@ -181,9 +181,7 @@ fn load_certs_from_pem(path: &Path) -> Result<Vec<rustls::pki_types::Certificate
 }
 
 /// Load a PEM private key from a file.
-fn load_private_key_from_pem(
-    path: &Path,
-) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+fn load_private_key_from_pem(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("failed to open key file: {}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -379,7 +377,9 @@ impl std::str::FromStr for CongestionControl {
             "cubic" => Ok(Self::Cubic),
             "newreno" => Ok(Self::NewReno),
             "none" => Ok(Self::None),
-            _ => Err(format!("unknown congestion control: {s} (expected bbr, cubic, newreno, none)")),
+            _ => Err(format!(
+                "unknown congestion control: {s} (expected bbr, cubic, newreno, none)"
+            )),
         }
     }
 }
@@ -465,7 +465,7 @@ impl Default for TransportTuning {
     fn default() -> Self {
         Self {
             datagram_recv_buffer: 8 * 1024 * 1024, // 8 MB
-            datagram_send_buffer: 8 * 1024 * 1024,  // 8 MB
+            datagram_send_buffer: 8 * 1024 * 1024, // 8 MB
             initial_mtu: 1452,
             send_window: 0, // 0 = use default
             cc: CongestionControl::Bbr,
@@ -500,13 +500,17 @@ pub fn make_transport_config(
     }
     match tuning.cc {
         CongestionControl::Bbr => {
-            transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         }
         CongestionControl::Cubic => {
-            transport.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
         }
         CongestionControl::NewReno => {
-            transport.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
         }
         CongestionControl::None => {
             transport.congestion_controller_factory(Arc::new(UnconstrainedConfig));

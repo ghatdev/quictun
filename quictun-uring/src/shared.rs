@@ -21,10 +21,7 @@ pub struct QuicState {
 }
 
 impl QuicState {
-    pub fn new(
-        remote_addr: SocketAddr,
-        server_config: Option<Arc<ServerConfig>>,
-    ) -> Self {
+    pub fn new(remote_addr: SocketAddr, server_config: Option<Arc<ServerConfig>>) -> Self {
         let ep_config = Arc::new(EndpointConfig::default());
         let endpoint = Endpoint::new(ep_config, server_config.clone(), true, None);
         Self {

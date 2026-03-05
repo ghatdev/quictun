@@ -40,7 +40,8 @@ pub fn run(
             })?;
             builder.setup_attach_wq(engine_ring_fd);
         }
-        builder.build(RING_SIZE)
+        builder
+            .build(RING_SIZE)
             .context("reader: failed to create io_uring with SQPOLL")?
     } else {
         IoUring::new(RING_SIZE).context("reader: failed to create io_uring")?
@@ -57,7 +58,10 @@ pub fn run(
     // Register buffer pool for zero-copy I/O.
     pool.register(&ring)?;
 
-    info!(sqpoll, "reader: io_uring initialized (registered fds + buffers)");
+    info!(
+        sqpoll,
+        "reader: io_uring initialized (registered fds + buffers)"
+    );
 
     // Prime TUN read SQEs.
     for _ in 0..PREFILL_READS {
@@ -164,9 +168,14 @@ fn submit_tun_read(ring: &mut IoUring, pool: &mut BufferPool) -> Result<()> {
             return Ok(());
         }
     };
-    let entry = opcode::ReadFixed::new(types::Fixed(FD_TUN), pool.ptr(idx), BUF_SIZE as u32, idx as u16)
-        .build()
-        .user_data(bufpool::encode_user_data(OP_TUN_READ, idx));
+    let entry = opcode::ReadFixed::new(
+        types::Fixed(FD_TUN),
+        pool.ptr(idx),
+        BUF_SIZE as u32,
+        idx as u16,
+    )
+    .build()
+    .user_data(bufpool::encode_user_data(OP_TUN_READ, idx));
 
     unsafe { ring.submission().push(&entry) }
         .map_err(|_| anyhow::anyhow!("reader: SQ full (tun read)"))?;

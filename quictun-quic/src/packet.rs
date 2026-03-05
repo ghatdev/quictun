@@ -188,7 +188,8 @@ mod tests {
         let spin = false;
 
         let mut buf = [0u8; 128];
-        let (header_len, _pn_len) = build_short_header(&cid, pn, largest_acked, key_phase, spin, &mut buf);
+        let (header_len, _pn_len) =
+            build_short_header(&cid, pn, largest_acked, key_phase, spin, &mut buf);
 
         // Now parse it back (without header protection, which is fine for this test)
         let parsed = parse_short_header(&buf[..header_len + 16], cid.len(), largest_acked)

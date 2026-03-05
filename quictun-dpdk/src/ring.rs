@@ -5,7 +5,7 @@
 
 use std::ffi::CString;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::ffi;
 

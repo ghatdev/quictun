@@ -1,7 +1,7 @@
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::ffi;
 
@@ -11,7 +11,10 @@ const DEFAULT_NB_DESC: u16 = 1024;
 /// Configure and start a DPDK Ethernet port with 1 RX queue and 1 TX queue.
 ///
 /// Returns `(mac_address, hw_udp_cksum, hw_ip_cksum)`.
-pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([u8; 6], bool, bool)> {
+pub fn configure_port(
+    port_id: u16,
+    mempool: *mut ffi::rte_mempool,
+) -> Result<([u8; 6], bool, bool)> {
     // Get device info for default RX/TX conf.
     let mut dev_info = MaybeUninit::<ffi::rte_eth_dev_info>::uninit();
     // SAFETY: dev_info is a valid MaybeUninit; rte_eth_dev_info_get writes into it.
@@ -99,7 +102,11 @@ pub fn configure_port(port_id: u16, mempool: *mut ffi::rte_mempool) -> Result<([
     // SAFETY: port is started; rte_eth_link_get_nowait writes into link.
     let ret = unsafe { ffi::rte_eth_link_get_nowait(port_id, link.as_mut_ptr()) };
     if ret < 0 {
-        tracing::warn!(port = port_id, ret, "rte_eth_link_get_nowait failed, link status unknown");
+        tracing::warn!(
+            port = port_id,
+            ret,
+            "rte_eth_link_get_nowait failed, link status unknown"
+        );
     }
     // SAFETY: rte_eth_link_get_nowait always initializes the struct (even on error, zeroed).
     let link = unsafe { link.assume_init() };
@@ -155,8 +162,7 @@ pub fn configure_port_multiqueue(
     }
 
     // SAFETY: port_conf is a valid RSS config; port_id was validated by dev_info_get above.
-    let ret =
-        unsafe { ffi::rte_eth_dev_configure(port_id, n_queues, n_queues, &port_conf) };
+    let ret = unsafe { ffi::rte_eth_dev_configure(port_id, n_queues, n_queues, &port_conf) };
     if ret != 0 {
         bail!(
             "rte_eth_dev_configure (multiqueue) failed: {}",
@@ -274,10 +280,20 @@ pub fn configure_port_dispatcher(
 
     // 1 RX queue (core 0).
     let ret = unsafe {
-        ffi::rte_eth_rx_queue_setup(port_id, 0, DEFAULT_NB_DESC, 0, &dev_info.default_rxconf, mempool)
+        ffi::rte_eth_rx_queue_setup(
+            port_id,
+            0,
+            DEFAULT_NB_DESC,
+            0,
+            &dev_info.default_rxconf,
+            mempool,
+        )
     };
     if ret != 0 {
-        bail!("rte_eth_rx_queue_setup(q=0) failed: {}", dpdk_strerror(-ret));
+        bail!(
+            "rte_eth_rx_queue_setup(q=0) failed: {}",
+            dpdk_strerror(-ret)
+        );
     }
 
     // N TX queues (one per core: dispatcher + workers).

@@ -1,13 +1,12 @@
 use std::ffi::CString;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::dispatch::{DpdkDispatchTable, WorkerRings};
-use quictun_core::peer::PeerConfig;
 use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
@@ -16,6 +15,7 @@ use crate::net::{self, ArpTable, ChecksumMode, NetIdentity};
 use crate::port;
 use crate::shared::MultiQuicState;
 use crate::veth::VethPair;
+use quictun_core::peer::PeerConfig;
 
 /// QUIC endpoint setup (connector or listener), same pattern as quictun-uring.
 pub enum EndpointSetup {
@@ -85,11 +85,7 @@ pub struct DpdkConfig {
 /// - mode "tap" → TAP PMD (default, DPDK built-in TAP virtual device)
 /// - mode "xdp" → AF_XDP (veth pair + DPDK AF_XDP PMD)
 /// - mode "virtio" → virtio-user + vhost-net (kernel TAP with offload support)
-pub fn run(
-    local_addr: SocketAddr,
-    setup: EndpointSetup,
-    dpdk_config: DpdkConfig,
-) -> Result<()> {
+pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig) -> Result<()> {
     // ── 1. Initialize DPDK EAL ───────────────────────────────────
 
     // For TAP/virtio mode, inject vdev(s) into EAL args before init.
@@ -126,8 +122,11 @@ pub fn run(
 
     // ── 2. Create mempool and configure outer port ────────────────
 
-    let mempool =
-        mbuf::create_mempool("quictun_dpdk", ffi::DEFAULT_NUM_MBUFS, ffi::MEMPOOL_CACHE_SIZE)?;
+    let mempool = mbuf::create_mempool(
+        "quictun_dpdk",
+        ffi::DEFAULT_NUM_MBUFS,
+        ffi::MEMPOOL_CACHE_SIZE,
+    )?;
 
     let (local_mac, hw_udp_cksum, hw_ip_cksum) = if n_cores > 1 {
         port::configure_port_multiqueue(dpdk_config.port_id, n_cores as u16, mempool)?
@@ -194,7 +193,8 @@ pub fn run(
         client_config,
     } = setup
     {
-        multi_state.connect(client_config, remote_addr)
+        multi_state
+            .connect(client_config, remote_addr)
             .context("failed to initiate QUIC connection")?;
     }
 
@@ -228,7 +228,10 @@ pub fn run(
         if let Some(mac) = identity.remote_mac {
             tracing::info!(mac = %format_mac(&mac), "ARP resolved peer MAC");
         } else {
-            bail!("ARP resolution failed: no reply from {}", dpdk_config.remote_ip);
+            bail!(
+                "ARP resolution failed: no reply from {}",
+                dpdk_config.remote_ip
+            );
         }
     }
 
@@ -258,7 +261,8 @@ pub fn run(
 
         for i in 0..n_cores {
             let inner_port_id = (total_ports - n_cores as u16) + i as u16;
-            let (inner_mac, _inner_hw_udp, _inner_hw_ip) = port::configure_port(inner_port_id, mempool)?;
+            let (inner_mac, _inner_hw_udp, _inner_hw_ip) =
+                port::configure_port(inner_port_id, mempool)?;
 
             let iface = if n_cores == 1 {
                 dpdk_config.tunnel_iface.clone()
@@ -282,7 +286,12 @@ pub fn run(
                 dpdk_config.tunnel_ip
             } else {
                 let octets = dpdk_config.tunnel_ip.octets();
-                Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3].wrapping_add(i as u8))
+                Ipv4Addr::new(
+                    octets[0],
+                    octets[1],
+                    octets[2],
+                    octets[3].wrapping_add(i as u8),
+                )
             };
 
             configure_tap_interface(
@@ -331,12 +340,11 @@ pub fn run(
         // SAFETY: EAL is initialized and vdev was just created.
         let total_ports = unsafe { ffi::rte_eth_dev_count_avail() };
         if total_ports < 2 {
-            bail!(
-                "AF_XDP vdev created but only {total_ports} port(s) available (expected ≥ 2)"
-            );
+            bail!("AF_XDP vdev created but only {total_ports} port(s) available (expected ≥ 2)");
         }
         let inner_port_id = total_ports as u16 - 1;
-        let (inner_mac, _inner_hw_udp, _inner_hw_ip) = port::configure_port(inner_port_id, mempool)?;
+        let (inner_mac, _inner_hw_udp, _inner_hw_ip) =
+            port::configure_port(inner_port_id, mempool)?;
 
         tracing::info!(
             inner_port = inner_port_id,
@@ -365,10 +373,7 @@ pub fn run(
     unsafe {
         libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
     }
-    SHUTDOWN_FLAG.store(
-        Arc::into_raw(sig_shutdown) as usize,
-        Ordering::Release,
-    );
+    SHUTDOWN_FLAG.store(Arc::into_raw(sig_shutdown) as usize, Ordering::Release);
 
     // ── 7b. Pin vhost kernel threads to non-DPDK cores ────────────
     //
@@ -384,7 +389,10 @@ pub fn run(
     let result = if n_cores == 1 {
         // Single-core: run directly on this thread.
         // Handles 1..N connections via connection table (no multi-client flag needed).
-        let inner = inner_ports.into_iter().next().expect("exactly 1 inner port");
+        let inner = inner_ports
+            .into_iter()
+            .next()
+            .expect("exactly 1 inner port");
 
         engine::run(
             dpdk_config.port_id,
@@ -406,9 +414,8 @@ pub fn run(
         // Configure outer port: 1 RX queue, n_cores TX queues.
         // Close and reconfigure for dispatcher mode.
         port::close_port(dpdk_config.port_id);
-        let (new_mac, hw_udp, hw_ip) = port::configure_port_dispatcher(
-            dpdk_config.port_id, n_cores as u16, mempool,
-        )?;
+        let (new_mac, hw_udp, hw_ip) =
+            port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
         identity.local_mac = new_mac;
 
         let checksum_mode = if dpdk_config.no_udp_checksum {
@@ -436,7 +443,10 @@ pub fn run(
         let mut dispatch_table = DpdkDispatchTable::new(n_workers);
 
         // Single inner port on core 0.
-        let inner = inner_ports.into_iter().next().expect("at least 1 inner port");
+        let inner = inner_ports
+            .into_iter()
+            .next()
+            .expect("at least 1 inner port");
 
         let adaptive_poll = dpdk_config.adaptive_poll;
         let outer_port_id = dpdk_config.port_id;
@@ -547,20 +557,19 @@ fn configure_tap_interface(
     let mtu_str = mtu.to_string();
     let addr = format!("{ip}/{prefix}");
 
-    run_cmd("ip", &["link", "set", iface, "mtu", &mtu_str])
-        .context("failed to set TAP MTU")?;
-    run_cmd("ip", &["addr", "add", &addr, "dev", iface])
-        .context("failed to assign IP to TAP")?;
-    run_cmd("ip", &["link", "set", iface, "up"])
-        .context("failed to bring TAP up")?;
+    run_cmd("ip", &["link", "set", iface, "mtu", &mtu_str]).context("failed to set TAP MTU")?;
+    run_cmd("ip", &["addr", "add", &addr, "dev", iface]).context("failed to assign IP to TAP")?;
+    run_cmd("ip", &["link", "set", iface, "up"]).context("failed to bring TAP up")?;
 
     if disable_offload {
         // Disable kernel checksum/segmentation offload on the TAP device.
         // DPDK handles checksums, so kernel computation is redundant overhead.
         if let Err(e) = run_cmd(
             "ethtool",
-            &["-K", iface, "tx", "off", "rx", "off", "sg", "off",
-              "tso", "off", "gso", "off", "gro", "off"],
+            &[
+                "-K", iface, "tx", "off", "rx", "off", "sg", "off", "tso", "off", "gso", "off",
+                "gro", "off",
+            ],
         ) {
             tracing::warn!(%e, iface, "failed to disable TAP offload (non-fatal)");
         } else {
@@ -586,11 +595,7 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "{program} {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        );
+        anyhow::bail!("{program} {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(())
 }
@@ -654,8 +659,7 @@ use crate::net::ParsedPacket;
 // ── Signal handling ─────────────────────────────────────────────────
 
 /// Atomic pointer to the shutdown flag (set by SIGINT handler).
-static SHUTDOWN_FLAG: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SHUTDOWN_FLAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn sigint_handler(_sig: libc::c_int) {
     let ptr = SHUTDOWN_FLAG.load(Ordering::Acquire);
@@ -698,7 +702,8 @@ fn pin_vhost_threads(n_dpdk_cores: usize) {
     let n_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
     if n_cpus <= n_dpdk_cores {
         tracing::warn!(
-            n_cpus, n_dpdk_cores,
+            n_cpus,
+            n_dpdk_cores,
             "not enough CPUs to pin vhost threads separately"
         );
         return;
@@ -725,11 +730,7 @@ fn pin_vhost_threads(n_dpdk_cores: usize) {
 
         if comm.starts_with("vhost-") {
             let ret = unsafe {
-                libc::sched_setaffinity(
-                    tid,
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &cpuset,
-                )
+                libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
             };
             if ret == 0 {
                 tracing::info!(tid, comm, cores = ?(n_dpdk_cores..n_cpus), "pinned vhost thread");

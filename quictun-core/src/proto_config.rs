@@ -16,12 +16,13 @@ pub fn build_proto_client_config(
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
 ) -> Result<quinn_proto::ClientConfig> {
-    let tls =
-        connection::build_rustls_client_tls_config(private_key, server_pubkey, false, false)?;
+    let tls = connection::build_rustls_client_tls_config(private_key, server_pubkey, false, false)?;
     let quic_crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(tls)
         .context("failed to create QUIC client crypto config")?;
     let mut config = quinn_proto::ClientConfig::new(Arc::new(quic_crypto));
-    config.transport_config(Arc::new(connection::make_transport_config(keepalive, tuning)));
+    config.transport_config(Arc::new(connection::make_transport_config(
+        keepalive, tuning,
+    )));
     Ok(config)
 }
 

@@ -10,8 +10,8 @@ use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
 
 use crate::bufpool::{
-    self, BUF_GROUP_UDP, BUF_SIZE, BufferPool, OP_PROVIDE_BUF, OP_SHUTDOWN, OP_TIMER,
-    OP_TUN_WRITE, OP_UDP_RECV, OP_UDP_SEND, OP_WAKE, ProvidedPool,
+    self, BUF_GROUP_UDP, BUF_SIZE, BufferPool, OP_PROVIDE_BUF, OP_SHUTDOWN, OP_TIMER, OP_TUN_WRITE,
+    OP_UDP_RECV, OP_UDP_SEND, OP_WAKE, ProvidedPool,
 };
 use crate::event_loop::{set_blocking, set_nonblocking};
 use crate::shared::{self, QuicState};
@@ -62,17 +62,15 @@ pub fn run(
         qs
     } else {
         // Listener: blocking wait for first packet (runs in parallel across cores).
-        let server_config =
-            server_config.expect("listener engine requires server_config");
+        let server_config = server_config.expect("listener engine requires server_config");
         set_blocking(udp_fd).context("engine: failed to set blocking for first-packet recv")?;
 
         let mut buf = vec![0u8; BUF_SIZE];
-        let (n, peer) = udp::recvfrom_first_raw(udp_fd, &mut buf)
-            .context("engine: recvfrom_first failed")?;
+        let (n, peer) =
+            udp::recvfrom_first_raw(udp_fd, &mut buf).context("engine: recvfrom_first failed")?;
         info!(peer = %peer, bytes = n, "engine: received first packet");
 
-        udp::connect_to_peer_raw(udp_fd, peer)
-            .context("engine: connect_to_peer failed")?;
+        udp::connect_to_peer_raw(udp_fd, peer).context("engine: connect_to_peer failed")?;
         set_nonblocking(udp_fd)
             .context("engine: failed to set non-blocking after first-packet recv")?;
 
@@ -95,7 +93,8 @@ pub fn run(
         if let Some(cpu) = sqpoll_cpu {
             builder.setup_sqpoll_cpu(cpu);
         }
-        builder.build(RING_SIZE)
+        builder
+            .build(RING_SIZE)
             .context("engine: failed to create io_uring with SQPOLL")?
     } else {
         IoUring::new(RING_SIZE).context("engine: failed to create io_uring")?
@@ -125,7 +124,10 @@ pub fn run(
     // Register send/TUN buffer pool (SendZc when --zero-copy, WriteFixed otherwise).
     pool.register(&ring)?;
 
-    info!(sqpoll, "engine: io_uring initialized (registered fds + buffers)");
+    info!(
+        sqpoll,
+        "engine: io_uring initialized (registered fds + buffers)"
+    );
 
     // Provide all recv buffers to kernel (single SQE).
     provide_all_buffers(&mut ring, &recv_pool)?;
@@ -156,7 +158,13 @@ pub fn run(
         for dg in &drive_result.datagrams {
             submit_tun_write(&mut ring, &mut pool, dg)?;
         }
-        drain_transmits(&mut quic, &mut ring, &mut pool, &mut transmit_buf, zero_copy)?;
+        drain_transmits(
+            &mut quic,
+            &mut ring,
+            &mut pool,
+            &mut transmit_buf,
+            zero_copy,
+        )?;
         update_timer(&mut quic, &timer);
     }
 
@@ -225,14 +233,10 @@ pub fn run(
                     // Feed packet into quinn state machine (no drive yet).
                     let now = Instant::now();
                     let remote_addr = quic.remote_addr;
-                    if let Some(event) = quic.endpoint.handle(
-                        now,
-                        remote_addr,
-                        None,
-                        None,
-                        data,
-                        &mut response_buf,
-                    ) {
+                    if let Some(event) =
+                        quic.endpoint
+                            .handle(now, remote_addr, None, None, data, &mut response_buf)
+                    {
                         let mut tx =
                             shared::handle_datagram_event(&mut quic, event, &mut response_buf);
                         resp_transmits.append(&mut tx);

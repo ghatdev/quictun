@@ -186,15 +186,13 @@ fn sockaddr_from(addr: SocketAddr) -> libc::sockaddr_storage {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(v4) => {
-            let sa: &mut libc::sockaddr_in =
-                unsafe { &mut *(&mut storage as *mut _ as *mut _) };
+            let sa: &mut libc::sockaddr_in = unsafe { &mut *(&mut storage as *mut _ as *mut _) };
             sa.sin_family = libc::AF_INET as libc::sa_family_t;
             sa.sin_port = v4.port().to_be();
             sa.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
         }
         SocketAddr::V6(v6) => {
-            let sa: &mut libc::sockaddr_in6 =
-                unsafe { &mut *(&mut storage as *mut _ as *mut _) };
+            let sa: &mut libc::sockaddr_in6 = unsafe { &mut *(&mut storage as *mut _ as *mut _) };
             sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sa.sin6_port = v6.port().to_be();
             sa.sin6_addr.s6_addr = v6.ip().octets();

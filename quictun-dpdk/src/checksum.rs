@@ -5,7 +5,6 @@
 //! 2. aarch64 NEON (always available) → 16 bytes/iteration
 //! 3. Scalar fast path (all arches)   → 8 bytes/iteration
 
-
 use std::net::Ipv4Addr;
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -60,11 +59,7 @@ pub fn udp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_segment: &[u8]) -> u
 /// The NIC will add the UDP segment checksum on top of this seed value.
 /// Returns the one's complement of the pseudo-header sum (ready to write
 /// into the UDP checksum field for the NIC to finish).
-pub fn udp_pseudo_header_checksum(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    udp_len: u16,
-) -> u16 {
+pub fn udp_pseudo_header_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_len: u16) -> u16 {
     let src = src_ip.octets();
     let dst = dst_ip.octets();
     let mut sum: u64 = 0;
@@ -199,7 +194,7 @@ unsafe fn checksum_avx2_partial(data: &[u8]) -> u64 {
         let zero128 = _mm_setzero_si128();
         let lo_lo = _mm_unpacklo_epi16(lo_swapped, zero128); // words 0-3 zero-extended to u32
         let lo_hi = _mm_unpackhi_epi16(lo_swapped, zero128); // words 4-7 zero-extended to u32
-        let lo_sum = _mm_add_epi32(lo_lo, lo_hi);            // 4 × u32 partial sums
+        let lo_sum = _mm_add_epi32(lo_lo, lo_hi); // 4 × u32 partial sums
         let lo_u64 = _mm256_cvtepu32_epi64(lo_sum);
 
         let hi_lo = _mm_unpacklo_epi16(hi_swapped, zero128);
@@ -355,7 +350,9 @@ mod tests {
     #[test]
     fn test_scalar_vs_naive() {
         // Test various sizes including edge cases.
-        for size in [0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 33, 63, 64, 100, 1400, 1500] {
+        for size in [
+            0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 33, 63, 64, 100, 1400, 1500,
+        ] {
             let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
             let naive = checksum_naive(&data);
             let scalar = checksum_scalar_fast(&data);
@@ -417,10 +414,7 @@ mod tests {
             let data: Vec<u8> = (0..size).map(|i| (i + 0x42) as u8).collect();
             let naive = checksum_naive(&data);
             let fast = internet_checksum(&data);
-            assert_eq!(
-                naive, fast,
-                "odd-length mismatch at size {size}"
-            );
+            assert_eq!(naive, fast, "odd-length mismatch at size {size}");
         }
     }
 
@@ -442,7 +436,10 @@ mod tests {
 
         let naive = udp_checksum_naive(src_ip, dst_ip, &segment);
         let fast = udp_checksum(src_ip, dst_ip, &segment);
-        assert_eq!(naive, fast, "UDP checksum mismatch: naive=0x{naive:04x}, fast=0x{fast:04x}");
+        assert_eq!(
+            naive, fast,
+            "UDP checksum mismatch: naive=0x{naive:04x}, fast=0x{fast:04x}"
+        );
         assert_ne!(fast, 0, "UDP checksum should be non-zero");
     }
 

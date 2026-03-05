@@ -148,8 +148,8 @@ pub fn run(
             let udp_raw = udp_fd.as_raw_fd();
             udp_fds.push(udp_fd);
 
-            let timer = Timer::new()
-                .with_context(|| format!("core {i}: failed to create timerfd"))?;
+            let timer =
+                Timer::new().with_context(|| format!("core {i}: failed to create timerfd"))?;
             let shutdown_fd = create_eventfd()
                 .with_context(|| format!("core {i}: failed to create shutdown eventfd"))?;
             let shutdown_raw = shutdown_fd.as_raw_fd();
@@ -186,8 +186,19 @@ pub fn run(
             let engine_h = s.spawn(move || {
                 pin_to_core(core_id);
                 crate::engine::run(
-                    tun_fd, udp_raw, quic_state, sc, timer, rx, notify_raw, shutdown_raw, sqp,
-                    sqp_cpu, ps, zc, ring_fd_tx,
+                    tun_fd,
+                    udp_raw,
+                    quic_state,
+                    sc,
+                    timer,
+                    rx,
+                    notify_raw,
+                    shutdown_raw,
+                    sqp,
+                    sqp_cpu,
+                    ps,
+                    zc,
+                    ring_fd_tx,
                 )
             });
 
@@ -197,8 +208,7 @@ pub fn run(
 
         // Signal watcher thread: blocks on the signal pipe, then signals all
         // shutdown eventfds so engines and readers exit gracefully.
-        let shutdown_fd_raws: Vec<RawFd> =
-            shutdown_fds.iter().map(|f| f.as_raw_fd()).collect();
+        let shutdown_fd_raws: Vec<RawFd> = shutdown_fds.iter().map(|f| f.as_raw_fd()).collect();
         let sig_r = sig_read.as_raw_fd();
         let signal_h = s.spawn(move || {
             let mut buf = [0u8; 1];
@@ -217,14 +227,12 @@ pub fn run(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if first_error.is_none() {
-                        first_error =
-                            Some(e.context(format!("engine thread {i} error")));
+                        first_error = Some(e.context(format!("engine thread {i} error")));
                     }
                 }
                 Err(_) => {
                     if first_error.is_none() {
-                        first_error =
-                            Some(anyhow::anyhow!("engine thread {i} panicked"));
+                        first_error = Some(anyhow::anyhow!("engine thread {i} panicked"));
                     }
                 }
             }
@@ -249,14 +257,12 @@ pub fn run(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if first_error.is_none() {
-                        first_error =
-                            Some(e.context(format!("reader thread {i} error")));
+                        first_error = Some(e.context(format!("reader thread {i} error")));
                     }
                 }
                 Err(_) => {
                     if first_error.is_none() {
-                        first_error =
-                            Some(anyhow::anyhow!("reader thread {i} panicked"));
+                        first_error = Some(anyhow::anyhow!("reader thread {i} panicked"));
                     }
                 }
             }
@@ -326,11 +332,7 @@ fn create_eventfd() -> Result<OwnedFd> {
 fn write_eventfd(fd: &OwnedFd) {
     let val: u64 = 1;
     unsafe {
-        libc::write(
-            fd.as_raw_fd(),
-            &val as *const u64 as *const libc::c_void,
-            8,
-        );
+        libc::write(fd.as_raw_fd(), &val as *const u64 as *const libc::c_void, 8);
     }
 }
 

@@ -81,10 +81,10 @@ fn dpdk_build() {
     // to library links. Explicitly link each PMD with +whole-archive to ensure
     // constructors survive static linking. (Demikernel does the same on Windows.)
     let pmd_libs = [
-        ("rte_bus_pci", true),     // PCI bus (dep of net_virtio PCI driver)
-        ("rte_bus_vdev", true),    // vdev bus (rte_vdev_init/uninit)
-        ("rte_net_virtio", true),  // virtio-user PMD (--dpdk virtio)
-        ("rte_net_tap", true),     // TAP PMD (--dpdk tap)
+        ("rte_bus_pci", true),      // PCI bus (dep of net_virtio PCI driver)
+        ("rte_bus_vdev", true),     // vdev bus (rte_vdev_init/uninit)
+        ("rte_net_virtio", true),   // virtio-user PMD (--dpdk virtio)
+        ("rte_net_tap", true),      // TAP PMD (--dpdk tap)
         ("rte_mempool_ring", true), // ring mempool (always needed)
     ];
     for (lib, required) in pmd_libs {

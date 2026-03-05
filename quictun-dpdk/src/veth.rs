@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// A veth pair for AF_XDP inner interface.
 ///
@@ -60,7 +60,9 @@ impl VethPair {
         // remote kernel sees invalid checksums and silently drops TCP/UDP packets.
         for iface in [&app_iface, &xdp_iface] {
             let _ = Command::new("ethtool")
-                .args(["-K", iface, "tx", "off", "rx", "off", "gso", "off", "gro", "off"])
+                .args([
+                    "-K", iface, "tx", "off", "rx", "off", "gso", "off", "gro", "off",
+                ])
                 .output();
         }
 
@@ -71,8 +73,8 @@ impl VethPair {
             .context("failed to bring xdp_iface up")?;
 
         // Read MAC address of the app-facing interface.
-        let app_mac = read_mac(&app_iface)
-            .with_context(|| format!("failed to read MAC of {app_iface}"))?;
+        let app_mac =
+            read_mac(&app_iface).with_context(|| format!("failed to read MAC of {app_iface}"))?;
 
         tracing::info!(
             app_iface = %app_iface,
@@ -111,11 +113,7 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "{program} {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        );
+        bail!("{program} {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(())
 }
@@ -123,8 +121,7 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 /// Read MAC address from sysfs.
 fn read_mac(iface: &str) -> Result<[u8; 6]> {
     let path = format!("/sys/class/net/{iface}/address");
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {path}"))?;
+    let content = std::fs::read_to_string(&path).with_context(|| format!("cannot read {path}"))?;
     parse_mac(content.trim())
 }
 
@@ -135,8 +132,8 @@ fn parse_mac(s: &str) -> Result<[u8; 6]> {
     }
     let mut mac = [0u8; 6];
     for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16)
-            .with_context(|| format!("invalid MAC octet: {part}"))?;
+        mac[i] =
+            u8::from_str_radix(part, 16).with_context(|| format!("invalid MAC octet: {part}"))?;
     }
     Ok(mac)
 }
