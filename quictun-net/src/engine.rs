@@ -713,9 +713,23 @@ fn handle_tun_rx_linux(
                             gso_pos += result.len;
                             gso_count += 1;
                         } else {
-                            // Odd-sized: send individually.
-                            let odd_end = gso_pos + result.len;
-                            udp.send_to(&gso_buf[gso_pos..odd_end], entry.remote_addr)?;
+                            // Odd-sized: flush accumulated batch first, then
+                            // start a new batch with this packet as the first
+                            // segment (it may match future packets).
+                            if gso_count > 0 {
+                                flush_gso_sync(
+                                    udp,
+                                    gso_buf,
+                                    gso_pos,
+                                    gso_segment_size,
+                                    entry.remote_addr,
+                                )?;
+                            }
+                            // Move odd packet to start of buffer and start new batch.
+                            gso_buf.copy_within(gso_pos..gso_pos + result.len, 0);
+                            gso_segment_size = result.len;
+                            gso_pos = result.len;
+                            gso_count = 1;
                         }
                     }
                     Err(e) => {
