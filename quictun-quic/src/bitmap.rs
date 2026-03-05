@@ -15,6 +15,12 @@ pub struct Bitmap {
     base_pn: u64,
 }
 
+impl Default for Bitmap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Bitmap {
     pub fn new() -> Self {
         Self {

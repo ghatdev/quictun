@@ -655,6 +655,7 @@ fn run_iouring(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_async(
     config_path: &str,
     serial: bool,
@@ -829,7 +830,7 @@ async fn run_async(
                 }
                 _ => connection::build_server_config_ext(
                     &private_key,
-                    &[peer_pubkey.clone()],
+                    std::slice::from_ref(&peer_pubkey),
                     keepalive,
                     &tuning,
                     fips_mode,

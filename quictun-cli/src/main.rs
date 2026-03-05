@@ -17,6 +17,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Generate a new private key and print it to stdout (base64)
     Genkey,

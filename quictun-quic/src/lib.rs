@@ -174,6 +174,7 @@ pub fn decrypt_payload_in_place(
 ///
 /// Writes the short header, frames (ACK + DATAGRAM), AEAD tag, and header
 /// protection into `buf`. Returns bytes written and the PN used.
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_packet(
     payload: &[u8],
     ack_ranges: Option<&[Range<u64>]>,
@@ -197,11 +198,11 @@ pub fn encrypt_packet(
 
     let mut frame_pos = header_len;
 
-    if let Some(ranges) = ack_ranges {
-        if !ranges.is_empty() {
-            let ack_len = frame::build_ack(ranges, 0, &mut buf[frame_pos..]);
-            frame_pos += ack_len;
-        }
+    if let Some(ranges) = ack_ranges
+        && !ranges.is_empty()
+    {
+        let ack_len = frame::build_ack(ranges, 0, &mut buf[frame_pos..]);
+        frame_pos += ack_len;
     }
 
     if !payload.is_empty() {
