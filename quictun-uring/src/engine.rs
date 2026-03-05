@@ -1,26 +1,28 @@
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use crossbeam_channel::{Receiver, Sender};
 use io_uring::{IoUring, cqueue, opcode, squeue::Flags, types};
 use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
+
+use quictun_core::peer::{self, PeerConfig};
+use quictun_core::quic_state::{BUF_SIZE as HANDSHAKE_BUF_SIZE, MultiQuicState};
+use quictun_quic::local::LocalConnectionState;
 
 use crate::bufpool::{
     self, BUF_GROUP_UDP, BUF_SIZE, BufferPool, OP_PROVIDE_BUF, OP_SHUTDOWN, OP_TIMER, OP_TUN_WRITE,
     OP_UDP_RECV, OP_UDP_SEND, OP_WAKE, ProvidedPool,
 };
 use crate::event_loop::{set_blocking, set_nonblocking};
-use crate::shared::{self, QuicState};
 use crate::timer::Timer;
 use crate::udp;
 
 /// io_uring ring size for the engine thread.
-/// 1024 handles burst SQE pushes where a single CQE batch can generate
-/// reprovide + TUN write + drain_transmits SQEs exceeding smaller ring sizes.
 const RING_SIZE: u32 = 1024;
 
 // Registered fd indices for the engine thread.
@@ -30,23 +32,44 @@ const FD_TIMER: u32 = 2;
 const FD_NOTIFY: u32 = 3;
 const FD_SHUTDOWN: u32 = 4;
 
-/// Run the engine thread: owns all QUIC state exclusively (no Mutex).
+/// Maximum QUIC packet size.
+const MAX_PACKET: usize = 2048;
+
+/// How the engine should set up the QUIC connection.
+pub enum EngineSetup {
+    Connector {
+        remote_addr: SocketAddr,
+        client_config: quinn_proto::ClientConfig,
+    },
+    Listener {
+        server_config: Arc<ServerConfig>,
+    },
+}
+
+/// Per-connection state in the connection table.
+#[allow(dead_code)]
+struct ConnEntry {
+    conn: LocalConnectionState,
+    tunnel_ip: Ipv4Addr,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
+    remote_addr: SocketAddr,
+    keepalive_interval: Duration,
+    last_tx: Instant,
+    last_rx: Instant,
+}
+
+/// Run the engine thread: two-phase architecture.
 ///
-/// Handles three event sources via io_uring:
-/// - UDP recv: incoming QUIC packets → endpoint.handle()
-/// - Timer: connection timeouts → handle_timeout()
-/// - Channel (via eventfd): TUN packets from reader → send_datagram()
-///
-/// Events are batched: all CQEs are handled first (feeding quinn state machine),
-/// then a single process_events() + drain_transmits() produces I/O for the batch.
-/// This coalesces ACKs (N packets → 1 ACK instead of N ACKs).
-///
-/// Uses registered fds and registered buffers for reduced kernel overhead.
+/// Phase 1 (Handshake): Uses MultiQuicState + quinn-proto for QUIC handshake.
+/// Phase 2 (Data plane): Uses LocalConnectionState from quictun-quic for
+///   optimized 1-RTT encrypt/decrypt with zero quinn-proto overhead.
 pub fn run(
     tun_fd: RawFd,
     udp_fd: RawFd,
-    quic: Option<QuicState>,
-    server_config: Option<Arc<ServerConfig>>,
+    setup: EngineSetup,
+    peers: Vec<PeerConfig>,
+    cid_len: usize,
+    idle_timeout: Duration,
     timer: Timer,
     rx: Receiver<Vec<u8>>,
     notify_fd: RawFd,
@@ -57,36 +80,228 @@ pub fn run(
     zero_copy: bool,
     ring_fd_tx: Option<Sender<RawFd>>,
 ) -> Result<()> {
-    // Resolve QuicState: connector has it ready, listener must wait for first packet.
-    let mut quic = if let Some(qs) = quic {
-        qs
-    } else {
-        // Listener: blocking wait for first packet (runs in parallel across cores).
-        let server_config = server_config.expect("listener engine requires server_config");
-        set_blocking(udp_fd).context("engine: failed to set blocking for first-packet recv")?;
+    // ── Phase 1: Handshake ─────────────────────────────────────────────
+    let (conn_entry, remote_addr) = run_handshake(
+        udp_fd, &setup, &peers, idle_timeout,
+    )?;
 
-        let mut buf = vec![0u8; BUF_SIZE];
-        let (n, peer) =
-            udp::recvfrom_first_raw(udp_fd, &mut buf).context("engine: recvfrom_first failed")?;
-        info!(peer = %peer, bytes = n, "engine: received first packet");
+    info!(
+        tunnel_ip = %conn_entry.tunnel_ip,
+        remote = %remote_addr,
+        "handshake complete, entering fast data plane"
+    );
 
-        udp::connect_to_peer_raw(udp_fd, peer).context("engine: connect_to_peer failed")?;
-        set_nonblocking(udp_fd)
-            .context("engine: failed to set non-blocking after first-packet recv")?;
+    // ── Phase 2: Data plane ────────────────────────────────────────────
+    run_data_plane(
+        tun_fd, udp_fd, conn_entry, remote_addr, cid_len, idle_timeout,
+        timer, rx, notify_fd, shutdown_fd, sqpoll, sqpoll_cpu, pool_size,
+        zero_copy, ring_fd_tx,
+    )
+}
 
-        // Feed the first packet to the QUIC endpoint.
-        let mut qs = QuicState::new(peer, Some(server_config));
-        let data = BytesMut::from(&buf[..n]);
-        let mut response_buf: Vec<u8> = Vec::new();
-        if let Some(event) =
-            qs.endpoint
-                .handle(Instant::now(), peer, None, None, data, &mut response_buf)
-        {
-            shared::handle_datagram_event(&mut qs, event, &mut response_buf);
+/// Phase 1: Run handshake using MultiQuicState + blocking I/O.
+///
+/// Returns (ConnEntry, remote_addr) on success.
+fn run_handshake(
+    udp_fd: RawFd,
+    setup: &EngineSetup,
+    peers: &[PeerConfig],
+    _idle_timeout: Duration,
+) -> Result<(ConnEntry, SocketAddr)> {
+    let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
+    let mut recv_buf = vec![0u8; MAX_PACKET];
+    let mut transmit_buf = Vec::with_capacity(HANDSHAKE_BUF_SIZE);
+
+    let (mut multi_state, remote_addr) = match setup {
+        EngineSetup::Connector { remote_addr, client_config } => {
+            let mut ms = MultiQuicState::new_connector();
+            ms.connect(client_config.clone(), *remote_addr)?;
+
+            // Drain initial ClientHello transmits.
+            drain_handshake_transmits(udp_fd, &mut ms, &mut transmit_buf, *remote_addr)?;
+
+            (ms, *remote_addr)
         }
-        qs
+        EngineSetup::Listener { server_config } => {
+            // Blocking wait for first packet.
+            set_blocking(udp_fd)
+                .context("engine: failed to set blocking for first-packet recv")?;
+
+            let (n, peer_addr) = udp::recvfrom_first_raw(udp_fd, &mut recv_buf)
+                .context("engine: recvfrom_first failed")?;
+            info!(peer = %peer_addr, bytes = n, "engine: received first packet");
+
+            udp::connect_to_peer_raw(udp_fd, peer_addr)
+                .context("engine: connect_to_peer failed")?;
+            set_nonblocking(udp_fd)
+                .context("engine: failed to set non-blocking after first-packet recv")?;
+
+            let mut ms = MultiQuicState::new(server_config.clone());
+
+            // Feed the first packet.
+            let data = BytesMut::from(&recv_buf[..n]);
+            let responses = ms.handle_incoming(
+                Instant::now(), peer_addr, None, data, &mut response_buf,
+            );
+            send_responses_raw(udp_fd, &responses, peer_addr);
+
+            // Drain initial ServerHello transmits.
+            drain_handshake_transmits(udp_fd, &mut ms, &mut transmit_buf, peer_addr)?;
+
+            (ms, peer_addr)
+        }
     };
 
+    // Blocking handshake loop — poll for packets, drive state machine.
+    // Use non-blocking recv with a sleep loop (simpler than setting up io_uring for handshake).
+    let handshake_start = Instant::now();
+    let handshake_timeout = Duration::from_secs(10);
+
+    loop {
+        if handshake_start.elapsed() > handshake_timeout {
+            anyhow::bail!("handshake timed out after {handshake_timeout:?}");
+        }
+
+        // Try to receive a packet (non-blocking).
+        let ret = unsafe {
+            libc::recv(
+                udp_fd,
+                recv_buf.as_mut_ptr() as *mut libc::c_void,
+                recv_buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+
+        if ret > 0 {
+            let n = ret as usize;
+            let data = BytesMut::from(&recv_buf[..n]);
+            let responses = multi_state.handle_incoming(
+                Instant::now(), remote_addr, None, data, &mut response_buf,
+            );
+            send_responses_raw(udp_fd, &responses, remote_addr);
+        }
+
+        // Handle timeouts for handshakes.
+        let now = Instant::now();
+        for hs in multi_state.handshakes.values_mut() {
+            hs.connection.handle_timeout(now);
+        }
+
+        // Drain transmits.
+        drain_handshake_transmits(udp_fd, &mut multi_state, &mut transmit_buf, remote_addr)?;
+
+        // Check for completed handshakes.
+        let result = multi_state.poll_handshakes();
+
+        // Drain transmits again after polling.
+        drain_handshake_transmits(udp_fd, &mut multi_state, &mut transmit_buf, remote_addr)?;
+
+        for ch in result.completed {
+            let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+                continue;
+            };
+
+            // Identify peer.
+            let matched_peer = if peers.len() == 1 {
+                &peers[0]
+            } else {
+                match peer::identify_peer(&hs.connection, peers) {
+                    Some(p) => p,
+                    None => {
+                        warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                        continue;
+                    }
+                }
+            };
+
+            let tunnel_ip = matched_peer.tunnel_ip;
+            let allowed_ips = matched_peer.allowed_ips.clone();
+            let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
+            let now_inst = Instant::now();
+
+            info!(
+                remote = %hs.remote_addr,
+                tunnel_ip = %tunnel_ip,
+                cid = %hex::encode(&hs.local_cid[..]),
+                "connection established"
+            );
+
+            return Ok((
+                ConnEntry {
+                    conn: conn_state,
+                    tunnel_ip,
+                    allowed_ips,
+                    remote_addr: hs.remote_addr,
+                    keepalive_interval,
+                    last_tx: now_inst,
+                    last_rx: now_inst,
+                },
+                hs.remote_addr,
+            ));
+        }
+
+        if !result.failed.is_empty() {
+            anyhow::bail!("handshake failed");
+        }
+
+        // Small sleep to avoid busy-spinning during handshake.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Drain quinn-proto handshake transmits via raw fd.
+fn drain_handshake_transmits(
+    udp_fd: RawFd,
+    state: &mut MultiQuicState,
+    buf: &mut Vec<u8>,
+    _remote: SocketAddr,
+) -> Result<()> {
+    let now = Instant::now();
+    for hs in state.handshakes.values_mut() {
+        loop {
+            buf.clear();
+            let Some(transmit) = hs.connection.poll_transmit(now, 1, buf) else {
+                break;
+            };
+            send_raw(udp_fd, &buf[..transmit.size]);
+        }
+    }
+    Ok(())
+}
+
+/// Send handshake response transmits via raw fd.
+fn send_responses_raw(udp_fd: RawFd, responses: &[(usize, [u8; HANDSHAKE_BUF_SIZE])], _remote: SocketAddr) {
+    for (len, data) in responses {
+        send_raw(udp_fd, &data[..*len]);
+    }
+}
+
+/// Send data via raw fd (connected UDP socket).
+fn send_raw(fd: RawFd, data: &[u8]) {
+    unsafe {
+        libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), 0);
+    }
+}
+
+/// Phase 2: Fast data plane using LocalConnectionState + io_uring.
+#[allow(clippy::too_many_arguments)]
+fn run_data_plane(
+    tun_fd: RawFd,
+    udp_fd: RawFd,
+    mut entry: ConnEntry,
+    _remote_addr: SocketAddr,
+    cid_len: usize,
+    idle_timeout: Duration,
+    timer: Timer,
+    rx: Receiver<Vec<u8>>,
+    notify_fd: RawFd,
+    shutdown_fd: RawFd,
+    sqpoll: bool,
+    sqpoll_cpu: Option<u32>,
+    pool_size: usize,
+    zero_copy: bool,
+    ring_fd_tx: Option<Sender<RawFd>>,
+) -> Result<()> {
     let mut ring = if sqpoll {
         let mut builder = IoUring::builder();
         builder.setup_sqpoll(1000);
@@ -113,7 +328,6 @@ pub fn run(
 
     let timer_fd = timer.raw_fd();
     let mut timer_buf = [0u8; 8];
-    let mut response_buf: Vec<u8> = Vec::new();
 
     // Register file descriptors for zero-overhead fd lookups.
     let fds = [udp_fd, tun_fd, timer_fd, notify_fd, shutdown_fd];
@@ -121,18 +335,18 @@ pub fn run(
         .register_files(&fds)
         .context("engine: failed to register files")?;
 
-    // Register send/TUN buffer pool (SendZc when --zero-copy, WriteFixed otherwise).
+    // Register send/TUN buffer pool.
     pool.register(&ring)?;
 
     info!(
         sqpoll,
-        "engine: io_uring initialized (registered fds + buffers)"
+        "engine: io_uring data plane initialized (registered fds + buffers)"
     );
 
-    // Provide all recv buffers to kernel (single SQE).
+    // Provide all recv buffers to kernel.
     provide_all_buffers(&mut ring, &recv_pool)?;
 
-    // Submit one multishot recv (replaces 32× ReadFixed).
+    // Submit multishot recv.
     submit_multishot_recv(&mut ring, &recv_pool)?;
     let mut multishot_active = true;
 
@@ -147,63 +361,28 @@ pub fn run(
     let mut shutdown_buf = [0u8; 8];
     submit_shutdown_read(&mut ring, &mut shutdown_buf)?;
 
-    // Pre-allocate reusable buffers (avoids per-iteration allocation).
-    let mut drive_result = shared::DriveResult::new();
-    let mut resp_transmits: Vec<(usize, [u8; BUF_SIZE])> = Vec::new();
-    let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    // Pre-allocate reusable buffers.
+    let mut scratch = BytesMut::with_capacity(MAX_PACKET);
+    let mut encrypt_buf = vec![0u8; MAX_PACKET];
 
-    // Drain initial handshake transmits (connector ClientHello / listener ServerHello).
-    if quic.connection.is_some() {
-        shared::process_events(&mut quic, &mut drive_result);
-        for dg in &drive_result.datagrams {
-            submit_tun_write(&mut ring, &mut pool, dg)?;
-        }
-        drain_transmits(
-            &mut quic,
-            &mut ring,
-            &mut pool,
-            &mut transmit_buf,
-            zero_copy,
-        )?;
-        update_timer(&mut quic, &timer);
-    }
+    // Arm keepalive timer.
+    let keepalive_deadline = Instant::now() + entry.keepalive_interval;
+    timer.arm(keepalive_deadline);
 
-    // Arm timer from initial connection state (connector may have a pending timeout).
-    if let Some(conn) = quic.connection.as_mut() {
-        if let Some(deadline) = conn.poll_timeout() {
-            timer.arm(deadline);
-        }
-    }
-
-    info!("engine: entering io_uring event loop");
+    info!("engine: entering io_uring fast data plane event loop");
     let mut stats_udp_recvs: u64 = 0;
     let mut stats_datagrams: u64 = 0;
-    let mut stats_transmits: u64 = 0;
+    let mut stats_encrypts: u64 = 0;
     let mut stats_timers: u64 = 0;
     let mut stats_channel_wakes: u64 = 0;
     let mut stats_channel_packets: u64 = 0;
-    let mut stats_sends_ok: u64 = 0;
-    let mut stats_sends_fail: u64 = 0;
-    let mut stats_tx_stalls: u64 = 0;
-    let mut stats_last = std::time::Instant::now();
+    let mut stats_last = Instant::now();
 
     loop {
-        // submit_and_wait submits all accumulated SQEs AND waits for ≥1 CQE.
-        // With SQPOLL: SQE submission is free (kernel polls shared memory),
-        // but we still need io_uring_enter(GETEVENTS) to block-wait for CQEs.
-        // Busy-polling the CQ would eliminate this syscall but requires a
-        // dedicated core — not possible when reader shares the same core.
         ring.submit_and_wait(1)
             .context("engine: submit_and_wait failed")?;
 
         let cqes: Vec<_> = ring.completion().collect();
-
-        // Phase 1: Handle all events (no drive/IO yet).
-        // Feed packets into quinn state machine, accumulate response transmits.
-        let mut had_udp = false;
-        let mut had_timer = false;
-        let mut had_wake = false;
-        resp_transmits.clear();
 
         for cqe in cqes {
             let user_data = cqe.user_data();
@@ -214,7 +393,6 @@ pub fn run(
             match op {
                 OP_UDP_RECV => {
                     if result < 0 {
-                        // Multishot cancelled (e.g., -ENOBUFS) or error.
                         let err = std::io::Error::from_raw_os_error(-result);
                         warn!(error = %err, "engine: multishot recv error");
                         multishot_active = false;
@@ -225,81 +403,164 @@ pub fn run(
                     let bid = cqueue::buffer_select(flags)
                         .expect("RecvMulti CQE must have BUFFER_SELECT flag");
                     let len = result as usize;
-                    let data = BytesMut::from(recv_pool.slice(bid, len));
 
-                    // Re-provide consumed buffer (SKIP_SUCCESS suppresses CQE).
+                    // Copy recv data to mutable buffer for in-place decrypt.
+                    let src = recv_pool.slice(bid, len);
+                    let mut pkt_buf = vec![0u8; len];
+                    pkt_buf.copy_from_slice(src);
+
+                    // Re-provide consumed buffer.
                     reprovide_buffer(&mut ring, &recv_pool, bid)?;
 
-                    // Feed packet into quinn state machine (no drive yet).
-                    let now = Instant::now();
-                    let remote_addr = quic.remote_addr;
-                    if let Some(event) =
-                        quic.endpoint
-                            .handle(now, remote_addr, None, None, data, &mut response_buf)
-                    {
-                        let mut tx =
-                            shared::handle_datagram_event(&mut quic, event, &mut response_buf);
-                        resp_transmits.append(&mut tx);
+                    if len == 0 {
+                        if !cqueue::more(flags) {
+                            multishot_active = false;
+                        }
+                        continue;
                     }
-                    response_buf.clear();
+
+                    if pkt_buf[0] & 0x80 != 0 {
+                        // Long header — handshake packet after data plane started.
+                        // Ignore (single-client, handshake complete).
+                        debug!("engine: ignoring long header packet in data plane");
+                    } else {
+                        // Short header — fast path decrypt.
+                        if cid_len > 0 && len > cid_len {
+                            match entry.conn.decrypt_packet_with_buf(&mut pkt_buf, &mut scratch) {
+                                Ok(decrypted) => {
+                                    entry.last_rx = Instant::now();
+                                    if let Some(ref ack) = decrypted.ack {
+                                        entry.conn.process_ack(ack);
+                                    }
+                                    if decrypted.close_received {
+                                        info!("engine: peer sent CONNECTION_CLOSE");
+                                        signal_shutdown(shutdown_fd);
+                                        return Ok(());
+                                    }
+                                    for datagram in &decrypted.datagrams {
+                                        stats_datagrams += 1;
+                                        if datagram.len() < 20 {
+                                            continue;
+                                        }
+                                        let src_ip = Ipv4Addr::new(
+                                            datagram[12], datagram[13],
+                                            datagram[14], datagram[15],
+                                        );
+                                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                            debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                            continue;
+                                        }
+                                        submit_tun_write(&mut ring, &mut pool, datagram)?;
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "decrypt failed, dropping");
+                                }
+                            }
+                        }
+                    }
 
                     if !cqueue::more(flags) {
                         multishot_active = false;
                     }
-                    had_udp = true;
                 }
 
                 OP_TIMER => {
                     stats_timers += 1;
-                    let now = Instant::now();
-                    if let Some(conn) = quic.connection.as_mut() {
-                        conn.handle_timeout(now);
-                    }
                     // Resubmit timer read.
                     submit_timer_read(&mut ring, &mut timer_buf)?;
-                    had_timer = true;
+
+                    // Check idle timeout.
+                    if entry.last_rx.elapsed() >= idle_timeout {
+                        info!("engine: connection idle timeout");
+                        if let Ok(result) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
+                            submit_udp_send(&mut ring, &mut pool, &encrypt_buf[..result.len], zero_copy)?;
+                        }
+                        signal_shutdown(shutdown_fd);
+                        // Submit final sends before returning.
+                        let _ = ring.submit();
+                        return Ok(());
+                    }
+
+                    // Send keepalive if needed.
+                    if entry.last_tx.elapsed() >= entry.keepalive_interval {
+                        let ack_ranges = entry.conn.generate_ack_ranges();
+                        let ack_ref = if !ack_ranges.is_empty() {
+                            Some(ack_ranges.as_slice())
+                        } else {
+                            None
+                        };
+                        match entry.conn.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
+                            Ok(result) => {
+                                submit_udp_send(&mut ring, &mut pool, &encrypt_buf[..result.len], zero_copy)?;
+                                entry.last_tx = Instant::now();
+                                debug!(pn = result.pn, "sent keepalive");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "keepalive encrypt failed");
+                            }
+                        }
+                    }
+
+                    // Check key exhaustion.
+                    if entry.conn.is_key_exhausted() {
+                        warn!("engine: keys exhausted, closing connection");
+                        if let Ok(result) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
+                            submit_udp_send(&mut ring, &mut pool, &encrypt_buf[..result.len], zero_copy)?;
+                        }
+                        signal_shutdown(shutdown_fd);
+                        let _ = ring.submit();
+                        return Ok(());
+                    }
+
+                    // Re-arm timer at keepalive interval.
+                    timer.arm(Instant::now() + entry.keepalive_interval);
                 }
 
                 OP_WAKE => {
                     stats_channel_wakes += 1;
 
-                    // Drain all packets from the channel — queue into quinn.
-                    let mut batch_count: u64 = 0;
+                    // Drain all TUN packets from the channel.
                     while let Ok(packet) = rx.try_recv() {
-                        batch_count += 1;
-                        if let Some(conn) = quic.connection.as_mut() {
-                            if conn.is_handshaking() {
-                                continue;
-                            }
-                            let max = conn.datagrams().max_size().unwrap_or(1200);
-                            if packet.len() > max {
-                                debug!(
-                                    packet_size = packet.len(),
-                                    max, "engine: dropping oversized TUN packet"
-                                );
-                            } else {
-                                let data = Bytes::from(packet);
-                                match conn.datagrams().send(data, true) {
-                                    Ok(()) => stats_sends_ok += 1,
-                                    Err(e) => {
-                                        debug!(error = ?e, "engine: datagrams.send failed");
-                                        stats_sends_fail += 1;
-                                    }
+                        stats_channel_packets += 1;
+
+                        if packet.len() < 20 {
+                            continue;
+                        }
+
+                        let ack_ranges = if entry.conn.needs_ack() {
+                            Some(entry.conn.generate_ack_ranges())
+                        } else {
+                            None
+                        };
+                        match entry.conn.encrypt_datagram(
+                            &packet, ack_ranges.as_deref(), &mut encrypt_buf,
+                        ) {
+                            Ok(result) => {
+                                stats_encrypts += 1;
+                                if pool.available() > RESERVED_BUFS {
+                                    submit_udp_send_direct(
+                                        &mut ring, &mut pool, &encrypt_buf, result.len, zero_copy,
+                                    )?;
+                                } else {
+                                    submit_udp_send(
+                                        &mut ring, &mut pool, &encrypt_buf[..result.len], zero_copy,
+                                    )?;
                                 }
+                                entry.last_tx = Instant::now();
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "encrypt failed, dropping packet");
                             }
                         }
                     }
-                    stats_channel_packets += batch_count;
 
                     // Resubmit channel eventfd read.
                     submit_notify_read(&mut ring, &mut notify_buf)?;
-                    had_wake = true;
                 }
 
                 OP_UDP_SEND => {
                     if zero_copy {
-                        // SendZc produces 2 CQEs: completion + notification.
-                        // Buffer can only be freed on the notification CQE.
                         let flags = cqe.flags();
                         if cqueue::notif(flags) {
                             pool.free(idx);
@@ -308,7 +569,6 @@ pub fn run(
                             debug!(error = %err, "engine: UDP send error");
                         }
                     } else {
-                        // WriteFixed: single CQE, free immediately.
                         if result < 0 {
                             let err = std::io::Error::from_raw_os_error(-result);
                             debug!(error = %err, "engine: UDP send error");
@@ -330,11 +590,15 @@ pub fn run(
                         let err = std::io::Error::from_raw_os_error(-result);
                         warn!(error = %err, "engine: provide buffer failed");
                     }
-                    // Success CQEs suppressed by SKIP_SUCCESS flag.
                 }
 
                 OP_SHUTDOWN => {
                     debug!("engine: shutdown signal received");
+                    // Send CONNECTION_CLOSE.
+                    if let Ok(result) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
+                        let _ = submit_udp_send(&mut ring, &mut pool, &encrypt_buf[..result.len], zero_copy);
+                    }
+                    let _ = ring.submit();
                     return Ok(());
                 }
 
@@ -350,180 +614,32 @@ pub fn run(
             multishot_active = true;
         }
 
-        // Phase 2: Single process_events + I/O for ALL events in this batch.
-        // N UDP packets → 1 drive → coalesced ACKs instead of N separate ACKs.
-        // Transmits go directly from quinn → buffer pool (1 copy, not 3).
-        if had_udp || had_timer || had_wake {
-            shared::process_events(&mut quic, &mut drive_result);
-            stats_datagrams += drive_result.datagrams.len() as u64;
-
-            if drive_result.connection_lost {
-                info!("engine: connection lost, signaling shutdown");
-                signal_shutdown(shutdown_fd);
-                return Ok(());
-            }
-
-            // Write decrypted datagrams to TUN.
-            for dg in &drive_result.datagrams {
-                submit_tun_write(&mut ring, &mut pool, dg)?;
-            }
-
-            // Send response transmits (handshake: version negotiation, etc.).
-            for (len, data) in &resp_transmits {
-                submit_udp_send(&mut ring, &mut pool, &data[..*len], zero_copy)?;
-            }
-
-            // Drain quinn transmits directly to buffer pool → io_uring.
-            // Stops early if pool is low (back-pressure), quinn holds the rest.
-            let (n, stalled) = drain_transmits(
-                &mut quic,
-                &mut ring,
-                &mut pool,
-                &mut transmit_buf,
-                zero_copy,
-            )?;
-            stats_transmits += n as u64;
-            if stalled {
-                stats_tx_stalls += 1;
-            }
-
-            // Update timer from connection state.
-            update_timer(&mut quic, &timer);
-        }
-
-        if stats_last.elapsed() >= std::time::Duration::from_secs(2) {
+        if stats_last.elapsed() >= Duration::from_secs(2) {
             info!(
                 udp_recvs = stats_udp_recvs,
                 datagrams = stats_datagrams,
-                transmits = stats_transmits,
+                encrypts = stats_encrypts,
                 timers = stats_timers,
                 channel_wakes = stats_channel_wakes,
                 channel_packets = stats_channel_packets,
-                sends_ok = stats_sends_ok,
-                sends_fail = stats_sends_fail,
-                tx_stalls = stats_tx_stalls,
                 free_bufs = pool.available(),
                 "engine: stats"
             );
             stats_udp_recvs = 0;
             stats_datagrams = 0;
-            stats_transmits = 0;
+            stats_encrypts = 0;
             stats_timers = 0;
             stats_channel_wakes = 0;
             stats_channel_packets = 0;
-            stats_sends_ok = 0;
-            stats_sends_fail = 0;
-            stats_tx_stalls = 0;
-            stats_last = std::time::Instant::now();
+            stats_last = Instant::now();
         }
     }
 }
+
+// ── io_uring SQE helpers (unchanged from original) ──────────────────────
 
 /// Minimum free buffers to reserve for recv resubmits and TUN writes.
-/// Prevents transmit drain from starving the receive path.
 const RESERVED_BUFS: usize = 64;
-
-/// Drain quinn-proto transmit queue directly into buffer pool + io_uring SQEs.
-///
-/// Path: poll_transmit → transmit_buf (Vec) → pool slot → SendZc/WriteFixed SQE.
-/// SendZc (--zero-copy) avoids the kernel-side copy to socket buffer.
-///
-/// Back-pressure: stops draining when pool is low (≤ RESERVED_BUFS free).
-/// Quinn-proto holds remaining transmits internally until the next iteration,
-/// when completed send SQEs return buffers to the pool. This prevents the
-/// catastrophic pattern of dropping QUIC packets → congestion collapse.
-///
-/// Returns (drained_count, stalled: bool).
-fn drain_transmits(
-    quic: &mut QuicState,
-    ring: &mut IoUring,
-    pool: &mut BufferPool,
-    transmit_buf: &mut Vec<u8>,
-    zero_copy: bool,
-) -> Result<(usize, bool)> {
-    let conn = match quic.connection.as_mut() {
-        Some(c) => c,
-        None => return Ok((0, false)),
-    };
-
-    let now = Instant::now();
-    let mut count = 0;
-    let mut stalled = false;
-
-    loop {
-        // Back-pressure: stop if pool is low, leaving headroom for recv/TUN ops.
-        // Quinn-proto keeps remaining transmits in its internal queue — they'll
-        // be drained next iteration after send completions free buffers.
-        if pool.available() <= RESERVED_BUFS {
-            stalled = true;
-            break;
-        }
-
-        transmit_buf.clear();
-        match conn.poll_transmit(now, 1, transmit_buf) {
-            Some(transmit) => {
-                let len = transmit.size;
-                submit_udp_send_direct(ring, pool, transmit_buf, len, zero_copy)?;
-                count += 1;
-            }
-            None => break,
-        }
-    }
-
-    Ok((count, stalled))
-}
-
-/// Submit a UDP send by copying data into a pool slot.
-///
-/// When `zero_copy` is true, uses SendZc (skips kernel-side memcpy, 2 CQEs per send).
-/// When false, uses WriteFixed (kernel copies from registered buffer, 1 CQE per send).
-///
-/// Called by `drain_transmits` which already checks pool availability
-/// via back-pressure (RESERVED_BUFS). Should not fail under normal operation.
-fn submit_udp_send_direct(
-    ring: &mut IoUring,
-    pool: &mut BufferPool,
-    src: &[u8],
-    len: usize,
-    zero_copy: bool,
-) -> Result<()> {
-    let idx = match pool.alloc() {
-        Some(i) => i,
-        None => {
-            // Should not happen — drain_transmits checks pool.available() > RESERVED_BUFS.
-            // If it does, the transmit was already consumed from quinn. Log and continue.
-            debug!("engine: unexpected buffer pool exhaustion in send_direct");
-            return Ok(());
-        }
-    };
-    let dst = pool.slice_mut(idx);
-    let len = len.min(BUF_SIZE);
-    dst[..len].copy_from_slice(&src[..len]);
-
-    let entry = if zero_copy {
-        opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
-            .buf_index(Some(idx as u16))
-            .build()
-            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
-    } else {
-        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
-            .build()
-            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
-    };
-
-    push_sqe(ring, &entry)?;
-    Ok(())
-}
-
-/// Update the timer from the current QUIC connection state.
-fn update_timer(quic: &mut QuicState, timer: &Timer) {
-    if let Some(conn) = quic.connection.as_mut() {
-        match conn.poll_timeout() {
-            Some(deadline) => timer.arm(deadline),
-            None => timer.disarm(),
-        }
-    }
-}
 
 /// Provide all buffers in the recv pool to the kernel as a buffer group.
 fn provide_all_buffers(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result<()> {
@@ -532,7 +648,7 @@ fn provide_all_buffers(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result<(
         BUF_SIZE as i32,
         recv_pool.size() as u16,
         recv_pool.group_id(),
-        0, // starting bid
+        0,
     )
     .build()
     .user_data(bufpool::encode_user_data(OP_PROVIDE_BUF, 0));
@@ -541,7 +657,7 @@ fn provide_all_buffers(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result<(
     Ok(())
 }
 
-/// Submit a single multishot recv SQE (replaces 32× ReadFixed).
+/// Submit a single multishot recv SQE.
 fn submit_multishot_recv(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result<()> {
     let entry = opcode::RecvMulti::new(types::Fixed(FD_UDP), recv_pool.group_id())
         .build()
@@ -552,7 +668,6 @@ fn submit_multishot_recv(ring: &mut IoUring, recv_pool: &ProvidedPool) -> Result
 }
 
 /// Re-provide a single consumed buffer back to the kernel.
-/// Uses SKIP_SUCCESS to suppress the CQE on success.
 fn reprovide_buffer(ring: &mut IoUring, recv_pool: &ProvidedPool, bid: u16) -> Result<()> {
     let entry = opcode::ProvideBuffers::new(
         recv_pool.ptr(bid),
@@ -570,8 +685,6 @@ fn reprovide_buffer(ring: &mut IoUring, recv_pool: &ProvidedPool, bid: u16) -> R
 }
 
 /// Submit a UDP send using registered fd + registered buffer.
-///
-/// When `zero_copy` is true, uses SendZc (2 CQEs). Otherwise uses WriteFixed (1 CQE).
 fn submit_udp_send(
     ring: &mut IoUring,
     pool: &mut BufferPool,
@@ -587,6 +700,40 @@ fn submit_udp_send(
     };
     let len = data.len().min(BUF_SIZE);
     pool.slice_mut(idx)[..len].copy_from_slice(&data[..len]);
+
+    let entry = if zero_copy {
+        opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
+            .buf_index(Some(idx as u16))
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
+    } else {
+        opcode::WriteFixed::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32, idx as u16)
+            .build()
+            .user_data(bufpool::encode_user_data(OP_UDP_SEND, idx))
+    };
+
+    push_sqe(ring, &entry)?;
+    Ok(())
+}
+
+/// Submit a UDP send by copying data into a pool slot (pre-checked availability).
+fn submit_udp_send_direct(
+    ring: &mut IoUring,
+    pool: &mut BufferPool,
+    src: &[u8],
+    len: usize,
+    zero_copy: bool,
+) -> Result<()> {
+    let idx = match pool.alloc() {
+        Some(i) => i,
+        None => {
+            debug!("engine: unexpected buffer pool exhaustion in send_direct");
+            return Ok(());
+        }
+    };
+    let dst = pool.slice_mut(idx);
+    let len = len.min(BUF_SIZE);
+    dst[..len].copy_from_slice(&src[..len]);
 
     let entry = if zero_copy {
         opcode::SendZc::new(types::Fixed(FD_UDP), pool.ptr(idx), len as u32)
@@ -624,7 +771,7 @@ fn submit_tun_write(ring: &mut IoUring, pool: &mut BufferPool, data: &[u8]) -> R
     Ok(())
 }
 
-/// Submit a timer read using registered fd (non-pool buffer).
+/// Submit a timer read using registered fd.
 fn submit_timer_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
     let entry = opcode::Read::new(types::Fixed(FD_TIMER), buf.as_mut_ptr(), 8)
         .build()
@@ -634,7 +781,7 @@ fn submit_timer_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
     Ok(())
 }
 
-/// Submit a channel notification eventfd read using registered fd (non-pool buffer).
+/// Submit a channel notification eventfd read.
 fn submit_notify_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
     let entry = opcode::Read::new(types::Fixed(FD_NOTIFY), buf.as_mut_ptr(), 8)
         .build()
@@ -644,7 +791,7 @@ fn submit_notify_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
     Ok(())
 }
 
-/// Submit a shutdown eventfd read using registered fd (non-pool buffer).
+/// Submit a shutdown eventfd read.
 fn submit_shutdown_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
     let entry = opcode::Read::new(types::Fixed(FD_SHUTDOWN), buf.as_mut_ptr(), 8)
         .build()
@@ -655,22 +802,10 @@ fn submit_shutdown_read(ring: &mut IoUring, buf: &mut [u8; 8]) -> Result<()> {
 }
 
 /// Push an SQE to the submission queue, flushing if full.
-///
-/// Without SQPOLL: `submit()` synchronously flushes all pending SQEs via
-/// `io_uring_enter()`. The SQ is empty after the call, so one retry suffices.
-///
-/// With SQPOLL: `submit()` wakes the kernel thread (no-op if already running).
-/// The kernel thread on its dedicated core processes SQEs asynchronously,
-/// freeing SQ slots as it goes. We spin until a slot opens. Each SQE takes
-/// ~100-500ns for the kernel to consume, so even a full ring (1024 entries)
-/// drains in <1ms.
 fn push_sqe(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> Result<()> {
     if unsafe { ring.submission().push(entry) }.is_ok() {
         return Ok(());
     }
-    // SQ full — wake SQPOLL thread (if idle) and spin until it frees a slot.
-    // Non-SQPOLL: submit() synchronously flushes, first spin succeeds.
-    // SQPOLL: kernel thread on a dedicated core processes SQEs concurrently.
     ring.submit().context("engine: SQ flush")?;
     loop {
         std::hint::spin_loop();

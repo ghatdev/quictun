@@ -6,9 +6,11 @@ license.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 quinn-proto = { workspace = true }
-rustls = { workspace = true }
 quictun-crypto = { workspace = true }
 quictun-core = { workspace = true }
+quictun-quic = { workspace = true }
+hex = { workspace = true }
+ipnet = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

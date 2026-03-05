@@ -1182,12 +1182,14 @@ dependencies = [
  "anyhow",
  "bytes",
  "crossbeam-channel",
+ "hex",
  "io-uring",
+ "ipnet",
  "libc",
  "quictun-core",
  "quictun-crypto",
+ "quictun-quic",
  "quinn-proto",
- "rustls",
  "tracing",
 ]
 

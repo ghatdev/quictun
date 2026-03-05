@@ -561,6 +561,17 @@ fn run_iouring(
 
     let cores = iouring_cores;
 
+    // Parse all peer public keys.
+    let all_peer_pubkeys: Vec<PublicKey> = config
+        .peer
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            PublicKey::from_base64(&p.public_key)
+                .with_context(|| format!("invalid public_key for peer[{i}]"))
+        })
+        .collect::<Result<_>>()?;
+
     tracing::info!(
         role = ?role,
         address = %addr,
@@ -580,7 +591,6 @@ fn run_iouring(
     let iface_name = config.interface_name(Path::new(config_path));
 
     // Create sync TUN device(s).
-    // Multi-core requires multi-queue TUN (kernel distributes by flow hash).
     let mut tun_opts = TunOptions::new(addr.addr(), addr.prefix_len(), config.mtu());
     tun_opts.name = Some(iface_name.clone());
     tun_opts.multi_queue = cores > 1;
@@ -588,7 +598,6 @@ fn run_iouring(
     let tun_primary =
         quictun_tun::create_sync(&tun_opts).context("failed to create sync TUN device")?;
 
-    // Build TUN fd list: primary + (N-1) clones for multi-queue.
     let mut tun_devices = vec![tun_primary];
     for i in 1..cores {
         let clone = tun_devices[0]
@@ -602,51 +611,87 @@ fn run_iouring(
         tracing::info!(cores, "multi-queue TUN ready ({} queues)", tun_fds.len());
     }
 
-    // Write PID file (guard removes it on exit/panic).
+    // Write PID file.
     state::write_pid_file(&iface_name)?;
     let _pid_guard = state::PidFileGuard::new(iface_name);
 
-    // Build quinn-proto configs.
-    let (client_config, server_config) = match role {
-        Role::Connector => {
-            let cc = quictun_uring::quic::build_proto_client_config(
-                &private_key,
-                &peer_pubkey,
-                keepalive,
-                &tuning,
-            )?;
-            (Some(cc), None)
-        }
-        Role::Listener => {
-            let sc = quictun_uring::quic::build_proto_server_config(
-                &private_key,
-                &[peer_pubkey],
-                keepalive,
-                &tuning,
-            )?;
-            (None, Some(sc))
-        }
+    // Idle timeout.
+    let idle_timeout = if config.interface.max_idle_timeout_ms > 0 {
+        Duration::from_millis(config.interface.max_idle_timeout_ms)
+    } else {
+        Duration::from_secs(30)
     };
+
+    let cid_len = config.interface.cid_length as usize;
+
+    // Build peer configs for identity matching.
+    let resolved_peers: Vec<quictun_core::peer::PeerConfig> = config
+        .peer
+        .iter()
+        .zip(all_peer_pubkeys.iter())
+        .map(|(peer_cfg, pubkey)| {
+            let tunnel_ip: std::net::Ipv4Addr = peer_cfg
+                .allowed_ips
+                .first()
+                .and_then(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                .map(|net| net.addr())
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+            let allowed_ips: Vec<ipnet::Ipv4Net> = peer_cfg
+                .allowed_ips
+                .iter()
+                .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                .collect();
+
+            quictun_core::peer::PeerConfig {
+                spki_der: pubkey.spki_der().to_vec(),
+                tunnel_ip,
+                allowed_ips,
+                keepalive: peer_cfg.keepalive.map(Duration::from_secs),
+            }
+        })
+        .collect();
+
+    // Build quinn-proto configs.
+    let first_keepalive = config.peer[0].keepalive.map(Duration::from_secs);
 
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
     let setup = match role {
         Role::Connector => {
+            let client_config = proto_config::build_proto_client_config(
+                &private_key,
+                &peer_pubkey,
+                keepalive,
+                &tuning,
+            )?;
             let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
             quictun_uring::event_loop::EndpointSetup::Connector {
                 remote_addr,
-                client_config: client_config.context("connector requires client_config")?,
+                client_config,
             }
         }
-        Role::Listener => quictun_uring::event_loop::EndpointSetup::Listener {
-            server_config: server_config.context("listener requires server_config")?,
-        },
+        Role::Listener => {
+            let server_config = proto_config::build_proto_server_config(
+                &private_key,
+                &all_peer_pubkeys,
+                first_keepalive,
+                &tuning,
+            )?;
+            quictun_uring::event_loop::EndpointSetup::Listener { server_config }
+        }
+    };
+
+    let uring_config = quictun_uring::event_loop::UringConfig {
+        cid_len,
+        peers: resolved_peers,
+        idle_timeout,
     };
 
     // Run the io_uring event loop (no tokio).
     // tun_devices must outlive the event loop (they own the fds).
     quictun_uring::event_loop::run(
-        tun_fds, local_addr, setup, sqpoll, sqpoll_cpu, pool_size, zero_copy,
+        tun_fds, local_addr, setup, uring_config, sqpoll, sqpoll_cpu, pool_size, zero_copy,
     )
 }

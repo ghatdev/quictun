@@ -3,13 +3,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quinn_proto::{ClientConfig, ServerConfig};
 use tracing::info;
 
-use crate::shared::QuicState;
+use quictun_core::peer::PeerConfig;
 use crate::timer::Timer;
 use crate::udp;
 
@@ -33,6 +33,13 @@ pub enum EndpointSetup {
     },
 }
 
+/// Configuration passed to the io_uring engine.
+pub struct UringConfig {
+    pub cid_len: usize,
+    pub peers: Vec<PeerConfig>,
+    pub idle_timeout: Duration,
+}
+
 /// Run the lock-free io_uring data plane.
 ///
 /// When `cores` is 1, spawns one reader + engine pair (single connection).
@@ -45,6 +52,7 @@ pub fn run(
     tun_fds: Vec<RawFd>,
     local_addr: SocketAddr,
     setup: EndpointSetup,
+    config: UringConfig,
     sqpoll: bool,
     sqpoll_cpu: Option<u32>,
     pool_size: usize,
@@ -65,23 +73,14 @@ pub fn run(
         set_nonblocking(fd).context("failed to set TUN fd non-blocking")?;
     }
 
-    // Build per-core state: (udp_fd, quic_state, server_config) for each core.
-    // Connector: QuicState is Some (connection already initiated).
-    // Listener: QuicState is None (first-packet handling moved to engine thread
-    //           so all cores block in parallel instead of sequentially).
-    let mut core_state: Vec<(OwnedFd, Option<QuicState>)> = Vec::with_capacity(cores);
-    let server_config: Option<Arc<ServerConfig>> = match &setup {
-        EndpointSetup::Listener { server_config } => Some(server_config.clone()),
-        _ => None,
-    };
+    // Build per-core state: (udp_fd) for each core.
+    // The engine thread creates MultiQuicState and handles handshake + data plane.
+    let mut core_state: Vec<OwnedFd> = Vec::with_capacity(cores);
 
     match &setup {
         EndpointSetup::Connector {
-            remote_addr,
-            client_config,
+            remote_addr, ..
         } => {
-            // Connector: each core creates its own UDP socket + QUIC connection.
-            // Core i connects to remote_addr port + i.
             for i in 0..cores {
                 let remote = if cores > 1 {
                     SocketAddr::new(remote_addr.ip(), remote_addr.port() + i as u16)
@@ -94,21 +93,10 @@ pub fn run(
                 let bind = udp::local_addr(&udp_fd)?;
                 info!(core = i, bind = %bind, remote = %remote, "UDP socket ready (connector)");
 
-                let mut quic = QuicState::new(remote, None);
-                let (handle, conn) = quic
-                    .endpoint
-                    .connect(Instant::now(), client_config.clone(), remote, "quictun")
-                    .map_err(|e| anyhow::anyhow!("core {i}: connect failed: {e:?}"))?;
-                quic.ch = Some(handle);
-                quic.connection = Some(conn);
-
-                core_state.push((udp_fd, Some(quic)));
+                core_state.push(udp_fd);
             }
         }
         EndpointSetup::Listener { .. } => {
-            // Listener: each core binds to listen_port + i.
-            // First-packet handling is deferred to each engine thread so all
-            // cores block in parallel (fixes sequential 7s+ startup delay).
             for i in 0..cores {
                 let listen_addr = if cores > 1 {
                     SocketAddr::new(local_addr.ip(), local_addr.port() + i as u16)
@@ -121,7 +109,7 @@ pub fn run(
                 let bind = udp::local_addr(&udp_fd)?;
                 info!(core = i, bind = %bind, "UDP socket bound (listener, waiting deferred to engine)");
 
-                core_state.push((udp_fd, None));
+                core_state.push(udp_fd);
             }
         }
     }
@@ -142,7 +130,7 @@ pub fn run(
         let mut udp_fds: Vec<OwnedFd> = Vec::with_capacity(cores);
         let mut notify_fds: Vec<OwnedFd> = Vec::with_capacity(cores);
 
-        for (i, ((udp_fd, quic_state), &tun_fd)) in
+        for (i, (udp_fd, &tun_fd)) in
             core_state.into_iter().zip(tun_fds.iter()).enumerate()
         {
             let udp_raw = udp_fd.as_raw_fd();
@@ -182,14 +170,37 @@ pub fn run(
 
             let ps = pool_size;
             let zc = zero_copy;
-            let sc = server_config.clone();
+            // Clone setup per core (only first core gets the real setup for single-client).
+            let core_setup = match &setup {
+                EndpointSetup::Connector { remote_addr, client_config } => {
+                    let remote = if cores > 1 {
+                        SocketAddr::new(remote_addr.ip(), remote_addr.port() + i as u16)
+                    } else {
+                        *remote_addr
+                    };
+                    crate::engine::EngineSetup::Connector {
+                        remote_addr: remote,
+                        client_config: client_config.clone(),
+                    }
+                }
+                EndpointSetup::Listener { server_config } => {
+                    crate::engine::EngineSetup::Listener {
+                        server_config: server_config.clone(),
+                    }
+                }
+            };
+            let engine_peers = config.peers.clone();
+            let engine_idle_timeout = config.idle_timeout;
+            let engine_cid_len = config.cid_len;
             let engine_h = s.spawn(move || {
                 pin_to_core(core_id);
                 crate::engine::run(
                     tun_fd,
                     udp_raw,
-                    quic_state,
-                    sc,
+                    core_setup,
+                    engine_peers,
+                    engine_cid_len,
+                    engine_idle_timeout,
                     timer,
                     rx,
                     notify_raw,
