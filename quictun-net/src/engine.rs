@@ -18,7 +18,7 @@ use mio::{Events, Interest, Poll, Token};
 use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
 
-use crate::dispatch::{ControlMessage, InnerPacket, NetDispatchTable, OuterPacket, WorkerChannels};
+use crate::dispatch::{InnerPacket, NetDispatchTable, NewConnection, OuterPacket, WorkerChannels};
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::{BUF_SIZE, MultiQuicState};
 use quictun_quic::local::LocalConnectionState;
@@ -1424,18 +1424,16 @@ fn dispatch_drive_handshakes(
             "connection established, assigned to worker"
         );
 
-        // Push control message to worker.
-        let msg = ControlMessage::AddConnection {
-            conn: conn_state,
-            tunnel_ip,
-            remote_addr: hs.remote_addr,
-            keepalive_interval,
-        };
         worker_channels[worker_id]
             .control
             .lock()
             .expect("worker control mutex poisoned — worker panicked")
-            .push(msg);
+            .push(NewConnection {
+                conn: conn_state,
+                tunnel_ip,
+                remote_addr: hs.remote_addr,
+                keepalive_interval,
+            });
     }
 
     Ok(())
@@ -1484,46 +1482,27 @@ fn run_worker(
 
         // ── Poll control channel ─────────────────────────────────────
         if let Ok(mut ctrl) = channels.control.try_lock() {
-            for msg in ctrl.drain(..) {
-                match msg {
-                    ControlMessage::AddConnection {
-                        conn,
-                        tunnel_ip,
-                        remote_addr,
-                        keepalive_interval,
-                    } => {
-                        let cid_bytes = conn.local_cid().to_vec();
-                        info!(
-                            worker = worker_id,
-                            tunnel_ip = %tunnel_ip,
-                            cid = %hex::encode(&cid_bytes),
-                            "worker received connection"
-                        );
-                        ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
-                        let now_inst = Instant::now();
-                        connections.insert(
-                            cid_bytes,
-                            ConnEntry {
-                                conn,
-                                tunnel_ip,
-                                remote_addr,
-                                keepalive_interval,
-                                last_tx: now_inst,
-                                last_rx: now_inst,
-                            },
-                        );
-                    }
-                    ControlMessage::RemoveConnection { cid } => {
-                        if let Some(entry) = connections.remove(&cid) {
-                            ip_to_cid.remove(&entry.tunnel_ip);
-                            info!(
-                                worker = worker_id,
-                                cid = %hex::encode(&cid),
-                                "worker removed connection"
-                            );
-                        }
-                    }
-                }
+            for new_conn in ctrl.drain(..) {
+                let cid_bytes = new_conn.conn.local_cid().to_vec();
+                info!(
+                    worker = worker_id,
+                    tunnel_ip = %new_conn.tunnel_ip,
+                    cid = %hex::encode(&cid_bytes),
+                    "worker received connection"
+                );
+                ip_to_cid.insert(new_conn.tunnel_ip, cid_bytes.clone());
+                let now_inst = Instant::now();
+                connections.insert(
+                    cid_bytes,
+                    ConnEntry {
+                        conn: new_conn.conn,
+                        tunnel_ip: new_conn.tunnel_ip,
+                        remote_addr: new_conn.remote_addr,
+                        keepalive_interval: new_conn.keepalive_interval,
+                        last_tx: now_inst,
+                        last_rx: now_inst,
+                    },
+                );
                 did_work = true;
             }
         }
