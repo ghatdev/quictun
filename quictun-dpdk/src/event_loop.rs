@@ -1,4 +1,3 @@
-use std::ffi::CString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,10 +87,31 @@ pub struct DpdkConfig {
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig) -> Result<()> {
     // ── 1. Initialize DPDK EAL ───────────────────────────────────
 
-    // For TAP/virtio mode, inject vdev(s) into EAL args before init.
+    // Inject inner vdev(s) into EAL args before init.
     // Multi-core: N vdevs (quictun0, quictun1, ...).
     let n_cores = dpdk_config.n_cores.max(1);
     let mut eal_args = dpdk_config.eal_args.clone();
+
+    // AF_XDP: create veth pair BEFORE EAL init so the interface exists
+    // when the PMD binds to it.
+    let mut _veth_pair: Option<VethPair> = None;
+    if dpdk_config.mode == "xdp" {
+        if n_cores > 1 {
+            bail!("multi-core (--dpdk-cores > 1) is only supported with TAP PMD mode (--dpdk tap)");
+        }
+        let veth = VethPair::create(
+            &dpdk_config.tunnel_iface,
+            dpdk_config.tunnel_ip,
+            dpdk_config.tunnel_prefix,
+            dpdk_config.tunnel_mtu,
+        )?;
+        eal_args.push(format!(
+            "--vdev=net_af_xdp0,iface={},start_queue=0,queue_count=1,busy_budget=64",
+            veth.xdp_iface
+        ));
+        _veth_pair = Some(veth);
+    }
+
     if dpdk_config.mode == "tap" {
         for i in 0..n_cores {
             let iface = if n_cores == 1 {
@@ -115,6 +135,11 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
              packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1"
         ));
         // Enable AVX-512 SIMD for virtio descriptor batch processing.
+        eal_args.push("--force-max-simd-bitwidth=512".to_string());
+    }
+
+    // Enable AVX-512 SIMD for AF_XDP ring operations too.
+    if dpdk_config.mode == "xdp" {
         eal_args.push("--force-max-simd-bitwidth=512".to_string());
     }
 
@@ -239,22 +264,41 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Holds veth pair ownership for AF_XDP mode (dropped on cleanup).
-    let mut _veth_pair: Option<VethPair> = None;
-
     let mut inner_ports: Vec<InnerPort> = Vec::with_capacity(n_cores);
 
-    if dpdk_config.mode == "tap" || dpdk_config.mode == "virtio" {
+    // All modes now use --vdev in EAL args. Inner port(s) are the last N ports.
+    // SAFETY: EAL is initialized; returns the count of available DPDK ports.
+    let total_ports = unsafe { ffi::rte_eth_dev_count_avail() } as u16;
+    let expected = 1 + n_cores as u16; // outer + N inner ports
+    if total_ports < expected {
+        bail!(
+            "inner vdev not found: only {total_ports} port(s) available (expected ≥ {expected})"
+        );
+    }
+
+    if dpdk_config.mode == "xdp" {
+        // AF_XDP mode: veth pair already created, PMD bound via --vdev.
+        let veth = _veth_pair.as_ref().expect("veth pair must exist for xdp mode");
+        let inner_port_id = total_ports - 1;
+        let (inner_mac, _inner_hw_udp, _inner_hw_ip) =
+            port::configure_port(inner_port_id, mempool)?;
+
+        tracing::info!(
+            inner_port = inner_port_id,
+            inner_mac = %format_mac(&inner_mac),
+            xdp_iface = %veth.xdp_iface,
+            "AF_XDP inner port configured"
+        );
+
+        let eth_hdr = InnerEthHeader::new(inner_mac, veth.app_mac);
+        inner_ports.push(InnerPort {
+            port_id: inner_port_id,
+            eth_hdr,
+        });
+        tracing::info!("inner interface: AF_XDP (veth pair)");
+    } else {
         // TAP PMD or virtio-user mode: DPDK created device(s) via --vdev in EAL args.
         // Both create kernel-visible TAP interfaces that need IP configuration.
-        // SAFETY: EAL is initialized; returns the count of available DPDK ports.
-        let total_ports = unsafe { ffi::rte_eth_dev_count_avail() } as u16;
-        let expected = 1 + n_cores as u16; // outer + N inner ports
-        if total_ports < expected {
-            bail!(
-                "inner vdev not found: only {total_ports} port(s) available (expected ≥ {expected})"
-            );
-        }
 
         // Fabricate a locally-administered peer MAC for ARP replies.
         let peer_mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -310,58 +354,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         }
 
         tracing::info!(n_cores, mode = %dpdk_config.mode, "inner interface ready");
-    } else {
-        // AF_XDP mode: create veth pair, init DPDK AF_XDP PMD.
-        // Multi-core AF_XDP not supported yet — requires per-queue veth pairs.
-        if n_cores > 1 {
-            bail!("multi-core (--dpdk-cores > 1) is only supported with TAP PMD mode (--dpdk tap)");
-        }
-
-        let veth = VethPair::create(
-            &dpdk_config.tunnel_iface,
-            dpdk_config.tunnel_ip,
-            dpdk_config.tunnel_prefix,
-            dpdk_config.tunnel_mtu,
-        )?;
-
-        let vdev_name = CString::new("net_af_xdp0").expect("CString::new failed");
-        let vdev_args =
-            CString::new(format!("iface={}", veth.xdp_iface)).expect("CString::new failed");
-
-        // SAFETY: vdev_name and vdev_args are valid CStrings; EAL is initialized.
-        let ret = unsafe { ffi::rte_vdev_init(vdev_name.as_ptr(), vdev_args.as_ptr()) };
-        if ret != 0 {
-            bail!(
-                "rte_vdev_init(net_af_xdp0, iface={}) failed: error {ret}",
-                veth.xdp_iface
-            );
-        }
-
-        // SAFETY: EAL is initialized and vdev was just created.
-        let total_ports = unsafe { ffi::rte_eth_dev_count_avail() };
-        if total_ports < 2 {
-            bail!("AF_XDP vdev created but only {total_ports} port(s) available (expected ≥ 2)");
-        }
-        let inner_port_id = total_ports as u16 - 1;
-        let (inner_mac, _inner_hw_udp, _inner_hw_ip) =
-            port::configure_port(inner_port_id, mempool)?;
-
-        tracing::info!(
-            inner_port = inner_port_id,
-            inner_mac = %format_mac(&inner_mac),
-            xdp_iface = %veth.xdp_iface,
-            "AF_XDP inner port configured"
-        );
-
-        let eth_hdr = InnerEthHeader::new(inner_mac, veth.app_mac);
-        _veth_pair = Some(veth);
-        tracing::info!("inner interface: AF_XDP (veth pair)");
-
-        inner_ports.push(InnerPort {
-            port_id: inner_port_id,
-            eth_hdr,
-        });
-    };
+    }
 
     // ── 7. Set up SIGINT handler ─────────────────────────────────
 
