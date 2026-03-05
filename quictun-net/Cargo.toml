@@ -19,3 +19,4 @@ hex = { workspace = true }
 ipnet = { workspace = true }
 tun-rs = { workspace = true }
 crossbeam-channel = { workspace = true }
+rustc-hash = { workspace = true }

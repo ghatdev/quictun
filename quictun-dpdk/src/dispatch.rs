@@ -3,14 +3,15 @@
 //! Core 0 (dispatcher) owns the `DpdkDispatchTable` and routes packets to
 //! worker cores via SPSC rings. Workers own `LocalConnectionState` per connection.
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 use anyhow::Result;
+use rustc_hash::FxHashMap;
 use quictun_quic::local::LocalConnectionState;
 use quinn_proto::ConnectionId;
 
+use quictun_quic::cid_to_u64;
 use crate::ffi;
 use crate::ring::SpscRing;
 
@@ -27,10 +28,10 @@ struct DispatchEntry {
 ///
 /// Single-owner on core 0 — no locking needed for lookups.
 pub struct DpdkDispatchTable {
-    /// CID → worker (outer RX routing by destination connection ID).
-    connections: HashMap<Vec<u8>, DispatchEntry>,
+    /// CID (as u64) → worker (outer RX routing by destination connection ID).
+    connections: FxHashMap<u64, DispatchEntry>,
     /// Tunnel IP → worker (inner RX routing by destination IP).
-    routes: HashMap<Ipv4Addr, DispatchEntry>,
+    routes: FxHashMap<Ipv4Addr, DispatchEntry>,
     /// Connection count per worker (for least-loaded assignment).
     worker_load: Vec<u32>,
 }
@@ -39,8 +40,8 @@ impl DpdkDispatchTable {
     /// Create a dispatch table for `n_workers` worker cores.
     pub fn new(n_workers: usize) -> Self {
         Self {
-            connections: HashMap::new(),
-            routes: HashMap::new(),
+            connections: FxHashMap::default(),
+            routes: FxHashMap::default(),
             worker_load: vec![0; n_workers],
         }
     }
@@ -48,7 +49,7 @@ impl DpdkDispatchTable {
     /// Register a CID → worker mapping (called at accept time).
     pub fn register_cid(&mut self, cid: &ConnectionId, worker_id: usize) {
         self.connections
-            .insert(cid.to_vec(), DispatchEntry { worker_id });
+            .insert(cid_to_u64(cid.as_ref()), DispatchEntry { worker_id });
         self.worker_load[worker_id] += 1;
     }
 
@@ -57,10 +58,10 @@ impl DpdkDispatchTable {
         self.routes.insert(tunnel_ip, DispatchEntry { worker_id });
     }
 
-    /// Look up worker by CID.
+    /// Look up worker by CID (raw bytes → u64 key).
     #[inline]
     pub fn lookup_cid(&self, cid: &[u8]) -> Option<usize> {
-        self.connections.get(cid).map(|e| e.worker_id)
+        self.connections.get(&cid_to_u64(cid)).map(|e| e.worker_id)
     }
 
     /// Look up worker by destination IP.
@@ -81,8 +82,8 @@ impl DpdkDispatchTable {
 
     /// Unregister a connection (CID + IP route).
     pub fn unregister(&mut self, cid: &ConnectionId, tunnel_ip: Ipv4Addr) {
-        let key: &[u8] = cid.as_ref();
-        if let Some(entry) = self.connections.remove(key) {
+        let key = cid_to_u64(cid.as_ref());
+        if let Some(entry) = self.connections.remove(&key) {
             self.worker_load[entry.worker_id] = self.worker_load[entry.worker_id].saturating_sub(1);
         }
         self.routes.remove(&tunnel_ip);

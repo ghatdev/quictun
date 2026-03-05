@@ -3,7 +3,6 @@
 //! Replaces tokio as the default non-DPDK data plane. No async runtime,
 //! no tokio dependency. Single-thread poll loop over UDP + TUN + signal pipe.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -16,6 +15,7 @@ use bytes::BytesMut;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use quinn_proto::ServerConfig;
+use rustc_hash::FxHashMap;
 use tracing::{debug, info, warn};
 
 use crate::dispatch::{
@@ -23,6 +23,7 @@ use crate::dispatch::{
 };
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::{BUF_SIZE, MultiQuicState};
+use quictun_quic::cid_to_u64;
 use quictun_quic::local::LocalConnectionState;
 use quictun_tun::TunOptions;
 
@@ -272,8 +273,8 @@ fn run_single(
     }
 
     // 6. Connection table.
-    let mut connections: HashMap<Vec<u8>, ConnEntry> = HashMap::new();
-    let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
+    let mut connections: FxHashMap<u64, ConnEntry> = FxHashMap::default();
+    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
     let mut had_connection = false;
 
     // Buffers.
@@ -587,7 +588,7 @@ fn drain_signal_pipe(read_fd: i32) {
 // ── Timeout computation ──────────────────────────────────────────────────
 
 fn compute_timeout(
-    connections: &HashMap<Vec<u8>, ConnEntry>,
+    connections: &FxHashMap<u64, ConnEntry>,
     multi_state: &mut MultiQuicState,
     idle_timeout: Duration,
 ) -> Duration {
@@ -637,7 +638,7 @@ fn drain_transmits(udp: &std::net::UdpSocket, state: &mut MultiQuicState) -> Res
 fn handle_udp_rx_linux(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
     cid_len: usize,
     multi_state: &mut MultiQuicState,
     recv_bufs: &mut [Vec<u8>],
@@ -687,9 +688,9 @@ fn handle_udp_rx_linux(
             if cid_len == 0 || n < 1 + cid_len {
                 continue;
             }
-            let cid_key: Vec<u8> = recv_bufs[i][1..1 + cid_len].to_vec();
+            let cid_key = cid_to_u64(&recv_bufs[i][1..1 + cid_len]);
 
-            let close_received = if let Some(entry) = connections.get_mut(cid_key.as_slice()) {
+            let close_received = if let Some(entry) = connections.get_mut(&cid_key) {
                 match entry
                     .conn
                     .decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch)
@@ -739,7 +740,7 @@ fn handle_udp_rx_linux(
             if close_received && let Some(entry) = connections.remove(&cid_key) {
                 info!(
                     tunnel_ip = %entry.tunnel_ip,
-                    cid = %hex::encode(&cid_key),
+                    cid = %hex::encode(cid_key.to_ne_bytes()),
                     "peer sent CONNECTION_CLOSE, removed"
                 );
             }
@@ -778,7 +779,7 @@ fn handle_udp_rx_linux(
 fn handle_udp_rx(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
     cid_len: usize,
     multi_state: &mut MultiQuicState,
     recv_buf: &mut [u8],
@@ -804,9 +805,9 @@ fn handle_udp_rx(
                 } else {
                     // Short header → CID routing.
                     if cid_len > 0 && n > cid_len {
-                        let cid_key: Vec<u8> = recv_buf[1..1 + cid_len].to_vec();
+                        let cid_key = cid_to_u64(&recv_buf[1..1 + cid_len]);
                         let close_received = if let Some(entry) =
-                            connections.get_mut(cid_key.as_slice())
+                            connections.get_mut(&cid_key)
                         {
                             match entry
                                 .conn
@@ -849,7 +850,7 @@ fn handle_udp_rx(
                         if close_received && let Some(entry) = connections.remove(&cid_key) {
                             info!(
                                 tunnel_ip = %entry.tunnel_ip,
-                                cid = %hex::encode(&cid_key),
+                                cid = %hex::encode(cid_key.to_ne_bytes()),
                                 "peer sent CONNECTION_CLOSE, removed"
                             );
                         }
@@ -869,8 +870,8 @@ fn handle_udp_rx(
 fn handle_tun_rx_linux(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
-    ip_to_cid: &HashMap<Ipv4Addr, Vec<u8>>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
     gso_buf: &mut [u8],
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
@@ -878,7 +879,7 @@ fn handle_tun_rx_linux(
     let mut gso_pos = 0usize;
     let mut gso_segment_size = 0usize;
     let mut gso_count = 0usize;
-    let mut current_cid: Option<Vec<u8>> = None;
+    let mut current_cid: Option<u64> = None;
     let mut current_remote: Option<SocketAddr> = None;
 
     loop {
@@ -891,14 +892,13 @@ fn handle_tun_rx_linux(
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
-                    cid.clone()
+                let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
+                    cid
                 } else if connections.len() == 1 {
-                    connections
+                    *connections
                         .keys()
                         .next()
                         .expect("single connection")
-                        .clone()
                 } else {
                     debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
                     continue;
@@ -918,7 +918,7 @@ fn handle_tun_rx_linux(
                                 gso_segment_size,
                                 current_remote.expect("remote set"),
                             )?;
-                            if let Some(entry) = connections.get_mut(cur_cid.as_slice()) {
+                            if let Some(entry) = connections.get_mut(cur_cid) {
                                 entry.last_tx = Instant::now();
                             }
                         }
@@ -928,7 +928,7 @@ fn handle_tun_rx_linux(
                     }
                 }
 
-                let entry = match connections.get_mut(cid.as_slice()) {
+                let entry = match connections.get_mut(&cid) {
                     Some(e) => e,
                     None => continue,
                 };
@@ -994,7 +994,7 @@ fn handle_tun_rx_linux(
             current_remote.expect("remote set"),
         )?;
         if let Some(ref cid) = current_cid {
-            if let Some(entry) = connections.get_mut(cid.as_slice()) {
+            if let Some(entry) = connections.get_mut(&cid) {
                 entry.last_tx = Instant::now();
             }
         }
@@ -1051,8 +1051,8 @@ fn wait_writable(fd: i32) {
 fn handle_tun_rx(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
-    ip_to_cid: &HashMap<Ipv4Addr, Vec<u8>>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
     loop {
@@ -1065,19 +1065,18 @@ fn handle_tun_rx(
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
-                    cid.clone()
+                let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
+                    cid
                 } else if connections.len() == 1 {
-                    connections
+                    *connections
                         .keys()
                         .next()
                         .expect("single connection")
-                        .clone()
                 } else {
                     continue;
                 };
 
-                let entry = match connections.get_mut(cid.as_slice()) {
+                let entry = match connections.get_mut(&cid) {
                     Some(e) => e,
                     None => continue,
                 };
@@ -1111,17 +1110,17 @@ fn handle_tun_rx(
 
 fn handle_timeouts(
     udp: &std::net::UdpSocket,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
-    ip_to_cid: &mut HashMap<Ipv4Addr, Vec<u8>>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
     multi_state: &mut MultiQuicState,
     idle_timeout: Duration,
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
     // Remove idle connections.
-    let expired: Vec<Vec<u8>> = connections
+    let expired: Vec<u64> = connections
         .iter()
         .filter(|(_, e)| e.last_rx.elapsed() >= idle_timeout)
-        .map(|(cid, _)| cid.clone())
+        .map(|(&cid, _)| cid)
         .collect();
 
     for cid in expired {
@@ -1129,7 +1128,7 @@ fn handle_timeouts(
             ip_to_cid.remove(&entry.tunnel_ip);
             info!(
                 tunnel_ip = %entry.tunnel_ip,
-                cid = %hex::encode(&cid),
+                cid = %hex::encode(cid.to_ne_bytes()),
                 "connection idle timeout, removed"
             );
         }
@@ -1171,8 +1170,8 @@ fn handle_timeouts(
 fn drive_handshakes(
     udp: &std::net::UdpSocket,
     multi_state: &mut MultiQuicState,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
-    ip_to_cid: &mut HashMap<Ipv4Addr, Vec<u8>>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
     peers: &[PeerConfig],
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
@@ -1217,6 +1216,7 @@ fn drive_handshakes(
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
 
         let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
+        let cid_key = cid_to_u64(&cid_bytes);
         let now_inst = Instant::now();
 
         info!(
@@ -1227,9 +1227,9 @@ fn drive_handshakes(
             "connection established"
         );
 
-        ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
+        ip_to_cid.insert(tunnel_ip, cid_key);
         connections.insert(
-            cid_bytes,
+            cid_key,
             ConnEntry {
                 conn: conn_state,
                 tunnel_ip,
@@ -1265,8 +1265,8 @@ fn send_responses(
 fn handle_tun_rx_linux_offload(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
-    connections: &mut HashMap<Vec<u8>, ConnEntry>,
-    ip_to_cid: &HashMap<Ipv4Addr, Vec<u8>>,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
     gso_buf: &mut [u8],
     original_buf: &mut [u8],
     split_bufs: &mut [Vec<u8>],
@@ -1278,7 +1278,7 @@ fn handle_tun_rx_linux_offload(
     let mut gso_pos = 0usize;
     let mut gso_segment_size = 0usize;
     let mut gso_count = 0usize;
-    let mut current_cid: Option<Vec<u8>> = None;
+    let mut current_cid: Option<u64> = None;
     let mut current_remote: Option<SocketAddr> = None;
 
     loop {
@@ -1297,14 +1297,13 @@ fn handle_tun_rx_linux_offload(
 
             let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-            let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
-                cid.clone()
+            let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
+                cid
             } else if connections.len() == 1 {
-                connections
+                *connections
                     .keys()
                     .next()
                     .expect("single connection")
-                    .clone()
             } else {
                 debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
                 continue;
@@ -1322,7 +1321,7 @@ fn handle_tun_rx_linux_offload(
                             gso_segment_size,
                             current_remote.expect("remote set"),
                         )?;
-                        if let Some(entry) = connections.get_mut(cur_cid.as_slice()) {
+                        if let Some(entry) = connections.get_mut(cur_cid) {
                             entry.last_tx = Instant::now();
                         }
                     }
@@ -1332,7 +1331,7 @@ fn handle_tun_rx_linux_offload(
                 }
             }
 
-            let entry = match connections.get_mut(cid.as_slice()) {
+            let entry = match connections.get_mut(&cid) {
                 Some(e) => e,
                 None => continue,
             };
@@ -1391,7 +1390,7 @@ fn handle_tun_rx_linux_offload(
             current_remote.expect("remote set"),
         )?;
         if let Some(ref cid) = current_cid {
-            if let Some(entry) = connections.get_mut(cid.as_slice()) {
+            if let Some(entry) = connections.get_mut(&cid) {
                 entry.last_tx = Instant::now();
             }
         }
@@ -1748,10 +1747,10 @@ fn run_dispatcher(
 
         // ── Drain removal notifications from workers ─────────────────
         while let Ok(removed) = removal_rx.try_recv() {
-            dispatch_table.unregister(&removed.cid, removed.tunnel_ip);
+            dispatch_table.unregister(removed.cid, removed.tunnel_ip);
             active_connections = active_connections.saturating_sub(1);
             debug!(
-                cid = %hex::encode(&removed.cid),
+                cid = %hex::encode(removed.cid.to_ne_bytes()),
                 tunnel_ip = %removed.tunnel_ip,
                 "dispatcher unregistered connection"
             );
@@ -2075,8 +2074,8 @@ fn run_worker(
         std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(udp_fd) });
 
     // Connection table (worker-local, no locking).
-    let mut connections: HashMap<Vec<u8>, ConnEntry> = HashMap::new();
-    let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
+    let mut connections: FxHashMap<u64, ConnEntry> = FxHashMap::default();
+    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
 
     let mut scratch = BytesMut::with_capacity(2048);
     let mut tun_write_buf = TunWriteBuffer::new();
@@ -2130,16 +2129,17 @@ fn run_worker(
                         keepalive_interval,
                     } => {
                         let cid_bytes = conn.local_cid().to_vec();
+                        let cid_key = cid_to_u64(&cid_bytes);
                         info!(
                             worker = worker_id,
                             tunnel_ip = %tunnel_ip,
                             cid = %hex::encode(&cid_bytes),
                             "worker received connection"
                         );
-                        ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
+                        ip_to_cid.insert(tunnel_ip, cid_key);
                         let now_inst = Instant::now();
                         connections.insert(
-                            cid_bytes,
+                            cid_key,
                             ConnEntry {
                                 conn,
                                 tunnel_ip,
@@ -2177,10 +2177,10 @@ fn run_worker(
                     if pkt.data.len() < 1 + cid_len {
                         continue;
                     }
-                    let cid_key: Vec<u8> = pkt.data[1..1 + cid_len].to_vec();
+                    let cid_key = cid_to_u64(&pkt.data[1..1 + cid_len]);
 
                     let close_received = if let Some(entry) =
-                        connections.get_mut(cid_key.as_slice())
+                        connections.get_mut(&cid_key)
                     {
                         match entry
                             .conn
@@ -2234,12 +2234,12 @@ fn run_worker(
                     if close_received && let Some(entry) = connections.remove(&cid_key) {
                         ip_to_cid.remove(&entry.tunnel_ip);
                         let _ = removal_tx.try_send(RemovedConnection {
-                            cid: cid_key.clone(),
+                            cid: cid_key,
                             tunnel_ip: entry.tunnel_ip,
                         });
                         info!(
                             worker = worker_id,
-                            cid = %hex::encode(&cid_key),
+                            cid = %hex::encode(cid_key.to_ne_bytes()),
                             "peer sent CONNECTION_CLOSE, removed"
                         );
                     }
@@ -2264,19 +2264,18 @@ fn run_worker(
                         let dest_ip =
                             Ipv4Addr::new(pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19]);
 
-                        let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
-                            cid.clone()
+                        let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
+                            cid
                         } else if connections.len() == 1 {
-                            connections
+                            *connections
                                 .keys()
                                 .next()
                                 .expect("single connection")
-                                .clone()
                         } else {
                             continue;
                         };
 
-                        let entry = match connections.get_mut(cid.as_slice()) {
+                        let entry = match connections.get_mut(&cid) {
                             Some(e) => e,
                             None => continue,
                         };
@@ -2381,19 +2380,18 @@ fn run_worker(
                         let dest_ip =
                             Ipv4Addr::new(pkt.data[16], pkt.data[17], pkt.data[18], pkt.data[19]);
 
-                        let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
-                            cid.clone()
+                        let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
+                            cid
                         } else if connections.len() == 1 {
-                            connections
+                            *connections
                                 .keys()
                                 .next()
                                 .expect("single connection")
-                                .clone()
                         } else {
                             continue;
                         };
 
-                        let entry = match connections.get_mut(cid.as_slice()) {
+                        let entry = match connections.get_mut(&cid) {
                             Some(e) => e,
                             None => continue,
                         };
@@ -2426,9 +2424,9 @@ fn run_worker(
 
         // ── Keepalives and idle timeouts ─────────────────────────────
         let mut expired = Vec::new();
-        for (cid, entry) in connections.iter_mut() {
+        for (&cid, entry) in connections.iter_mut() {
             if entry.last_rx.elapsed() >= idle_timeout {
-                expired.push(cid.clone());
+                expired.push(cid);
                 continue;
             }
             if entry.last_tx.elapsed() >= entry.keepalive_interval {
@@ -2454,13 +2452,13 @@ fn run_worker(
             if let Some(entry) = connections.remove(&cid) {
                 ip_to_cid.remove(&entry.tunnel_ip);
                 let _ = removal_tx.try_send(RemovedConnection {
-                    cid: cid.clone(),
+                    cid,
                     tunnel_ip: entry.tunnel_ip,
                 });
                 info!(
                     worker = worker_id,
                     tunnel_ip = %entry.tunnel_ip,
-                    cid = %hex::encode(&cid),
+                    cid = %hex::encode(cid.to_ne_bytes()),
                     "connection idle timeout, removed"
                 );
             }

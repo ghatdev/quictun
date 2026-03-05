@@ -1119,6 +1119,7 @@ dependencies = [
  "quictun-crypto",
  "quictun-quic",
  "quinn-proto",
+ "rustc-hash",
  "rustls",
  "tracing",
 ]
@@ -1138,6 +1139,7 @@ dependencies = [
  "quictun-quic",
  "quictun-tun",
  "quinn-proto",
+ "rustc-hash",
  "socket2 0.5.10",
  "tracing",
  "tun-rs",

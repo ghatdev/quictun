@@ -338,6 +338,17 @@ fn parse_frames_in_place(
     })
 }
 
+/// Convert an 8-byte CID slice to a u64 key for fast HashMap lookup.
+///
+/// CIDs are always 8 bytes in quictun. For shorter slices, zero-pads.
+#[inline(always)]
+pub fn cid_to_u64(cid: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let len = cid.len().min(8);
+    buf[..len].copy_from_slice(&cid[..len]);
+    u64::from_ne_bytes(buf)
+}
+
 /// Coarse monotonic timestamp in nanoseconds (shared epoch across threads).
 pub fn coarse_now_ns() -> u64 {
     use std::sync::OnceLock;

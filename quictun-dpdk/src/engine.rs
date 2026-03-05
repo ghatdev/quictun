@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::BytesMut;
+use rustc_hash::FxHashMap;
 
 use crate::dispatch::ConnectionEntry;
 use crate::ffi;
@@ -14,6 +14,7 @@ use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{self, BUF_SIZE, DriveResult, MultiQuicState, QuicState};
 use quictun_core::peer::{self, PeerConfig};
+use quictun_quic::cid_to_u64;
 use quictun_quic::local::LocalConnectionState;
 
 /// Maximum burst size for rx/tx.
@@ -74,7 +75,9 @@ pub struct ResolvedHandshake {
     pub tunnel_ip: Ipv4Addr,
     pub remote_addr: SocketAddr,
     pub remote_mac: [u8; 6],
-    pub cid: Vec<u8>,
+    pub cid: u64,
+    /// Raw CID bytes for logging.
+    pub cid_bytes: Vec<u8>,
 }
 
 /// Extract shared handshake completion logic: identify peer, resolve MAC, build CID.
@@ -117,7 +120,8 @@ pub fn resolve_completed_handshake(
         .or(identity.remote_mac)
         .unwrap_or([0xff; 6]);
 
-    let cid = conn_state.local_cid().to_vec();
+    let cid_bytes = conn_state.local_cid().to_vec();
+    let cid = cid_to_u64(&cid_bytes);
 
     Some(ResolvedHandshake {
         conn: conn_state,
@@ -125,6 +129,7 @@ pub fn resolve_completed_handshake(
         remote_addr: hs.remote_addr,
         remote_mac,
         cid,
+        cid_bytes,
     })
 }
 
@@ -161,10 +166,10 @@ pub fn run(
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
 
-    // Connection table: CID → connection entry.
-    let mut connections: HashMap<Vec<u8>, ConnectionEntry> = HashMap::new();
-    // Tunnel IP → CID (for inner RX routing).
-    let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
+    // Connection table: CID (as u64) → connection entry.
+    let mut connections: FxHashMap<u64, ConnectionEntry> = FxHashMap::default();
+    // Tunnel IP → CID (as u64) for inner RX routing.
+    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
 
     // Stats.
     let mut rx_pkts: u64 = 0;
@@ -308,9 +313,9 @@ pub fn run(
                     if payload_len < 1 + CID_LEN {
                         continue;
                     }
-                    let cid_bytes = &data[payload_offset + 1..payload_offset + 1 + CID_LEN];
+                    let cid_key = cid_to_u64(&data[payload_offset + 1..payload_offset + 1 + CID_LEN]);
 
-                    let Some(entry) = connections.get_mut(cid_bytes) else {
+                    let Some(entry) = connections.get_mut(&cid_key) else {
                         decrypt_fail += 1;
                         continue;
                     };
@@ -465,8 +470,8 @@ pub fn run(
                     );
 
                     // Look up connection by dest IP, with single-connection default route.
-                    let entry = if let Some(cid) = ip_to_cid.get(&dst_ip) {
-                        connections.get_mut(cid.as_slice())
+                    let entry = if let Some(&cid) = ip_to_cid.get(&dst_ip) {
+                        connections.get_mut(&cid)
                     } else if connections.len() == 1 {
                         connections.values_mut().next()
                     } else {
@@ -627,9 +632,9 @@ pub fn run(
                     };
 
                     // Insert into connection table.
-                    ip_to_cid.insert(resolved.tunnel_ip, resolved.cid.clone());
+                    ip_to_cid.insert(resolved.tunnel_ip, resolved.cid);
                     connections.insert(
-                        resolved.cid.clone(),
+                        resolved.cid,
                         ConnectionEntry {
                             conn: resolved.conn,
                             tunnel_ip: resolved.tunnel_ip,
@@ -641,7 +646,7 @@ pub fn run(
                     tracing::info!(
                         tunnel_ip = %resolved.tunnel_ip,
                         remote = %resolved.remote_addr,
-                        cid = %hex::encode(&resolved.cid),
+                        cid = %hex::encode(&resolved.cid_bytes),
                         "connection established"
                     );
                 }
@@ -1539,10 +1544,10 @@ pub fn run_worker(
     checksum_mode: ChecksumMode,
     core_id: usize,
 ) -> Result<()> {
-    // Per-connection state: CID → connection entry.
-    let mut connections: HashMap<Vec<u8>, ConnectionEntry> = HashMap::new();
-    // IP → CID lookup for inner RX routing.
-    let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
+    // Per-connection state: CID (as u64) → connection entry.
+    let mut connections: FxHashMap<u64, ConnectionEntry> = FxHashMap::default();
+    // IP → CID (as u64) lookup for inner RX routing.
+    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
 
     let mut ip_id: u16 = (core_id as u16).wrapping_mul(10000);
 
@@ -1584,14 +1589,15 @@ pub fn run_worker(
                         remote_addr,
                         remote_mac,
                     } => {
-                        let cid = conn.local_cid().to_vec();
+                        let cid_bytes = conn.local_cid().to_vec();
+                        let cid = cid_to_u64(&cid_bytes);
                         tracing::info!(
                             core = core_id,
                             tunnel_ip = %tunnel_ip,
-                            cid = %hex::encode(&cid),
+                            cid = %hex::encode(&cid_bytes),
                             "worker: added connection"
                         );
-                        ip_to_cid.insert(tunnel_ip, cid.clone());
+                        ip_to_cid.insert(tunnel_ip, cid);
                         connections.insert(
                             cid,
                             ConnectionEntry {
@@ -1603,8 +1609,8 @@ pub fn run_worker(
                         );
                     }
                     ControlMessage::RemoveConnection { cid } => {
-                        let key: &[u8] = cid.as_ref();
-                        if let Some(entry) = connections.remove(key) {
+                        let key = cid_to_u64(cid.as_ref());
+                        if let Some(entry) = connections.remove(&key) {
                             ip_to_cid.remove(&entry.tunnel_ip);
                             tracing::info!(
                                 core = core_id,
@@ -1644,9 +1650,9 @@ pub fn run_worker(
             if payload_len < 1 + cid_len {
                 continue;
             }
-            let cid_bytes = &data[payload_offset + 1..payload_offset + 1 + cid_len];
+            let cid_key = cid_to_u64(&data[payload_offset + 1..payload_offset + 1 + cid_len]);
 
-            let Some(entry) = connections.get_mut(cid_bytes) else {
+            let Some(entry) = connections.get_mut(&cid_key) else {
                 decrypt_fail += 1;
                 continue;
             };
@@ -1718,10 +1724,10 @@ pub fn run_worker(
                 data[ETH_HLEN + 18],
                 data[ETH_HLEN + 19],
             );
-            let Some(cid) = ip_to_cid.get(&dst_ip) else {
+            let Some(&cid) = ip_to_cid.get(&dst_ip) else {
                 continue;
             };
-            let Some(entry) = connections.get_mut(cid.as_slice()) else {
+            let Some(entry) = connections.get_mut(&cid) else {
                 continue;
             };
 

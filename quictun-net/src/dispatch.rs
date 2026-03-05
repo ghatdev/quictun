@@ -4,10 +4,12 @@
 //! worker threads via crossbeam-channel. Workers own `LocalConnectionState`
 //! per connection — no Mutex/atomics in the data plane.
 
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
+
+use quictun_quic::cid_to_u64;
+use rustc_hash::FxHashMap;
 
 use crossbeam_channel::{Receiver, Sender};
 use quictun_quic::local::LocalConnectionState;
@@ -43,7 +45,7 @@ pub enum ControlMessage {
 
 /// Removed connection notification from worker to dispatcher.
 pub struct RemovedConnection {
-    pub cid: Vec<u8>,
+    pub cid: u64,
     pub tunnel_ip: Ipv4Addr,
 }
 
@@ -80,10 +82,10 @@ impl WorkerChannels {
 ///
 /// Single-owner on thread 0 — no locking needed for lookups.
 pub struct NetDispatchTable {
-    /// CID → worker_id (outer RX routing by destination connection ID).
-    connections: HashMap<Vec<u8>, usize>,
+    /// CID (as u64) → worker_id (outer RX routing by destination connection ID).
+    connections: FxHashMap<u64, usize>,
     /// Tunnel IP → list of worker IDs (flow-hash when multiple connections share same IP).
-    routes: HashMap<Ipv4Addr, Vec<usize>>,
+    routes: FxHashMap<Ipv4Addr, Vec<usize>>,
     /// Connection count per worker (for least-loaded assignment).
     worker_load: Vec<u32>,
 }
@@ -92,15 +94,15 @@ impl NetDispatchTable {
     /// Create a dispatch table for `n_workers` worker threads.
     pub fn new(n_workers: usize) -> Self {
         Self {
-            connections: HashMap::new(),
-            routes: HashMap::new(),
+            connections: FxHashMap::default(),
+            routes: FxHashMap::default(),
             worker_load: vec![0; n_workers],
         }
     }
 
     /// Register a CID → worker mapping.
     pub fn register_cid(&mut self, cid: &[u8], worker_id: usize) {
-        self.connections.insert(cid.to_vec(), worker_id);
+        self.connections.insert(cid_to_u64(cid), worker_id);
         self.worker_load[worker_id] += 1;
     }
 
@@ -113,7 +115,7 @@ impl NetDispatchTable {
     /// Look up worker by CID.
     #[inline]
     pub fn lookup_cid(&self, cid: &[u8]) -> Option<usize> {
-        self.connections.get(cid).copied()
+        self.connections.get(&cid_to_u64(cid)).copied()
     }
 
     /// Look up worker(s) by destination IP.
@@ -140,8 +142,8 @@ impl NetDispatchTable {
     }
 
     /// Unregister a connection (CID + remove worker from IP route list).
-    pub fn unregister(&mut self, cid: &[u8], tunnel_ip: Ipv4Addr) {
-        if let Some(worker_id) = self.connections.remove(cid) {
+    pub fn unregister(&mut self, cid: u64, tunnel_ip: Ipv4Addr) {
+        if let Some(worker_id) = self.connections.remove(&cid) {
             self.worker_load[worker_id] = self.worker_load[worker_id].saturating_sub(1);
             // Remove this worker from the IP route list.
             if let Some(workers) = self.routes.get_mut(&tunnel_ip) {
@@ -249,13 +251,13 @@ mod tests {
         assert_eq!(workers, &[0, 1, 2]);
 
         // Unregister worker 1 — should leave [0, 2].
-        table.unregister(b"cid1", ip);
+        table.unregister(cid_to_u64(b"cid1"), ip);
         let workers = table.lookup_ip(ip).unwrap();
         assert_eq!(workers, &[0, 2]);
 
         // Unregister all — route should be removed.
-        table.unregister(b"cid0", ip);
-        table.unregister(b"cid2", ip);
+        table.unregister(cid_to_u64(b"cid0"), ip);
+        table.unregister(cid_to_u64(b"cid2"), ip);
         assert!(table.lookup_ip(ip).is_none());
     }
 
