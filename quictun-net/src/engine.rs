@@ -1031,8 +1031,17 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
         client_config,
     } = setup
     {
-        multi_state.connect(client_config, remote_addr)?;
+        // Open one connection per worker for load distribution.
+        for _ in 0..n_workers {
+            multi_state.connect(client_config.clone(), remote_addr)?;
+        }
         drain_transmits(&udp_socket, &mut multi_state)?;
+        info!(
+            connections = n_workers,
+            "connector: initiated {} connection(s) to {}",
+            n_workers,
+            remote_addr,
+        );
     }
 
     // 3. Create per-worker channels.
@@ -1410,7 +1419,13 @@ fn dispatch_tun_rx(
                 }
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                if let Some(worker_id) = dispatch_table.lookup_ip(dest_ip) {
+                if let Some(workers) = dispatch_table.lookup_ip(dest_ip) {
+                    let worker_id = if workers.len() == 1 {
+                        workers[0]
+                    } else {
+                        let hash = crate::dispatch::flow_hash_5tuple(&packet[..n]);
+                        workers[(hash as usize) % workers.len()]
+                    };
                     let pkt = InnerPacket {
                         data: packet[..n].to_vec(),
                     };
