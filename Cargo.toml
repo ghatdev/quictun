@@ -4,7 +4,6 @@ members = [
     "quictun-crypto",
     "quictun-core",
     "quictun-tun",
-    "quictun-uring",
     "quictun-dpdk",
     "quictun-quic",
     "quictun-net",
@@ -21,7 +20,6 @@ license = "Apache-2.0"
 quictun-crypto = { path = "quictun-crypto" }
 quictun-core = { path = "quictun-core" }
 quictun-tun = { path = "quictun-tun" }
-quictun-uring = { path = "quictun-uring" }
 quictun-dpdk = { path = "quictun-dpdk" }
 quictun-net = { path = "quictun-net" }
 
@@ -72,8 +70,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TUN device
 tun-rs = { version = "2", features = ["async"] }
 
-# io_uring (Linux only)
-io-uring = "0.7"
 libc = "0.2"
 crossbeam-channel = "0.5"
 

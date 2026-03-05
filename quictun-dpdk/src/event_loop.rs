@@ -17,7 +17,7 @@ use crate::shared::MultiQuicState;
 use crate::veth::VethPair;
 use quictun_core::peer::PeerConfig;
 
-/// QUIC endpoint setup (connector or listener), same pattern as quictun-uring.
+/// QUIC endpoint setup (connector or listener).
 pub enum EndpointSetup {
     Connector {
         remote_addr: SocketAddr,

@@ -9,7 +9,7 @@ A high-performance VPN tunnel over QUIC + TLS 1.3 with Raw Public Keys (RFC 7250
 - **Firewall traversal** — UDP 443, indistinguishable from HTTP/3 to DPI.
 - **Connection migration** — QUIC handles network transitions (Wi-Fi → cellular) without re-handshake.
 - **Low overhead** — 20-byte per-packet overhead with zero-length CIDs (vs. WireGuard's 32 bytes).
-- **Multiple data planes** — tokio (production), io_uring, DPDK kernel-bypass.
+- **Multiple data planes** — mio (default), DPDK kernel-bypass.
 
 ## Quick Start
 
@@ -35,7 +35,6 @@ quictun-crypto/   Key generation, serialization, RPK TLS verifiers
 quictun-core/     Config, QUIC builders, TUN↔QUIC forwarding loops
 quictun-tun/      Async TUN device wrapper (tun-rs v2)
 quictun-cli/      CLI binary (genkey, pubkey, up, down)
-quictun-uring/    [Experimental] Linux io_uring data plane
 quictun-dpdk/     [Experimental] Linux DPDK kernel-bypass data plane
 ```
 
@@ -46,11 +45,10 @@ quictun-dpdk/     [Experimental] Linux DPDK kernel-bypass data plane
 | **DPDK virtio-user** | quictun-quic + DPDK 25.11 | **14.0 Gbps** | Experimental |
 | **DPDK AF_XDP** | quinn-proto + DPDK 25.11 | **4.86 Gbps** | Experimental |
 | **tokio + offload** | quinn + tokio + TUN GSO/GRO | 2.59 Gbps | Production |
-| **io_uring** | quinn-proto + io_uring | 820 Mbps | Experimental |
 
 Kernel WireGuard reference: 1.53 Gbps (same hardware, same NIC). DPDK is **9.1x faster** than kernel WireGuard. All benchmarks on AMD Ryzen 9700X (AES-NI, AVX-512), Proxmox KVM VM, virtio NIC, host CPU passthrough. Raw NIC: 26.8 Gbps.
 
-See [quictun-dpdk/README.md](quictun-dpdk/README.md) and [quictun-uring/README.md](quictun-uring/README.md) for details.
+See [quictun-dpdk/README.md](quictun-dpdk/README.md) for details.
 
 ## Config
 
@@ -82,11 +80,9 @@ quictun down <config>           # Bring down tunnel
 | `--cc {bbr,cubic,newreno,none}` | Congestion control algorithm (default: bbr) |
 | `--serial` | Serial forwarding mode (vs parallel) |
 | `--queues N` | TUN multi-queue count |
-| `--iouring` | io_uring data plane (Linux) |
 | `--dpdk [tap\|xdp\|virtio]` | DPDK data plane (Linux) |
 | `--offload` | TUN GSO/GRO offload (Linux, kernel 6.2+) |
 | `--dpdk-cores N` | Multi-core DPDK engines |
-| `--zero-copy` | SendZc zero-copy UDP (io_uring) |
 | `--no-udp-checksum` | Skip UDP checksum (benchmarking) |
 
 ## Stack

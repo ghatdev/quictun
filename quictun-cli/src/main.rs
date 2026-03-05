@@ -39,24 +39,6 @@ enum Command {
         /// QUIC send window in bytes (0 = default)
         #[arg(long, default_value = "0")]
         send_window: u64,
-        /// Use io_uring data plane (Linux only)
-        #[arg(long)]
-        iouring: bool,
-        /// Enable SQPOLL for kernel-side SQ polling (kernel 5.13+ supports unprivileged)
-        #[arg(long)]
-        sqpoll: bool,
-        /// Starting CPU for SQPOLL kernel threads (core i → CPU sqpoll_cpu+i; default: iouring_cores)
-        #[arg(long)]
-        sqpoll_cpu: Option<u32>,
-        /// Number of io_uring cores (each gets own TUN queue + QUIC connection)
-        #[arg(long, default_value = "1")]
-        iouring_cores: usize,
-        /// Buffer pool size per thread (max 1024, io_uring only)
-        #[arg(long, default_value = "1024")]
-        pool_size: usize,
-        /// Use SendZc for zero-copy UDP sends (kernel 6.0+, io_uring only)
-        #[arg(long)]
-        zero_copy: bool,
         /// Initial RTT estimate in ms (default: 333). Set lower for LAN (e.g. 5).
         #[arg(long, default_value = "0")]
         initial_rtt: u64,
@@ -119,12 +101,6 @@ fn main() -> anyhow::Result<()> {
             recv_buf,
             send_buf,
             send_window,
-            iouring,
-            sqpoll,
-            sqpoll_cpu,
-            iouring_cores,
-            pool_size,
-            zero_copy,
             initial_rtt,
             pin_mtu,
             dpdk,
@@ -145,12 +121,6 @@ fn main() -> anyhow::Result<()> {
             recv_buf,
             send_buf,
             send_window,
-            iouring,
-            sqpoll,
-            sqpoll_cpu,
-            iouring_cores,
-            pool_size,
-            zero_copy,
             initial_rtt,
             pin_mtu,
             dpdk,

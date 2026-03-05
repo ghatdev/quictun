@@ -626,17 +626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.7.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd7bddefd0a8833b88a4b68f90dae22c7450d11b354198baee3874fd811b344"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1067,7 +1056,6 @@ dependencies = [
  "quictun-dpdk",
  "quictun-net",
  "quictun-tun",
- "quictun-uring",
  "socket2 0.5.10",
  "tracing",
  "tracing-subscriber",
@@ -1173,24 +1161,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tun-rs",
-]
-
-[[package]]
-name = "quictun-uring"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "crossbeam-channel",
- "hex",
- "io-uring",
- "ipnet",
- "libc",
- "quictun-core",
- "quictun-crypto",
- "quictun-quic",
- "quinn-proto",
- "tracing",
 ]
 
 [[package]]
