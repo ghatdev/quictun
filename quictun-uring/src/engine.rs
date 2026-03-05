@@ -362,7 +362,6 @@ fn run_data_plane(
     submit_shutdown_read(&mut ring, &mut shutdown_buf)?;
 
     // Pre-allocate reusable buffers.
-    let mut scratch = BytesMut::with_capacity(MAX_PACKET);
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
 
     // Arm keepalive timer.
@@ -404,58 +403,53 @@ fn run_data_plane(
                         .expect("RecvMulti CQE must have BUFFER_SELECT flag");
                     let len = result as usize;
 
-                    // Copy recv data to mutable buffer for in-place decrypt.
+                    // Copy to stack buffer for in-place decrypt (provided bufs are read-only).
                     let src = recv_pool.slice(bid, len);
-                    let mut pkt_buf = vec![0u8; len];
-                    pkt_buf.copy_from_slice(src);
+                    let mut pkt_buf = [0u8; BUF_SIZE];
+                    pkt_buf[..len].copy_from_slice(src);
 
-                    // Re-provide consumed buffer.
+                    // Re-provide consumed buffer immediately.
                     reprovide_buffer(&mut ring, &recv_pool, bid)?;
 
-                    if len == 0 {
+                    if len == 0 || pkt_buf[0] & 0x80 != 0 {
                         if !cqueue::more(flags) {
                             multishot_active = false;
                         }
                         continue;
                     }
 
-                    if pkt_buf[0] & 0x80 != 0 {
-                        // Long header — handshake packet after data plane started.
-                        // Ignore (single-client, handshake complete).
-                        debug!("engine: ignoring long header packet in data plane");
-                    } else {
-                        // Short header — fast path decrypt.
-                        if cid_len > 0 && len > cid_len {
-                            match entry.conn.decrypt_packet_with_buf(&mut pkt_buf, &mut scratch) {
-                                Ok(decrypted) => {
-                                    entry.last_rx = Instant::now();
-                                    if let Some(ref ack) = decrypted.ack {
-                                        entry.conn.process_ack(ack);
-                                    }
-                                    if decrypted.close_received {
-                                        info!("engine: peer sent CONNECTION_CLOSE");
-                                        signal_shutdown(shutdown_fd);
-                                        return Ok(());
-                                    }
-                                    for datagram in &decrypted.datagrams {
-                                        stats_datagrams += 1;
-                                        if datagram.len() < 20 {
-                                            continue;
-                                        }
-                                        let src_ip = Ipv4Addr::new(
-                                            datagram[12], datagram[13],
-                                            datagram[14], datagram[15],
-                                        );
-                                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
-                                            debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
-                                            continue;
-                                        }
-                                        submit_tun_write(&mut ring, &mut pool, datagram)?;
-                                    }
+                    // Short header — fast path: decrypt in-place (zero heap alloc).
+                    if cid_len > 0 && len > cid_len {
+                        match entry.conn.decrypt_packet_in_place(&mut pkt_buf[..len]) {
+                            Ok(decrypted) => {
+                                entry.last_rx = Instant::now();
+                                if let Some(ref ack) = decrypted.ack {
+                                    entry.conn.process_ack(ack);
                                 }
-                                Err(e) => {
-                                    debug!(error = %e, "decrypt failed, dropping");
+                                if decrypted.close_received {
+                                    info!("engine: peer sent CONNECTION_CLOSE");
+                                    signal_shutdown(shutdown_fd);
+                                    return Ok(());
                                 }
+                                for range in &decrypted.datagrams {
+                                    stats_datagrams += 1;
+                                    let datagram = &pkt_buf[range.clone()];
+                                    if datagram.len() < 20 {
+                                        continue;
+                                    }
+                                    let src_ip = Ipv4Addr::new(
+                                        datagram[12], datagram[13],
+                                        datagram[14], datagram[15],
+                                    );
+                                    if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                        debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                        continue;
+                                    }
+                                    submit_tun_write(&mut ring, &mut pool, datagram)?;
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "decrypt failed, dropping");
                             }
                         }
                     }
