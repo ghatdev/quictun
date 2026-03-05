@@ -18,7 +18,9 @@ use mio::{Events, Interest, Poll, Token};
 use quinn_proto::ServerConfig;
 use tracing::{debug, info, warn};
 
-use crate::dispatch::{InnerPacket, NetDispatchTable, NewConnection, OuterPacket, WorkerChannels};
+use crate::dispatch::{
+    InnerPacket, NetDispatchTable, NewConnection, OuterPacket, RemovedConnection, WorkerChannels,
+};
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::{BUF_SIZE, MultiQuicState};
 use quictun_quic::local::LocalConnectionState;
@@ -1006,7 +1008,10 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
         .map(|_| Arc::new(WorkerChannels::new()))
         .collect();
 
-    // 4. Create dispatch table.
+    // 4. Worker→dispatcher removal channel (all workers share the sender).
+    let (removal_tx, removal_rx) = crossbeam_channel::bounded::<RemovedConnection>(256);
+
+    // 5. Create dispatch table.
     let mut dispatch_table = NetDispatchTable::new(n_workers);
 
     // 5. Shutdown signal.
@@ -1030,6 +1035,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
         for i in 0..n_workers {
             let channels = Arc::clone(&worker_channels[i]);
             let shutdown_flag = Arc::clone(&shutdown);
+            let removal = removal_tx.clone();
             let udp_fd = worker_udp_fds[i];
             let tun_fd = worker_tun_fds[i];
             let idle_timeout = config.idle_timeout;
@@ -1043,6 +1049,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
                     tun_fd,
                     idle_timeout,
                     cid_len,
+                    removal,
                     shutdown_flag,
                 )
             });
@@ -1050,6 +1057,9 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
         }
 
         // Run dispatcher on this thread (thread 0).
+        // Drop dispatcher's copy of removal_tx so channel closes when all workers exit.
+        drop(removal_tx);
+
         let dispatch_result = run_dispatcher(
             &udp_socket,
             &tun,
@@ -1059,6 +1069,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
             &worker_channels,
             &config,
             &shutdown,
+            &removal_rx,
         );
 
         // Signal shutdown to workers.
@@ -1103,6 +1114,7 @@ fn run_dispatcher(
     worker_channels: &[Arc<WorkerChannels>],
     config: &NetConfig,
     _shutdown: &AtomicBool,
+    removal_rx: &crossbeam_channel::Receiver<RemovedConnection>,
 ) -> Result<RunResult> {
     // Register with mio.
     let mut poll = Poll::new().context("failed to create mio::Poll")?;
@@ -1218,6 +1230,16 @@ fn run_dispatcher(
             worker_channels,
             &config.peers,
         )?;
+
+        // ── Drain removal notifications from workers ─────────────────
+        while let Ok(removed) = removal_rx.try_recv() {
+            dispatch_table.unregister(&removed.cid, removed.tunnel_ip);
+            debug!(
+                cid = %hex::encode(&removed.cid),
+                tunnel_ip = %removed.tunnel_ip,
+                "dispatcher unregistered connection"
+            );
+        }
     }
 }
 
@@ -1447,6 +1469,7 @@ fn dispatch_drive_handshakes(
 const WORKER_DRAIN_BATCH: usize = 64;
 
 /// Worker loop: owns connections, processes packets from dispatcher channels.
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     worker_id: usize,
     channels: Arc<WorkerChannels>,
@@ -1454,6 +1477,7 @@ fn run_worker(
     tun_fd: RawFd,
     idle_timeout: Duration,
     cid_len: usize,
+    removal_tx: crossbeam_channel::Sender<RemovedConnection>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!(worker = worker_id, "worker started");
@@ -1639,6 +1663,10 @@ fn run_worker(
         for cid in expired {
             if let Some(entry) = connections.remove(&cid) {
                 ip_to_cid.remove(&entry.tunnel_ip);
+                let _ = removal_tx.try_send(RemovedConnection {
+                    cid: cid.clone(),
+                    tunnel_ip: entry.tunnel_ip,
+                });
                 info!(
                     worker = worker_id,
                     tunnel_ip = %entry.tunnel_ip,

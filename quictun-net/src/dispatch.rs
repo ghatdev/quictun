@@ -34,6 +34,12 @@ pub struct NewConnection {
     pub keepalive_interval: Duration,
 }
 
+/// Removed connection notification from worker to dispatcher.
+pub struct RemovedConnection {
+    pub cid: Vec<u8>,
+    pub tunnel_ip: Ipv4Addr,
+}
+
 /// Per-worker channel bundle.
 pub struct WorkerChannels {
     pub outer_tx: Sender<OuterPacket>,
