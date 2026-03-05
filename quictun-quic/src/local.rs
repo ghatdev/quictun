@@ -343,11 +343,11 @@ fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec
         return ranges;
     }
 
-    // Which word (and bit within it) does largest_pn map to?
-    let largest_offset = largest_pn - base;
-    let mut word_idx = (largest_offset >> 6) as usize;
+    // Use absolute PN indexing (consistent with Bitmap::set/test/advance_base).
+    let largest_word = (largest_pn >> 6) as usize;
+    let base_word = (base >> 6) as usize;
     // Mask: only bits <= largest_pn's bit position in the top word.
-    let top_bit = (largest_offset & 63) as u32;
+    let top_bit = (largest_pn & 63) as u32;
     let top_mask = if top_bit == 63 {
         u64::MAX
     } else {
@@ -360,11 +360,9 @@ fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec
     let mut range_end = 0u64;
     let mut first_word = true;
 
-    // Number of words to scan.
-    let total_words = word_idx + 1;
+    let mut word_idx = largest_word;
 
-    for _i in 0..total_words {
-        // Bitmap uses offset-based indexing: word_idx = (offset >> 6) & mask.
+    loop {
         let actual_word_idx = word_idx & (bitmap_word_count - 1);
         let mut word = bitmap.word_at(actual_word_idx);
 
@@ -374,7 +372,8 @@ fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec
             first_word = false;
         }
 
-        let word_base_pn = base + (word_idx as u64) * 64;
+        // With absolute indexing, word_base_pn = word_idx * 64.
+        let word_base_pn = (word_idx as u64) * 64;
 
         if word == u64::MAX {
             // All 64 bits set — extend or start range.
@@ -419,7 +418,7 @@ fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec
             }
         }
 
-        if word_idx == 0 {
+        if word_idx <= base_word {
             break;
         }
         word_idx -= 1;
@@ -427,8 +426,7 @@ fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec
 
     // Close final range.
     if in_range && ranges.len() < MAX_ACK_RANGES {
-        let final_start = base;
-        ranges.push(final_start..range_end);
+        ranges.push(base..range_end);
     }
 
     ranges

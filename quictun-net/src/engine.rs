@@ -763,7 +763,9 @@ fn flush_gso_sync(
             gso_segment_size as u16,
             remote_addr,
         ) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                return Ok(());
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Wait for socket to become writable via poll(2).
                 wait_writable(udp.as_raw_fd());
@@ -1008,7 +1010,7 @@ fn tun_write_sync(tun: &tun_rs::SyncDevice, buf: &[u8]) {
             debug!("TUN write would block, dropping packet");
         }
         Err(e) => {
-            warn!(error = %e, "TUN write failed");
+            debug!(error = %e, "TUN write failed");
         }
     }
 }

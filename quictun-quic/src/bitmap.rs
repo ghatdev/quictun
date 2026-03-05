@@ -38,8 +38,8 @@ impl Bitmap {
         if offset >= BITMAP_CAPACITY {
             return false;
         }
-        let word_idx = (offset >> 6) as usize & (BITMAP_WORDS - 1);
-        let bit_idx = offset & 63;
+        let word_idx = (pn >> 6) as usize & (BITMAP_WORDS - 1);
+        let bit_idx = pn & 63;
         self.words[word_idx] |= 1u64 << bit_idx;
         true
     }
@@ -53,8 +53,8 @@ impl Bitmap {
         if offset >= BITMAP_CAPACITY {
             return false;
         }
-        let word_idx = (offset >> 6) as usize & (BITMAP_WORDS - 1);
-        let bit_idx = offset & 63;
+        let word_idx = (pn >> 6) as usize & (BITMAP_WORDS - 1);
+        let bit_idx = pn & 63;
         (self.words[word_idx] >> bit_idx) & 1 == 1
     }
 
@@ -133,6 +133,28 @@ mod tests {
 
         bm.set(BITMAP_CAPACITY + 1);
         assert!(!bm.test(BITMAP_CAPACITY + 2));
+    }
+
+    /// Regression: advance_base must not leave stale bits that cause
+    /// false duplicate detection for future PNs.
+    #[test]
+    fn bitmap_no_false_duplicates_after_advance() {
+        let mut bm = Bitmap::new();
+        // Receive PNs 0-999.
+        for pn in 0..1000 {
+            bm.set(pn);
+        }
+        // Advance base (simulates ACK range generation advancing the window).
+        bm.advance_base(744);
+        // PNs 1448+ should NOT be flagged as duplicates.
+        // With the old offset-based bug, PN 1448 mapped to the same word[11]
+        // as old PN 704, causing false "duplicate packet number".
+        for pn in 1000..2000 {
+            assert!(
+                !bm.test(pn),
+                "PN {pn} falsely detected as duplicate after advance_base(744)"
+            );
+        }
     }
 
     #[test]
