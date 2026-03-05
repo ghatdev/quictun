@@ -29,9 +29,15 @@ pub enum KeyError {
 }
 
 /// A P-256 ECDSA private key in PKCS#8 DER format.
-#[derive(Clone)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct PrivateKey {
     pkcs8_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateKey(****)")
+    }
 }
 
 impl PrivateKey {

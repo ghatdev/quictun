@@ -1,4 +1,4 @@
-use std::os::fd::{OwnedFd, AsRawFd, RawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -9,24 +9,22 @@ use anyhow::{Context, Result};
 /// We convert that to a timerfd deadline so io_uring can wake us when it fires.
 pub struct Timer {
     fd: OwnedFd,
-    /// Monotonic reference point for converting `Instant` → kernel timespec.
-    epoch: Instant,
 }
 
 impl Timer {
     pub fn new() -> Result<Self> {
         // SAFETY: timerfd_create is a safe syscall.
         let raw = unsafe {
-            libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+            )
         };
         if raw < 0 {
             return Err(std::io::Error::last_os_error()).context("timerfd_create failed");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        Ok(Self {
-            fd,
-            epoch: Instant::now(),
-        })
+        Ok(Self { fd })
     }
 
     /// Arm the timer to fire at `deadline`.
@@ -51,8 +49,10 @@ impl Timer {
         };
 
         // SAFETY: valid fd and spec.
-        unsafe {
-            libc::timerfd_settime(self.fd.as_raw_fd(), 0, &spec, std::ptr::null_mut());
+        let ret =
+            unsafe { libc::timerfd_settime(self.fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+        if ret < 0 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), "timerfd_settime (arm) failed");
         }
     }
 
@@ -70,8 +70,10 @@ impl Timer {
         };
 
         // SAFETY: valid fd and zeroed spec disarms the timer.
-        unsafe {
-            libc::timerfd_settime(self.fd.as_raw_fd(), 0, &spec, std::ptr::null_mut());
+        let ret =
+            unsafe { libc::timerfd_settime(self.fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+        if ret < 0 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), "timerfd_settime (disarm) failed");
         }
     }
 

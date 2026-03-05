@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::BytesMut;
 
+use crate::dispatch::ConnectionEntry;
 use crate::ffi;
 use crate::mbuf::Mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
-use crate::dispatch::ConnectionEntry;
-use crate::shared::{self, DriveResult, MultiQuicState, QuicState, BUF_SIZE};
+use crate::shared::{self, BUF_SIZE, DriveResult, MultiQuicState, QuicState};
 use quictun_core::peer::{self, PeerConfig};
 use quictun_quic::local::LocalConnectionState;
 
@@ -224,8 +224,7 @@ pub fn run(
 
         inner_tx_mbufs.clear();
 
-        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-            [std::ptr::null_mut(); BURST_SIZE];
+        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
 
         let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
 
@@ -265,9 +264,8 @@ pub fn run(
                         {
                             RxAction::Skip
                         } else {
-                            let payload_offset = unsafe {
-                                udp.payload.as_ptr().offset_from(data.as_ptr()) as usize
-                            };
+                            let payload_offset =
+                                unsafe { udp.payload.as_ptr().offset_from(data.as_ptr()) as usize };
                             let payload_len = udp.payload.len();
                             let first_byte = udp.payload[0];
                             if first_byte & 0x80 == 0 {
@@ -363,7 +361,11 @@ pub fn run(
 
                     let remote_addr = SocketAddr::new(src_ip.into(), src_port);
                     let responses = multi_state.handle_incoming(
-                        now, remote_addr, ecn, quic_data, &mut response_buf,
+                        now,
+                        remote_addr,
+                        ecn,
+                        quic_data,
+                        &mut response_buf,
                     );
 
                     // Send responses back to the sender.
@@ -425,7 +427,11 @@ pub fn run(
 
         let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
-        let inner_burst = if !connections.is_empty() { INNER_BURST_SIZE } else { BURST_SIZE as u16 };
+        let inner_burst = if !connections.is_empty() {
+            INNER_BURST_SIZE
+        } else {
+            BURST_SIZE as u16
+        };
         let nb = if !pending_outer_tx.is_empty() {
             0 // back-pressure: drain pending mbufs first
         } else {
@@ -471,12 +477,19 @@ pub fn run(
                         continue;
                     };
 
-                    let max_quic_len = 1 + entry.conn.remote_cid().len() + 4
-                        + 1 + ip_payload.len() + entry.conn.tag_len();
+                    let max_quic_len = 1
+                        + entry.conn.remote_cid().len()
+                        + 4
+                        + 1
+                        + ip_payload.len()
+                        + entry.conn.tag_len();
                     let max_frame_len = net::HEADER_SIZE + max_quic_len;
+                    let Ok(max_frame_len_u16) = u16::try_from(max_frame_len) else {
+                        continue;
+                    };
 
                     if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
-                        if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
+                        if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
                             match entry.conn.encrypt_datagram(
                                 ip_payload,
                                 None,
@@ -503,8 +516,12 @@ pub fn run(
                                     );
                                     tx_mbuf.truncate(actual_len as u16);
                                     match checksum_mode {
-                                        ChecksumMode::HardwareUdpOnly => tx_mbuf.set_tx_udp_checksum_offload(),
-                                        ChecksumMode::HardwareFull => tx_mbuf.set_tx_full_checksum_offload(),
+                                        ChecksumMode::HardwareUdpOnly => {
+                                            tx_mbuf.set_tx_udp_checksum_offload()
+                                        }
+                                        ChecksumMode::HardwareFull => {
+                                            tx_mbuf.set_tx_full_checksum_offload()
+                                        }
                                         _ => {}
                                     }
                                     outer_tx_mbufs.push(tx_mbuf.into_raw());
@@ -520,7 +537,9 @@ pub fn run(
                     // ARP: reply to requests with our inner port MAC.
                     if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
                         if arp.is_request {
-                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
+                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12]
+                                .try_into()
+                                .expect("eth_hdr always 14 bytes");
                             let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
                             if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
                                 if reply_mbuf.write_packet(&reply).is_ok() {
@@ -553,9 +572,7 @@ pub fn run(
                     }
                     pending_outer_tx.truncate(64);
                 }
-                let unsent: Vec<_> = pending_outer_tx[sent as usize..].to_vec();
-                pending_outer_tx.clear();
-                pending_outer_tx.extend(unsent);
+                pending_outer_tx.drain(..sent as usize);
             } else {
                 pending_outer_tx.clear();
             }
@@ -603,9 +620,9 @@ pub fn run(
                         checksum_mode,
                     );
 
-                    let Some(resolved) = resolve_completed_handshake(
-                        &hs, conn_state, peers, identity, arp_table,
-                    ) else {
+                    let Some(resolved) =
+                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                    else {
                         continue;
                     };
 
@@ -649,7 +666,13 @@ pub fn run(
         }
 
         // Send pending raw frames (ARP replies, stateless QUIC responses).
-        send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+        send_raw_frames(
+            outer_port_id,
+            queue_id,
+            mempool,
+            &mut pending_frames,
+            &mut tx_pkts,
+        )?;
 
         // ── Refresh `now` when traffic is present ─────────────────────
         // During handshake: refreshed unconditionally at loop top (quinn-proto needs it).
@@ -861,8 +884,16 @@ pub fn run_handshake_only(
 
     // If connector, drain initial handshake transmits.
     drain_and_send(
-        state, Instant::now(), outer_port_id, queue_id, mempool,
-        identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+        state,
+        Instant::now(),
+        outer_port_id,
+        queue_id,
+        mempool,
+        identity,
+        arp_table,
+        &mut transmit_buf,
+        &mut tx_pkts,
+        &mut ip_id,
         checksum_mode,
     )?;
 
@@ -876,8 +907,7 @@ pub fn run_handshake_only(
         let now = Instant::now();
 
         // RX burst: process ARP + QUIC long headers
-        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-            [std::ptr::null_mut(); BURST_SIZE];
+        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
         let nb_rx = port::rx_burst(outer_port_id, queue_id, &mut rx_mbufs, BURST_SIZE as u16);
 
         for i in 0..nb_rx as usize {
@@ -915,9 +945,14 @@ pub fn run_handshake_only(
                         rx_buf.extend_from_slice(udp.payload);
                         let quic_data = rx_buf.split();
                         let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
-                        if let Some(event) =
-                            state.endpoint.handle(now, remote_addr, None, udp.ecn, quic_data, &mut response_buf)
-                        {
+                        if let Some(event) = state.endpoint.handle(
+                            now,
+                            remote_addr,
+                            None,
+                            udp.ecn,
+                            quic_data,
+                            &mut response_buf,
+                        ) {
                             let responses =
                                 shared::handle_datagram_event(state, event, &mut response_buf);
                             for (len, buf) in responses {
@@ -927,11 +962,17 @@ pub fn run_handshake_only(
                                     .unwrap_or([0xff; 6]);
                                 ip_id = ip_id.wrapping_add(1);
                                 let frame_len = net::build_udp_packet(
-                                    &identity.local_mac, &dst_mac,
-                                    identity.local_ip, identity.remote_ip,
-                                    identity.local_port, identity.remote_port,
-                                    &buf[..len], &mut pkt_buf,
-                                    0, ip_id, checksum_mode,
+                                    &identity.local_mac,
+                                    &dst_mac,
+                                    identity.local_ip,
+                                    identity.remote_ip,
+                                    identity.local_port,
+                                    identity.remote_port,
+                                    &buf[..len],
+                                    &mut pkt_buf,
+                                    0,
+                                    ip_id,
+                                    checksum_mode,
                                 );
                                 pending_frames.push(pkt_buf[..frame_len].to_vec());
                             }
@@ -949,7 +990,8 @@ pub fn run_handshake_only(
                         );
                     }
                     if arp.is_request && arp.target_ip == identity.local_ip {
-                        let reply = net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
+                        let reply =
+                            net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
                         pending_frames.push(reply);
                     }
                 }
@@ -968,7 +1010,9 @@ pub fn run_handshake_only(
                 if ethertype == 0x0806 {
                     if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
                         if arp.is_request {
-                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
+                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12]
+                                .try_into()
+                                .expect("eth_hdr always 14 bytes");
                             let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
                             if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
                                 if reply_mbuf.write_packet(&reply).is_ok() {
@@ -1001,11 +1045,25 @@ pub fn run_handshake_only(
                 tracing::info!("handshake complete (quictun-quic data plane ready)");
                 // Drain any remaining handshake transmits
                 drain_and_send(
-                    state, now, outer_port_id, queue_id, mempool,
-                    identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+                    state,
+                    now,
+                    outer_port_id,
+                    queue_id,
+                    mempool,
+                    identity,
+                    arp_table,
+                    &mut transmit_buf,
+                    &mut tx_pkts,
+                    &mut ip_id,
                     checksum_mode,
                 )?;
-                send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+                send_raw_frames(
+                    outer_port_id,
+                    queue_id,
+                    mempool,
+                    &mut pending_frames,
+                    &mut tx_pkts,
+                )?;
                 return Ok(HandshakeResult {
                     conn_state: cs,
                     identity: identity.clone(),
@@ -1020,12 +1078,26 @@ pub fn run_handshake_only(
         }
 
         drain_and_send(
-            state, now, outer_port_id, queue_id, mempool,
-            identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+            state,
+            now,
+            outer_port_id,
+            queue_id,
+            mempool,
+            identity,
+            arp_table,
+            &mut transmit_buf,
+            &mut tx_pkts,
+            &mut ip_id,
             checksum_mode,
         )?;
 
-        send_raw_frames(outer_port_id, queue_id, mempool, &mut pending_frames, &mut tx_pkts)?;
+        send_raw_frames(
+            outer_port_id,
+            queue_id,
+            mempool,
+            &mut pending_frames,
+            &mut tx_pkts,
+        )?;
 
         deadline = if let Some(conn) = state.connection.as_mut() {
             conn.poll_timeout().unwrap_or(now + Duration::from_secs(1))
@@ -1037,8 +1109,8 @@ pub fn run_handshake_only(
 
 // ── Multi-client dispatcher + worker loops ──────────────────────────────
 
-use quinn_proto::ConnectionId;
 use crate::dispatch::{ControlMessage, DpdkDispatchTable, WorkerRings};
+use quinn_proto::ConnectionId;
 
 /// Run the multi-client dispatcher on core 0.
 ///
@@ -1078,8 +1150,7 @@ pub fn run_dispatcher(
     let mut now = Instant::now();
 
     // Reusable mbuf array for collecting inner TX from workers.
-    let mut inner_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] =
-        [std::ptr::null_mut(); BURST_SIZE];
+    let mut inner_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
 
     tracing::info!(n_workers = workers.len(), "dispatcher started on core 0");
 
@@ -1094,8 +1165,7 @@ pub fn run_dispatcher(
 
         // ── 1. Outer RX burst → dispatch by CID or feed handshake ──
 
-        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-            [std::ptr::null_mut(); BURST_SIZE];
+        let mut rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
         let nb_rx = port::rx_burst(outer_port_id, 0, &mut rx_mbufs, BURST_SIZE as u16);
 
         for i in 0..nb_rx as usize {
@@ -1142,7 +1212,10 @@ pub fn run_dispatcher(
                         let remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
 
                         let responses = multi_state.handle_incoming(
-                            now, remote_addr, udp.ecn, quic_data,
+                            now,
+                            remote_addr,
+                            udp.ecn,
+                            quic_data,
                             &mut response_buf,
                         );
 
@@ -1153,11 +1226,17 @@ pub fn run_dispatcher(
                                 .unwrap_or([0xff; 6]);
                             ip_id = ip_id.wrapping_add(1);
                             let frame_len = net::build_udp_packet(
-                                &identity.local_mac, &dst_mac,
-                                identity.local_ip, udp.src_ip,
-                                identity.local_port, udp.src_port,
-                                &buf[..len], &mut pkt_buf,
-                                0, ip_id, checksum_mode,
+                                &identity.local_mac,
+                                &dst_mac,
+                                identity.local_ip,
+                                udp.src_ip,
+                                identity.local_port,
+                                udp.src_port,
+                                &buf[..len],
+                                &mut pkt_buf,
+                                0,
+                                ip_id,
+                                checksum_mode,
                             );
                             pending_frames.push(pkt_buf[..frame_len].to_vec());
                         }
@@ -1166,7 +1245,8 @@ pub fn run_dispatcher(
                 Some(ParsedPacket::Arp(arp)) => {
                     arp_table.learn(arp.sender_ip, arp.sender_mac);
                     if arp.is_request && arp.target_ip == identity.local_ip {
-                        let reply = net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
+                        let reply =
+                            net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
                         pending_frames.push(reply);
                     }
                 }
@@ -1215,7 +1295,9 @@ pub fn run_dispatcher(
                     // Inner ARP reply.
                     if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
                         if arp.is_request {
-                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12].try_into().unwrap();
+                            let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12]
+                                .try_into()
+                                .expect("eth_hdr always 14 bytes");
                             let reply = net::build_arp_reply(&arp, inner_mac, arp.target_ip);
                             if let Ok(mut reply_mbuf) = Mbuf::alloc(mempool) {
                                 if reply_mbuf.write_packet(&reply).is_ok() {
@@ -1244,7 +1326,12 @@ pub fn run_dispatcher(
             let nb = worker.inner_tx.dequeue_burst(&mut inner_tx_collect);
             if nb > 0 {
                 had_work = true;
-                let sent = port::tx_burst(inner.port_id, 0, &mut inner_tx_collect[..nb as usize], nb as u16);
+                let sent = port::tx_burst(
+                    inner.port_id,
+                    0,
+                    &mut inner_tx_collect[..nb as usize],
+                    nb as u16,
+                );
                 for j in sent as usize..nb as usize {
                     unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_collect[j]) };
                 }
@@ -1257,9 +1344,9 @@ pub fn run_dispatcher(
 
         for ch in drive_result.completed {
             if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                let Some(resolved) = resolve_completed_handshake(
-                    &hs, conn_state, peers, identity, arp_table,
-                ) else {
+                let Some(resolved) =
+                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                else {
                     continue;
                 };
 
@@ -1271,8 +1358,16 @@ pub fn run_dispatcher(
 
                 // Drain final handshake transmits.
                 drain_handshake_transmits(
-                    &mut hs.connection, now, outer_port_id, 0, mempool,
-                    identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+                    &mut hs.connection,
+                    now,
+                    outer_port_id,
+                    0,
+                    mempool,
+                    identity,
+                    arp_table,
+                    &mut transmit_buf,
+                    &mut tx_pkts,
+                    &mut ip_id,
                     checksum_mode,
                 );
 
@@ -1298,8 +1393,16 @@ pub fn run_dispatcher(
         // Drain handshake transmits for in-progress connections.
         for hs in multi_state.handshakes.values_mut() {
             drain_handshake_transmits(
-                &mut hs.connection, now, outer_port_id, 0, mempool,
-                identity, arp_table, &mut transmit_buf, &mut tx_pkts, &mut ip_id,
+                &mut hs.connection,
+                now,
+                outer_port_id,
+                0,
+                mempool,
+                identity,
+                arp_table,
+                &mut transmit_buf,
+                &mut tx_pkts,
+                &mut ip_id,
                 checksum_mode,
             );
         }
@@ -1320,7 +1423,9 @@ pub fn run_dispatcher(
         // ── Stats ──
         if now.duration_since(last_stats).as_secs() >= 2 {
             tracing::info!(
-                rx_pkts, tx_pkts, dispatch_miss,
+                rx_pkts,
+                tx_pkts,
+                dispatch_miss,
                 handshakes = multi_state.handshakes.len(),
                 "dispatcher stats"
             );
@@ -1386,10 +1491,17 @@ fn drain_handshake_transmits(
             if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
                 if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
                     net::build_udp_packet(
-                        &identity.local_mac, &dst_mac,
-                        identity.local_ip, dst_ip,
-                        identity.local_port, dst_port,
-                        chunk, buf, 0, *ip_id, checksum_mode,
+                        &identity.local_mac,
+                        &dst_mac,
+                        identity.local_ip,
+                        dst_ip,
+                        identity.local_port,
+                        dst_port,
+                        chunk,
+                        buf,
+                        0,
+                        *ip_id,
+                        checksum_mode,
                     );
                     match checksum_mode {
                         ChecksumMode::HardwareUdpOnly => mbuf.set_tx_udp_checksum_offload(),
@@ -1447,10 +1559,8 @@ pub fn run_worker(
     let mut now = Instant::now();
 
     // Reusable mbuf arrays.
-    let mut outer_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-        [std::ptr::null_mut(); BURST_SIZE];
-    let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
-        [std::ptr::null_mut(); BURST_SIZE];
+    let mut outer_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
+    let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
     let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
     let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
 
@@ -1468,7 +1578,12 @@ pub fn run_worker(
         if let Ok(mut ctrl) = rings.control.try_lock() {
             for msg in ctrl.drain(..) {
                 match msg {
-                    ControlMessage::AddConnection { conn, tunnel_ip, remote_addr, remote_mac } => {
+                    ControlMessage::AddConnection {
+                        conn,
+                        tunnel_ip,
+                        remote_addr,
+                        remote_mac,
+                    } => {
                         let cid = conn.local_cid().to_vec();
                         tracing::info!(
                             core = core_id,
@@ -1477,12 +1592,15 @@ pub fn run_worker(
                             "worker: added connection"
                         );
                         ip_to_cid.insert(tunnel_ip, cid.clone());
-                        connections.insert(cid, ConnectionEntry {
-                            conn,
-                            tunnel_ip,
-                            remote_addr,
-                            remote_mac,
-                        });
+                        connections.insert(
+                            cid,
+                            ConnectionEntry {
+                                conn,
+                                tunnel_ip,
+                                remote_addr,
+                                remote_mac,
+                            },
+                        );
                     }
                     ControlMessage::RemoveConnection { cid } => {
                         let key: &[u8] = cid.as_ref();
@@ -1517,9 +1635,8 @@ pub fn run_worker(
                 continue;
             }
 
-            let payload_offset = unsafe {
-                udp.payload.as_ptr().offset_from(data.as_ptr()) as usize
-            };
+            let payload_offset =
+                unsafe { udp.payload.as_ptr().offset_from(data.as_ptr()) as usize };
             let payload_len = udp.payload.len();
 
             // Extract CID to find connection.
@@ -1534,9 +1651,10 @@ pub fn run_worker(
                 continue;
             };
 
-            match entry.conn.decrypt_packet_in_place(
-                &mut data[payload_offset..payload_offset + payload_len],
-            ) {
+            match entry
+                .conn
+                .decrypt_packet_in_place(&mut data[payload_offset..payload_offset + payload_len])
+            {
                 Ok(decrypted) => {
                     if let Some(ref ack) = decrypted.ack {
                         entry.conn.process_ack(ack);
@@ -1549,8 +1667,7 @@ pub fn run_worker(
                         if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
                             if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
                                 buf[..ETH_HLEN].copy_from_slice(&inner_eth_hdr.bytes);
-                                buf[ETH_HLEN..frame_len]
-                                    .copy_from_slice(&data[abs_start..abs_end]);
+                                buf[ETH_HLEN..frame_len].copy_from_slice(&data[abs_start..abs_end]);
                                 inner_tx_mbufs.push(out_mbuf.into_raw());
                             }
                         }
@@ -1596,8 +1713,10 @@ pub fn run_worker(
 
             // Find connection by dest IP.
             let dst_ip = Ipv4Addr::new(
-                data[ETH_HLEN + 16], data[ETH_HLEN + 17],
-                data[ETH_HLEN + 18], data[ETH_HLEN + 19],
+                data[ETH_HLEN + 16],
+                data[ETH_HLEN + 17],
+                data[ETH_HLEN + 18],
+                data[ETH_HLEN + 19],
             );
             let Some(cid) = ip_to_cid.get(&dst_ip) else {
                 continue;
@@ -1606,27 +1725,43 @@ pub fn run_worker(
                 continue;
             };
 
-            let max_quic_len = 1 + entry.conn.remote_cid().len() + 4
-                + 1 + ip_payload.len() + entry.conn.tag_len();
+            let max_quic_len =
+                1 + entry.conn.remote_cid().len() + 4 + 1 + ip_payload.len() + entry.conn.tag_len();
             let max_frame_len = net::HEADER_SIZE + max_quic_len;
+            let Ok(max_frame_len_u16) = u16::try_from(max_frame_len) else {
+                continue;
+            };
 
             if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
-                if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len as u16) {
+                if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
                     match entry.conn.encrypt_datagram(
-                        ip_payload, None, &mut buf[net::HEADER_SIZE..],
+                        ip_payload,
+                        None,
+                        &mut buf[net::HEADER_SIZE..],
                     ) {
                         Ok(result) => {
                             ip_id = ip_id.wrapping_add(1);
                             let actual_len = net::build_udp_packet_inplace(
-                                &identity.local_mac, &entry.remote_mac,
-                                identity.local_ip, identity.remote_ip,
-                                identity.local_port, entry.remote_addr.port(),
-                                result.len, buf, 0, ip_id, checksum_mode,
+                                &identity.local_mac,
+                                &entry.remote_mac,
+                                identity.local_ip,
+                                identity.remote_ip,
+                                identity.local_port,
+                                entry.remote_addr.port(),
+                                result.len,
+                                buf,
+                                0,
+                                ip_id,
+                                checksum_mode,
                             );
                             tx_mbuf.truncate(actual_len as u16);
                             match checksum_mode {
-                                ChecksumMode::HardwareUdpOnly => tx_mbuf.set_tx_udp_checksum_offload(),
-                                ChecksumMode::HardwareFull => tx_mbuf.set_tx_full_checksum_offload(),
+                                ChecksumMode::HardwareUdpOnly => {
+                                    tx_mbuf.set_tx_udp_checksum_offload()
+                                }
+                                ChecksumMode::HardwareFull => {
+                                    tx_mbuf.set_tx_full_checksum_offload()
+                                }
                                 _ => {}
                             }
                             outer_tx_mbufs.push(tx_mbuf.into_raw());
@@ -1660,7 +1795,10 @@ pub fn run_worker(
         if now.duration_since(last_stats).as_secs() >= 2 {
             tracing::info!(
                 core = core_id,
-                rx_pkts, tx_pkts, inner_rx, decrypt_fail,
+                rx_pkts,
+                tx_pkts,
+                inner_rx,
+                decrypt_fail,
                 connections = connections.len(),
                 "worker stats"
             );

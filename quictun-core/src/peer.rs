@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use ipnet::Ipv4Net;
 use quinn_proto::crypto;
 use tracing::info;
 
@@ -24,8 +25,15 @@ pub struct PeerConfig {
     pub spki_der: Vec<u8>,
     /// Tunnel IP assigned to this peer (first IP from `allowed_ips`).
     pub tunnel_ip: Ipv4Addr,
+    /// Networks this peer is allowed to send from.
+    pub allowed_ips: Vec<Ipv4Net>,
     /// Keepalive interval (used by tokio backend; DPDK can set to `None`).
     pub keepalive: Option<Duration>,
+}
+
+/// Check if an IP is within any of the allowed_ips networks.
+pub fn is_allowed_source(allowed_ips: &[Ipv4Net], src_ip: Ipv4Addr) -> bool {
+    allowed_ips.is_empty() || allowed_ips.iter().any(|net| net.contains(&src_ip))
 }
 
 /// Identify which peer connected by matching their certificate against known peers.
@@ -72,7 +80,10 @@ pub fn extract_1rtt_keys(conn: &mut quinn_proto::Connection) -> Option<Extracted
             break;
         }
     }
-    info!(key_generations = key_gens.len(), "pre-computed key update generations");
+    info!(
+        key_generations = key_gens.len(),
+        "pre-computed key update generations"
+    );
 
     Some(ExtractedKeys {
         keys,

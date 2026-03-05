@@ -71,7 +71,7 @@ async fn run_handshake_raw(
     let mut ch: Option<ConnectionHandle> = None;
     let mut remote_addr: SocketAddr = match setup {
         HandshakeSetup::Connector { remote_addr, .. } => *remote_addr,
-        HandshakeSetup::Listener { .. } => "0.0.0.0:0".parse().unwrap(),
+        HandshakeSetup::Listener { .. } => "0.0.0.0:0".parse().expect("valid literal address"),
     };
 
     if let HandshakeSetup::Connector {
@@ -87,7 +87,12 @@ async fn run_handshake_raw(
         connection = Some(new_conn);
         remote_addr = *addr;
         info!(remote = %addr, "QUIC connection initiated (handshake)");
-        drain_transmits(udp, connection.as_mut().unwrap(), remote_addr).await?;
+        drain_transmits(
+            udp,
+            connection.as_mut().expect("connection just set"),
+            remote_addr,
+        )
+        .await?;
     } else {
         info!(address = %local_addr, "listening for incoming connection (handshake)");
     }
@@ -123,8 +128,7 @@ async fn run_handshake_raw(
                 let mut data = BytesMut::new();
                 data.extend_from_slice(&recv_buf[..n]);
 
-                if let Some(event) =
-                    endpoint.handle(now, from, None, None, data, &mut response_buf)
+                if let Some(event) = endpoint.handle(now, from, None, None, data, &mut response_buf)
                 {
                     handle_datagram_event(
                         &mut endpoint,

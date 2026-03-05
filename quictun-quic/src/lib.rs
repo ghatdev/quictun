@@ -47,6 +47,7 @@ pub enum ParseError {
     UnexpectedFrameType(u8),
     CryptoError,
     NoKeysAvailable,
+    DuplicatePacket,
 }
 
 impl std::fmt::Display for ParseError {
@@ -58,6 +59,7 @@ impl std::fmt::Display for ParseError {
             Self::UnexpectedFrameType(t) => write!(f, "unexpected frame type 0x{t:02x}"),
             Self::CryptoError => write!(f, "AEAD decryption failed"),
             Self::NoKeysAvailable => write!(f, "no keys available"),
+            Self::DuplicatePacket => write!(f, "duplicate packet number"),
         }
     }
 }

@@ -99,7 +99,11 @@ impl BufferPool {
 
     /// Return a buffer to the free list.
     pub fn free(&mut self, idx: usize) {
-        debug_assert!(idx < self.size);
+        assert!(
+            idx < self.size,
+            "BufferPool::free: index {idx} out of bounds (size {})",
+            self.size
+        );
         self.free.push_back(idx);
     }
 
@@ -198,6 +202,11 @@ impl ProvidedPool {
 
     /// Raw pointer to buffer `bid` for SQE construction.
     pub fn ptr(&self, bid: u16) -> *mut u8 {
+        assert!(
+            (bid as usize) < self.size,
+            "ProvidedPool::ptr: bid {bid} out of bounds (size {})",
+            self.size
+        );
         unsafe { self.base_ptr.add(bid as usize * BUF_SIZE) }
     }
 
@@ -207,6 +216,11 @@ impl ProvidedPool {
     /// Caller must ensure the buffer was returned by the kernel (CQE reaped)
     /// and is not currently provided to the kernel.
     pub fn slice(&self, bid: u16, len: usize) -> &[u8] {
+        assert!(
+            (bid as usize) < self.size,
+            "ProvidedPool::slice: bid {bid} out of bounds (size {})",
+            self.size
+        );
         unsafe { std::slice::from_raw_parts(self.base_ptr.add(bid as usize * BUF_SIZE), len) }
     }
 

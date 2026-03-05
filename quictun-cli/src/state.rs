@@ -13,8 +13,23 @@ pub fn runtime_dir() -> PathBuf {
     }
 }
 
+fn validate_interface_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+    {
+        anyhow::bail!(
+            "invalid interface name: must not contain path separators, '..', or null bytes"
+        );
+    }
+    Ok(())
+}
+
 /// Write the current process PID to `<runtime_dir>/<name>.pid`.
 pub fn write_pid_file(name: &str) -> Result<PathBuf> {
+    validate_interface_name(name)?;
     let dir = runtime_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create runtime dir {}", dir.display()))?;
@@ -30,6 +45,7 @@ pub fn write_pid_file(name: &str) -> Result<PathBuf> {
 /// Read a PID from `<runtime_dir>/<name>.pid`. Returns `None` if the file
 /// does not exist.
 pub fn read_pid_file(name: &str) -> Result<Option<u32>> {
+    validate_interface_name(name)?;
     let path = runtime_dir().join(format!("{name}.pid"));
     match fs::read_to_string(&path) {
         Ok(contents) => {
@@ -51,6 +67,27 @@ pub fn remove_pid_file(name: &str) {
         && e.kind() != ErrorKind::NotFound
     {
         tracing::warn!(path = %path.display(), error = %e, "failed to remove PID file");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_interface_name_rejects_traversal() {
+        assert!(validate_interface_name("../etc/passwd").is_err());
+        assert!(validate_interface_name("foo/bar").is_err());
+        assert!(validate_interface_name("foo\\bar").is_err());
+        assert!(validate_interface_name("").is_err());
+        assert!(validate_interface_name("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn validate_interface_name_accepts_valid() {
+        assert!(validate_interface_name("quictun0").is_ok());
+        assert!(validate_interface_name("wg-tunnel").is_ok());
+        assert!(validate_interface_name("my.iface").is_ok());
     }
 }
 

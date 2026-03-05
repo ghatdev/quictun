@@ -33,6 +33,7 @@ pub enum ControlMessage {
     AddConnection {
         conn: LocalConnectionState,
         tunnel_ip: Ipv4Addr,
+        allowed_ips: Vec<ipnet::Ipv4Net>,
         remote_addr: SocketAddr,
         keepalive_interval: Duration,
     },

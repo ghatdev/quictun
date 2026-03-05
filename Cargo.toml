@@ -58,6 +58,9 @@ rustls-pemfile = "2"
 # Test utilities
 rcgen = "0.13"
 
+# Security
+zeroize = { version = "1", features = ["derive"] }
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

@@ -74,6 +74,7 @@ pub enum RunResult {
 struct ConnEntry {
     conn: LocalConnectionState,
     tunnel_ip: Ipv4Addr,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
     remote_addr: SocketAddr,
     keepalive_interval: Duration,
     last_tx: Instant,
@@ -338,19 +339,18 @@ fn create_signal_pipe() -> Result<(i32, i32)> {
     Ok((fds[0], fds[1]))
 }
 
-static mut SIGNAL_WRITE_FD: i32 = -1;
+static SIGNAL_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
-    let fd = unsafe { SIGNAL_WRITE_FD };
+    let fd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         unsafe { libc::write(fd, b"x".as_ptr() as *const libc::c_void, 1) };
     }
 }
 
 fn install_signal_handler(write_fd: i32) -> Result<()> {
+    SIGNAL_WRITE_FD.store(write_fd, Ordering::Release);
     unsafe {
-        SIGNAL_WRITE_FD = write_fd;
-
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = signal_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
@@ -488,7 +488,17 @@ fn handle_udp_rx_linux(
                         }
                         if !decrypted.close_received {
                             for datagram in &decrypted.datagrams {
-                                if datagram.is_empty() {
+                                if datagram.len() < 20 {
+                                    continue;
+                                }
+                                let src_ip = Ipv4Addr::new(
+                                    datagram[12],
+                                    datagram[13],
+                                    datagram[14],
+                                    datagram[15],
+                                );
+                                if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                    debug!(src = %src_ip, "dropping packet: source IP not in allowed_ips");
                                     continue;
                                 }
                                 tun_write_sync(tun, datagram);
@@ -553,35 +563,47 @@ fn handle_udp_rx(
                     // Short header → CID routing.
                     if cid_len > 0 && n > cid_len {
                         let cid_key: Vec<u8> = recv_buf[1..1 + cid_len].to_vec();
-                        let close_received =
-                            if let Some(entry) = connections.get_mut(cid_key.as_slice()) {
-                                match entry
-                                    .conn
-                                    .decrypt_packet_with_buf(&mut recv_buf[..n], scratch)
-                                {
-                                    Ok(decrypted) => {
-                                        entry.last_rx = Instant::now();
-                                        if let Some(ref ack) = decrypted.ack {
-                                            entry.conn.process_ack(ack);
-                                        }
-                                        if !decrypted.close_received {
-                                            for datagram in &decrypted.datagrams {
-                                                if datagram.is_empty() {
-                                                    continue;
-                                                }
-                                                tun_write_sync(tun, datagram);
+                        let close_received = if let Some(entry) =
+                            connections.get_mut(cid_key.as_slice())
+                        {
+                            match entry
+                                .conn
+                                .decrypt_packet_with_buf(&mut recv_buf[..n], scratch)
+                            {
+                                Ok(decrypted) => {
+                                    entry.last_rx = Instant::now();
+                                    if let Some(ref ack) = decrypted.ack {
+                                        entry.conn.process_ack(ack);
+                                    }
+                                    if !decrypted.close_received {
+                                        for datagram in &decrypted.datagrams {
+                                            if datagram.len() < 20 {
+                                                continue;
                                             }
+                                            let src_ip = Ipv4Addr::new(
+                                                datagram[12],
+                                                datagram[13],
+                                                datagram[14],
+                                                datagram[15],
+                                            );
+                                            if !peer::is_allowed_source(&entry.allowed_ips, src_ip)
+                                            {
+                                                debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                                continue;
+                                            }
+                                            tun_write_sync(tun, datagram);
                                         }
-                                        decrypted.close_received
                                     }
-                                    Err(e) => {
-                                        debug!(error = %e, "decrypt failed, dropping");
-                                        false
-                                    }
+                                    decrypted.close_received
                                 }
-                            } else {
-                                false
-                            };
+                                Err(e) => {
+                                    debug!(error = %e, "decrypt failed, dropping");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         if close_received && let Some(entry) = connections.remove(&cid_key) {
                             info!(
                                 tunnel_ip = %entry.tunnel_ip,
@@ -759,7 +781,10 @@ fn wait_writable(fd: i32) {
         events: libc::POLLOUT,
         revents: 0,
     };
-    unsafe { libc::poll(&mut pfd, 1, 5) }; // 5ms max
+    let ret = unsafe { libc::poll(&mut pfd, 1, 5) }; // 5ms max
+    if ret < 0 {
+        tracing::trace!(error = %io::Error::last_os_error(), "poll(POLLOUT) failed");
+    }
 }
 
 // ── TUN RX (non-Linux — per-packet send) ─────────────────────────────────
@@ -930,6 +955,7 @@ fn drive_handshakes(
         };
 
         let tunnel_ip = matched_peer.tunnel_ip;
+        let allowed_ips = matched_peer.allowed_ips.clone();
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
 
         let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
@@ -949,6 +975,7 @@ fn drive_handshakes(
             ConnEntry {
                 conn: conn_state,
                 tunnel_ip,
+                allowed_ips,
                 remote_addr: hs.remote_addr,
                 keepalive_interval,
                 last_tx: now_inst,
@@ -1038,9 +1065,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
         drain_transmits(&udp_socket, &mut multi_state)?;
         info!(
             connections = n_workers,
-            "connector: initiated {} connection(s) to {}",
-            n_workers,
-            remote_addr,
+            "connector: initiated {} connection(s) to {}", n_workers, remote_addr,
         );
     }
 
@@ -1484,6 +1509,7 @@ fn dispatch_drive_handshakes(
         };
 
         let tunnel_ip = matched_peer.tunnel_ip;
+        let allowed_ips = matched_peer.allowed_ips.clone();
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
         let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
 
@@ -1507,6 +1533,7 @@ fn dispatch_drive_handshakes(
             .push(ControlMessage::AddConnection {
                 conn: conn_state,
                 tunnel_ip,
+                allowed_ips,
                 remote_addr: hs.remote_addr,
                 keepalive_interval,
             });
@@ -1566,6 +1593,7 @@ fn run_worker(
                     ControlMessage::AddConnection {
                         conn,
                         tunnel_ip,
+                        allowed_ips,
                         remote_addr,
                         keepalive_interval,
                     } => {
@@ -1583,6 +1611,7 @@ fn run_worker(
                             ConnEntry {
                                 conn,
                                 tunnel_ip,
+                                allowed_ips,
                                 remote_addr,
                                 keepalive_interval,
                                 last_tx: now_inst,
@@ -1618,47 +1647,58 @@ fn run_worker(
                     }
                     let cid_key: Vec<u8> = pkt.data[1..1 + cid_len].to_vec();
 
-                    let close_received =
-                        if let Some(entry) = connections.get_mut(cid_key.as_slice()) {
-                            match entry
-                                .conn
-                                .decrypt_packet_with_buf(&mut pkt.data, &mut scratch)
-                            {
-                                Ok(decrypted) => {
-                                    entry.last_rx = Instant::now();
-                                    if let Some(ref ack) = decrypted.ack {
-                                        entry.conn.process_ack(ack);
-                                    }
-                                    if !decrypted.close_received {
-                                        for datagram in &decrypted.datagrams {
-                                            if datagram.is_empty() {
-                                                continue;
-                                            }
-                                            let ret = unsafe {
-                                                libc::write(
-                                                    tun_fd,
-                                                    datagram.as_ptr() as *const libc::c_void,
-                                                    datagram.len(),
-                                                )
-                                            };
-                                            if ret < 0 {
-                                                let err = io::Error::last_os_error();
-                                                if err.kind() != io::ErrorKind::WouldBlock {
-                                                    warn!(error = %err, "worker TUN write failed");
-                                                }
+                    let close_received = if let Some(entry) =
+                        connections.get_mut(cid_key.as_slice())
+                    {
+                        match entry
+                            .conn
+                            .decrypt_packet_with_buf(&mut pkt.data, &mut scratch)
+                        {
+                            Ok(decrypted) => {
+                                entry.last_rx = Instant::now();
+                                if let Some(ref ack) = decrypted.ack {
+                                    entry.conn.process_ack(ack);
+                                }
+                                if !decrypted.close_received {
+                                    for datagram in &decrypted.datagrams {
+                                        if datagram.len() < 20 {
+                                            continue;
+                                        }
+                                        let src_ip = Ipv4Addr::new(
+                                            datagram[12],
+                                            datagram[13],
+                                            datagram[14],
+                                            datagram[15],
+                                        );
+                                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                            debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                            continue;
+                                        }
+                                        let ret = unsafe {
+                                            libc::write(
+                                                tun_fd,
+                                                datagram.as_ptr() as *const libc::c_void,
+                                                datagram.len(),
+                                            )
+                                        };
+                                        if ret < 0 {
+                                            let err = io::Error::last_os_error();
+                                            if err.kind() != io::ErrorKind::WouldBlock {
+                                                warn!(error = %err, "worker TUN write failed");
                                             }
                                         }
                                     }
-                                    decrypted.close_received
                                 }
-                                Err(e) => {
-                                    debug!(error = %e, "worker decrypt failed, dropping");
-                                    false
-                                }
+                                decrypted.close_received
                             }
-                        } else {
-                            false
-                        };
+                            Err(e) => {
+                                debug!(error = %e, "worker decrypt failed, dropping");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     if close_received && let Some(entry) = connections.remove(&cid_key) {
                         ip_to_cid.remove(&entry.tunnel_ip);
                         let _ = removal_tx.try_send(RemovedConnection {

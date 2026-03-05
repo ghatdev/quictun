@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::ptr;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::ffi;
 
@@ -143,8 +143,7 @@ impl Mbuf {
         // SAFETY: self.raw is a valid mbuf; we set ol_flags and the l2/l3 length
         // bitfields that DPDK uses to locate the headers for offload computation.
         unsafe {
-            (*self.raw).ol_flags |= ffi::RTE_MBUF_F_TX_IPV4
-                | ffi::RTE_MBUF_F_TX_UDP_CKSUM;
+            (*self.raw).ol_flags |= ffi::RTE_MBUF_F_TX_IPV4 | ffi::RTE_MBUF_F_TX_UDP_CKSUM;
             (*self.raw).__bindgen_anon_3.__bindgen_anon_1.set_l2_len(14); // Ethernet
             (*self.raw).__bindgen_anon_3.__bindgen_anon_1.set_l3_len(20); // IPv4 (no options)
         }
@@ -182,6 +181,12 @@ impl Mbuf {
     ///
     /// Resets the mbuf, appends space, and copies `data` into it.
     pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() > u16::MAX as usize {
+            return Err(anyhow::anyhow!(
+                "packet too large for mbuf: {} bytes",
+                data.len()
+            ));
+        }
         self.reset();
         let ptr = self
             .append(data.len() as u16)

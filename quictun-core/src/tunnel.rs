@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -8,6 +9,8 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use quictun_tun::TunDevice;
+
+use crate::peer;
 
 /// Result of a forwarding loop iteration.
 #[derive(Debug)]
@@ -45,10 +48,14 @@ fn classify_send_error(e: quinn::SendDatagramError) -> TunnelResult {
 pub async fn run_forwarding_loop(
     connection: Connection,
     tun: &TunDevice,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
     mut shutdown: watch::Receiver<bool>,
 ) -> TunnelResult {
     let initial_max = connection.max_datagram_size().unwrap_or(1200);
-    tracing::info!(max_datagram_size = initial_max, "forwarding loop started (serial)");
+    tracing::info!(
+        max_datagram_size = initial_max,
+        "forwarding loop started (serial)"
+    );
 
     let mut buf = vec![0u8; 65535];
 
@@ -80,6 +87,13 @@ pub async fn run_forwarding_loop(
                     Err(e) => return classify_connection_error(e),
                 };
                 debug!(size = datagram.len(), "QUIC → TUN");
+                if datagram.len() >= 20 {
+                    let src_ip = Ipv4Addr::new(datagram[12], datagram[13], datagram[14], datagram[15]);
+                    if !peer::is_allowed_source(&allowed_ips, src_ip) {
+                        debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                        continue;
+                    }
+                }
                 if let Err(e) = tun.send(&datagram).await {
                     return TunnelResult::Fatal(e.into());
                 }
@@ -101,10 +115,14 @@ pub async fn run_forwarding_loop(
 pub async fn run_forwarding_loop_parallel(
     connection: Connection,
     tun: Arc<TunDevice>,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
     mut shutdown: watch::Receiver<bool>,
 ) -> TunnelResult {
     let initial_max = connection.max_datagram_size().unwrap_or(1200);
-    tracing::info!(max_datagram_size = initial_max, "forwarding loop started (parallel)");
+    tracing::info!(
+        max_datagram_size = initial_max,
+        "forwarding loop started (parallel)"
+    );
 
     let conn_tx = connection.clone();
     let tun_rx = tun.clone();
@@ -157,6 +175,13 @@ pub async fn run_forwarding_loop_parallel(
                 }
             };
             debug!(size = datagram.len(), "QUIC → TUN");
+            if datagram.len() >= 20 {
+                let src_ip = Ipv4Addr::new(datagram[12], datagram[13], datagram[14], datagram[15]);
+                if !peer::is_allowed_source(&allowed_ips, src_ip) {
+                    debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                    continue;
+                }
+            }
             if let Err(e) = tun_tx.send(&datagram).await {
                 tracing::error!(error = %e, "TUN send failed");
                 return TunnelResult::Fatal(e.into());
@@ -196,6 +221,7 @@ pub async fn run_forwarding_loop_parallel(
 pub async fn run_forwarding_loop_multiqueue(
     connection: Connection,
     tun_queues: Vec<Arc<TunDevice>>,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
     mut shutdown: watch::Receiver<bool>,
 ) -> TunnelResult {
     let n = tun_queues.len();
@@ -250,6 +276,7 @@ pub async fn run_forwarding_loop_multiqueue(
     for (i, tun_q) in tun_queues.iter().enumerate() {
         let conn = connection.clone();
         let tun = tun_q.clone();
+        let allowed = allowed_ips.clone();
         tasks.spawn(async move {
             loop {
                 let datagram = match conn.read_datagram().await {
@@ -260,6 +287,14 @@ pub async fn run_forwarding_loop_multiqueue(
                     }
                 };
                 debug!(queue = i, size = datagram.len(), "QUIC → TUN");
+                if datagram.len() >= 20 {
+                    let src_ip =
+                        Ipv4Addr::new(datagram[12], datagram[13], datagram[14], datagram[15]);
+                    if !peer::is_allowed_source(&allowed, src_ip) {
+                        debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                        continue;
+                    }
+                }
                 if let Err(e) = tun.send(&datagram).await {
                     tracing::error!(queue = i, error = %e, "TUN send failed");
                     return TunnelResult::Fatal(e.into());
@@ -295,6 +330,7 @@ pub async fn run_forwarding_loop_multiqueue(
 pub async fn run_forwarding_loop_offload(
     connection: Connection,
     tun: Arc<TunDevice>,
+    _allowed_ips: Vec<ipnet::Ipv4Net>,
     mut shutdown: watch::Receiver<bool>,
 ) -> TunnelResult {
     use quictun_tun::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -332,15 +368,12 @@ pub async fn run_forwarding_loop_offload(
                 if pkt_len > max {
                     warn!(
                         packet_size = pkt_len,
-                        max,
-                        "dropping oversized packet from TUN"
+                        max, "dropping oversized packet from TUN"
                     );
                     continue;
                 }
                 debug!(size = pkt_len, batch = n_pkts, "TUN → QUIC (offload)");
-                if let Err(e) =
-                    conn_tx.send_datagram(Bytes::copy_from_slice(&bufs[i][..pkt_len]))
-                {
+                if let Err(e) = conn_tx.send_datagram(Bytes::copy_from_slice(&bufs[i][..pkt_len])) {
                     tracing::error!(error = %e, "QUIC send failed");
                     return classify_send_error(e);
                 }
@@ -375,11 +408,7 @@ pub async fn run_forwarding_loop_offload(
 
             // Drain any immediately available datagrams up to batch size.
             while batch.len() < IDEAL_BATCH_SIZE {
-                match tokio::time::timeout(
-                    std::time::Duration::ZERO,
-                    conn_rx.read_datagram(),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::ZERO, conn_rx.read_datagram()).await
                 {
                     Ok(Ok(d)) => {
                         let mut buf = BytesMut::zeroed(VIRTIO_NET_HDR_LEN + d.len());

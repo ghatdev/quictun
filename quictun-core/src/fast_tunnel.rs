@@ -49,6 +49,7 @@ async fn tun_try_send(tun: &TunDevice, buf: &[u8]) -> std::io::Result<()> {
 struct ConnEntry {
     conn: LocalConnectionState,
     tunnel_ip: Ipv4Addr,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
     remote_addr: SocketAddr,
     keepalive_interval: Duration,
     last_tx: Instant,
@@ -81,8 +82,7 @@ pub async fn run_fast_loop_multi(
 ) -> TunnelResult {
     info!(
         peers = peers.len(),
-        cid_len,
-        "unified listener loop started"
+        cid_len, "unified listener loop started"
     );
 
     // Connection table: CID bytes → connection entry.
@@ -93,9 +93,7 @@ pub async fn run_fast_loop_multi(
     // Inline handshake state.
     let ep_config = {
         let mut cfg = EndpointConfig::default();
-        cfg.cid_generator(move || {
-            Box::new(quinn_proto::RandomConnectionIdGenerator::new(cid_len))
-        });
+        cfg.cid_generator(move || Box::new(quinn_proto::RandomConnectionIdGenerator::new(cid_len)));
         Arc::new(cfg)
     };
     let mut endpoint = Endpoint::new(ep_config, Some(server_config.clone()), true, None);
@@ -113,7 +111,10 @@ pub async fn run_fast_loop_multi(
     #[cfg(target_os = "linux")]
     let mut recv_lens = vec![0usize; crate::batch_io::BATCH_SIZE];
     #[cfg(target_os = "linux")]
-    let mut recv_addrs = vec![SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0); crate::batch_io::BATCH_SIZE];
+    let mut recv_addrs = vec![
+        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+        crate::batch_io::BATCH_SIZE
+    ];
 
     // Non-Linux: simple per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -204,10 +205,17 @@ pub async fn run_fast_loop_multi(
 
         // Drive handshakes after every select iteration.
         if let Some(result) = drive_handshakes(
-            udp, &mut endpoint, &mut handshakes,
-            &mut connections, &mut ip_to_cid, &peers,
-            &server_config, &mut response_buf,
-        ).await {
+            udp,
+            &mut endpoint,
+            &mut handshakes,
+            &mut connections,
+            &mut ip_to_cid,
+            &peers,
+            &server_config,
+            &mut response_buf,
+        )
+        .await
+        {
             return result;
         }
     }
@@ -222,7 +230,9 @@ fn compute_timeout(
     let mut min_timeout = Duration::from_secs(5);
 
     for entry in connections.values() {
-        let keepalive_remaining = entry.keepalive_interval.saturating_sub(entry.last_tx.elapsed());
+        let keepalive_remaining = entry
+            .keepalive_interval
+            .saturating_sub(entry.last_tx.elapsed());
         let idle_remaining = idle_timeout.saturating_sub(entry.last_rx.elapsed());
         min_timeout = min_timeout.min(keepalive_remaining).min(idle_remaining);
     }
@@ -258,7 +268,9 @@ async fn handle_tun_readable_linux(
         let mut packet = [0u8; 1500];
         match tun.try_recv(&mut packet) {
             Ok(n) => {
-                if n < 20 { continue; }
+                if n < 20 {
+                    continue;
+                }
 
                 // Extract dest IP from IPv4 header.
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
@@ -268,7 +280,7 @@ async fn handle_tun_readable_linux(
                     cid.clone()
                 } else if connections.len() == 1 {
                     // Single-connection default route.
-                    connections.keys().next().unwrap().clone()
+                    connections.keys().next().expect("checked len == 1").clone()
                 } else {
                     debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
                     continue;
@@ -276,13 +288,21 @@ async fn handle_tun_readable_linux(
 
                 // Check if we need to flush the current GSO batch (different connection).
                 if let Some(ref cur_cid) = current_cid {
-                    if *cur_cid != cid || gso_count >= max_segs || gso_pos + MAX_PACKET > gso_buf.len() {
+                    if *cur_cid != cid
+                        || gso_count >= max_segs
+                        || gso_pos + MAX_PACKET > gso_buf.len()
+                    {
                         // Flush current batch.
                         if gso_count > 0 {
                             if let Some(result) = flush_gso(
-                                udp, gso_buf, gso_pos, gso_segment_size,
-                                current_remote.unwrap(),
-                            ).await {
+                                udp,
+                                gso_buf,
+                                gso_pos,
+                                gso_segment_size,
+                                current_remote.expect("remote set when gso_count > 0"),
+                            )
+                            .await
+                            {
                                 return Some(result);
                             }
                             if let Some(entry) = connections.get_mut(cur_cid) {
@@ -324,7 +344,10 @@ async fn handle_tun_readable_linux(
                         } else {
                             // Odd-sized: send individually.
                             let odd_end = gso_pos + result.len;
-                            if let Err(e) = udp.send_to(&gso_buf[gso_pos..odd_end], entry.remote_addr).await {
+                            if let Err(e) = udp
+                                .send_to(&gso_buf[gso_pos..odd_end], entry.remote_addr)
+                                .await
+                            {
                                 return Some(TunnelResult::Fatal(e.into()));
                             }
                         }
@@ -342,9 +365,14 @@ async fn handle_tun_readable_linux(
     // Flush remaining GSO batch.
     if gso_count > 0 {
         if let Some(result) = flush_gso(
-            udp, gso_buf, gso_pos, gso_segment_size,
-            current_remote.unwrap(),
-        ).await {
+            udp,
+            gso_buf,
+            gso_pos,
+            gso_segment_size,
+            current_remote.expect("remote set when gso_count > 0"),
+        )
+        .await
+        {
             return Some(result);
         }
         if let Some(ref cid) = current_cid {
@@ -399,14 +427,16 @@ async fn handle_tun_readable_nonlinux(
         let mut packet = [0u8; 1500];
         match tun.try_recv(&mut packet) {
             Ok(n) => {
-                if n < 20 { continue; }
+                if n < 20 {
+                    continue;
+                }
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
                 let cid = if let Some(cid) = ip_to_cid.get(&dest_ip) {
                     cid.clone()
                 } else if connections.len() == 1 {
-                    connections.keys().next().unwrap().clone()
+                    connections.keys().next().expect("checked len == 1").clone()
                 } else {
                     continue;
                 };
@@ -421,13 +451,15 @@ async fn handle_tun_readable_nonlinux(
                 } else {
                     None
                 };
-                match entry.conn.encrypt_datagram(
-                    &packet[..n],
-                    ack_ranges.as_deref(),
-                    encrypt_buf,
-                ) {
+                match entry
+                    .conn
+                    .encrypt_datagram(&packet[..n], ack_ranges.as_deref(), encrypt_buf)
+                {
                     Ok(result) => {
-                        if let Err(e) = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr).await {
+                        if let Err(e) = udp
+                            .send_to(&encrypt_buf[..result.len], entry.remote_addr)
+                            .await
+                        {
                             return Some(TunnelResult::Fatal(e.into()));
                         }
                         entry.last_tx = Instant::now();
@@ -462,7 +494,11 @@ async fn handle_udp_readable_linux(
     response_buf: &mut Vec<u8>,
 ) -> Option<TunnelResult> {
     let n_msgs = match crate::batch_io::recvmmsg_batch(
-        udp, recv_bufs, recv_lens, recv_addrs, crate::batch_io::BATCH_SIZE,
+        udp,
+        recv_bufs,
+        recv_lens,
+        recv_addrs,
+        crate::batch_io::BATCH_SIZE,
     ) {
         Ok(n) => n,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
@@ -474,7 +510,9 @@ async fn handle_udp_readable_linux(
 
     for i in 0..n_msgs {
         let n = recv_lens[i];
-        if n == 0 { continue; }
+        if n == 0 {
+            continue;
+        }
         let first_byte = recv_bufs[i][0];
 
         if first_byte & 0x80 != 0 {
@@ -485,9 +523,15 @@ async fn handle_udp_readable_linux(
             let now = Instant::now();
             if let Some(event) = endpoint.handle(now, from, None, None, data, response_buf)
                 && let Some(result) = handle_endpoint_event(
-                    udp, endpoint, handshakes, server_config,
-                    event, from, response_buf,
-                ).await
+                    udp,
+                    endpoint,
+                    handshakes,
+                    server_config,
+                    event,
+                    from,
+                    response_buf,
+                )
+                .await
             {
                 return Some(result);
             }
@@ -495,18 +539,31 @@ async fn handle_udp_readable_linux(
         }
 
         // Short header → extract CID → decrypt.
-        if cid_len == 0 || n < 1 + cid_len { continue; }
+        if cid_len == 0 || n < 1 + cid_len {
+            continue;
+        }
         let cid_bytes = &recv_bufs[i][1..1 + cid_len];
 
         if let Some(entry) = connections.get_mut(cid_bytes) {
-            match entry.conn.decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch) {
+            match entry
+                .conn
+                .decrypt_packet_with_buf(&mut recv_bufs[i][..n], scratch)
+            {
                 Ok(decrypted) => {
                     entry.last_rx = Instant::now();
                     if let Some(ref ack) = decrypted.ack {
                         entry.conn.process_ack(ack);
                     }
                     for datagram in &decrypted.datagrams {
-                        if datagram.is_empty() { continue; }
+                        if datagram.len() < 20 {
+                            continue;
+                        }
+                        let src_ip =
+                            Ipv4Addr::new(datagram[12], datagram[13], datagram[14], datagram[15]);
+                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                            debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                            continue;
+                        }
                         if let Err(e) = tun_try_send(tun, datagram).await {
                             return Some(TunnelResult::Fatal(e.into()));
                         }
@@ -540,7 +597,9 @@ async fn handle_udp_readable_nonlinux(
     loop {
         match udp.try_recv_from(recv_buf) {
             Ok((n, from)) => {
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
 
                 if recv_buf[0] & 0x80 != 0 {
                     // Long header → handshake.
@@ -549,9 +608,15 @@ async fn handle_udp_readable_nonlinux(
                     let now = Instant::now();
                     if let Some(event) = endpoint.handle(now, from, None, None, data, response_buf)
                         && let Some(result) = handle_endpoint_event(
-                            udp, endpoint, handshakes, server_config,
-                            event, from, response_buf,
-                        ).await
+                            udp,
+                            endpoint,
+                            handshakes,
+                            server_config,
+                            event,
+                            from,
+                            response_buf,
+                        )
+                        .await
                     {
                         return Some(result);
                     }
@@ -560,14 +625,29 @@ async fn handle_udp_readable_nonlinux(
                     if cid_len > 0 && n > cid_len {
                         let cid_bytes = &recv_buf[1..1 + cid_len];
                         if let Some(entry) = connections.get_mut(cid_bytes) {
-                            match entry.conn.decrypt_packet_with_buf(&mut recv_buf[..n], scratch) {
+                            match entry
+                                .conn
+                                .decrypt_packet_with_buf(&mut recv_buf[..n], scratch)
+                            {
                                 Ok(decrypted) => {
                                     entry.last_rx = Instant::now();
                                     if let Some(ref ack) = decrypted.ack {
                                         entry.conn.process_ack(ack);
                                     }
                                     for datagram in &decrypted.datagrams {
-                                        if datagram.is_empty() { continue; }
+                                        if datagram.len() < 20 {
+                                            continue;
+                                        }
+                                        let src_ip = Ipv4Addr::new(
+                                            datagram[12],
+                                            datagram[13],
+                                            datagram[14],
+                                            datagram[15],
+                                        );
+                                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                            debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                            continue;
+                                        }
                                         if let Err(e) = tun_try_send(tun, datagram).await {
                                             return Some(TunnelResult::Fatal(e.into()));
                                         }
@@ -610,11 +690,14 @@ async fn handle_endpoint_event(
                         cid = %hex::encode(&local_cid[..]),
                         "accepted incoming handshake"
                     );
-                    handshakes.insert(ch, HandshakeEntry {
-                        connection: conn,
-                        remote_addr: remote,
-                        local_cid,
-                    });
+                    handshakes.insert(
+                        ch,
+                        HandshakeEntry {
+                            connection: conn,
+                            remote_addr: remote,
+                            local_cid,
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!(error = ?e.cause, "failed to accept connection");
@@ -674,7 +757,10 @@ async fn handle_timeouts(
             };
             match entry.conn.encrypt_datagram(&[], ack_ref, encrypt_buf) {
                 Ok(result) => {
-                    if let Err(e) = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr).await {
+                    if let Err(e) = udp
+                        .send_to(&encrypt_buf[..result.len], entry.remote_addr)
+                        .await
+                    {
                         return Some(TunnelResult::Fatal(e.into()));
                     }
                     entry.last_tx = Instant::now();
@@ -765,7 +851,9 @@ async fn drive_handshakes(
 
     // Promote completed handshakes to connections.
     for ch in completed {
-        let Some(mut hs) = handshakes.remove(&ch) else { continue };
+        let Some(mut hs) = handshakes.remove(&ch) else {
+            continue;
+        };
 
         let local_cid = hs.local_cid;
         let remote_cid = hs.connection.remote_cid();
@@ -778,7 +866,9 @@ async fn drive_handshakes(
             let Some(transmit) = hs.connection.poll_transmit(now, 1, &mut transmit_buf) else {
                 break;
             };
-            let _ = udp.send_to(&transmit_buf[..transmit.size], hs.remote_addr).await;
+            let _ = udp
+                .send_to(&transmit_buf[..transmit.size], hs.remote_addr)
+                .await;
         }
 
         // Identify peer by certificate.
@@ -790,6 +880,7 @@ async fn drive_handshakes(
             }
         };
         let tunnel_ip = matched_peer.tunnel_ip;
+        let allowed_ips = matched_peer.allowed_ips.clone();
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
 
         // Extract 1-RTT keys.
@@ -822,14 +913,18 @@ async fn drive_handshakes(
         );
 
         ip_to_cid.insert(tunnel_ip, cid_bytes.clone());
-        connections.insert(cid_bytes, ConnEntry {
-            conn,
-            tunnel_ip,
-            remote_addr: hs.remote_addr,
-            keepalive_interval,
-            last_tx: now_inst,
-            last_rx: now_inst,
-        });
+        connections.insert(
+            cid_bytes,
+            ConnEntry {
+                conn,
+                tunnel_ip,
+                allowed_ips,
+                remote_addr: hs.remote_addr,
+                keepalive_interval,
+                last_tx: now_inst,
+                last_rx: now_inst,
+            },
+        );
     }
 
     None
@@ -842,6 +937,7 @@ async fn drive_handshakes(
 /// No shared mutable state, no atomics, no cross-task coordination.
 /// Uses GSO send + recvmmsg batching on Linux for high throughput.
 /// Falls back to per-packet I/O on other platforms.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_fast_loop(
     mut conn: LocalConnectionState,
     udp: &UdpSocket,
@@ -849,6 +945,7 @@ pub async fn run_fast_loop(
     remote_addr: SocketAddr,
     idle_timeout: Duration,
     keepalive: Option<Duration>,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
     mut shutdown: watch::Receiver<bool>,
 ) -> TunnelResult {
     tracing::info!("fast forwarding loop started (single-task, LocalConnectionState)");
@@ -868,7 +965,10 @@ pub async fn run_fast_loop(
     #[cfg(target_os = "linux")]
     let mut recv_lens = vec![0usize; crate::batch_io::BATCH_SIZE];
     #[cfg(target_os = "linux")]
-    let mut recv_addrs = vec![SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0); crate::batch_io::BATCH_SIZE];
+    let mut recv_addrs = vec![
+        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+        crate::batch_io::BATCH_SIZE
+    ];
 
     // Non-Linux: simple per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -1067,7 +1167,14 @@ pub async fn run_fast_loop(
                                     conn.process_ack(ack);
                                 }
                                 for datagram in &decrypted.datagrams {
-                                    if datagram.is_empty() { continue; }
+                                    if datagram.len() < 20 { continue; }
+                                    let src_ip = Ipv4Addr::new(
+                                        datagram[12], datagram[13], datagram[14], datagram[15],
+                                    );
+                                    if !peer::is_allowed_source(&allowed_ips, src_ip) {
+                                        debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                        continue;
+                                    }
                                     if let Err(e) = tun_try_send(tun, datagram).await {
                                         return TunnelResult::Fatal(e.into());
                                     }
@@ -1095,7 +1202,14 @@ pub async fn run_fast_loop(
                                         conn.process_ack(ack);
                                     }
                                     for datagram in &decrypted.datagrams {
-                                        if datagram.is_empty() { continue; }
+                                        if datagram.len() < 20 { continue; }
+                                        let src_ip = Ipv4Addr::new(
+                                            datagram[12], datagram[13], datagram[14], datagram[15],
+                                        );
+                                        if !peer::is_allowed_source(&allowed_ips, src_ip) {
+                                            debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
+                                            continue;
+                                        }
                                         if let Err(e) = tun_try_send(tun, datagram).await {
                                             return TunnelResult::Fatal(e.into());
                                         }

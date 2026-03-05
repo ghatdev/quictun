@@ -44,6 +44,9 @@ pub struct LocalConnectionState {
     remote_cid: ConnectionId,
     local_cid_len: usize,
 
+    // Key exhaustion flag.
+    key_exhausted: bool,
+
     // TX state.
     pn_counter: u64,
     largest_acked: u64,
@@ -81,6 +84,7 @@ impl LocalConnectionState {
             key_phase: false,
             peer_key_phase: false,
             packets_since_key_update: 0,
+            key_exhausted: false,
             local_cid,
             remote_cid,
             local_cid_len: local_cid.len(),
@@ -111,6 +115,11 @@ impl LocalConnectionState {
         if hdr.key_phase != self.peer_key_phase {
             self.peer_key_phase = hdr.key_phase;
             self.handle_key_update_rx(hdr.key_phase);
+        }
+
+        // Reject duplicate packet numbers.
+        if self.received.test(hdr.pn) {
+            return Err(ParseError::DuplicatePacket);
         }
 
         let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
@@ -145,6 +154,11 @@ impl LocalConnectionState {
         if hdr.key_phase != self.peer_key_phase {
             self.peer_key_phase = hdr.key_phase;
             self.handle_key_update_rx(hdr.key_phase);
+        }
+
+        // Reject duplicate packet numbers.
+        if self.received.test(hdr.pn) {
+            return Err(ParseError::DuplicatePacket);
         }
 
         let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
@@ -281,6 +295,11 @@ impl LocalConnectionState {
         self.tag_len
     }
 
+    /// Returns `true` if keys are exhausted and the connection must be closed.
+    pub fn is_key_exhausted(&self) -> bool {
+        self.key_exhausted
+    }
+
     fn handle_key_update_rx(&mut self, new_phase: bool) {
         if let Some(new_rx) = self.pending_rx_key.take() {
             self.rx_packet_key = new_rx;
@@ -290,7 +309,8 @@ impl LocalConnectionState {
             self.tx_packet_key = new_tx;
             tracing::debug!("key update: rotated to new keys (peer-initiated)");
         } else {
-            warn!("key update requested but no pre-computed keys available");
+            self.key_exhausted = true;
+            warn!("key update: no pre-computed keys available, connection must be closed");
             return;
         }
         self.key_phase = new_phase;
@@ -305,7 +325,8 @@ impl LocalConnectionState {
             self.packets_since_key_update = 0;
             tracing::debug!("key update: TX rotated, awaiting peer response");
         } else {
-            warn!("key update: no pre-computed keys available, cannot rotate");
+            self.key_exhausted = true;
+            warn!("key update: no pre-computed keys available, connection must be closed");
         }
     }
 }

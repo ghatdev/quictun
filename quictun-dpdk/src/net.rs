@@ -123,7 +123,7 @@ pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket<'_>> {
         return None;
     }
 
-    let src_mac: [u8; 6] = data[6..12].try_into().unwrap();
+    let src_mac: [u8; 6] = data[6..12].try_into().expect("slice len checked above");
     let ethertype = u16::from_be_bytes([data[12], data[13]]);
 
     match ethertype {
@@ -200,7 +200,7 @@ fn parse_arp(data: &[u8], src_mac: [u8; 6]) -> Option<ParsedPacket<'_>> {
         return None;
     }
 
-    let sender_mac: [u8; 6] = arp[8..14].try_into().unwrap();
+    let sender_mac: [u8; 6] = arp[8..14].try_into().expect("slice len checked above");
     let sender_ip = Ipv4Addr::new(arp[14], arp[15], arp[16], arp[17]);
     // target MAC at [18..24]
     let target_ip = Ipv4Addr::new(arp[24], arp[25], arp[26], arp[27]);
@@ -373,11 +373,7 @@ pub fn build_udp_packet_inplace(
 /// Build an ARP reply Ethernet frame.
 ///
 /// Returns the complete frame as a `Vec<u8>`.
-pub fn build_arp_reply(
-    request: &ParsedArp,
-    local_mac: [u8; 6],
-    local_ip: Ipv4Addr,
-) -> Vec<u8> {
+pub fn build_arp_reply(request: &ParsedArp, local_mac: [u8; 6], local_ip: Ipv4Addr) -> Vec<u8> {
     let mut frame = vec![0u8; ETH_HLEN + ARP_PACKET_LEN];
 
     // Ethernet header.
@@ -403,11 +399,7 @@ pub fn build_arp_reply(
 /// Build an ARP request Ethernet frame.
 ///
 /// Used to resolve the peer's MAC before QUIC handshake.
-pub fn build_arp_request(
-    local_mac: [u8; 6],
-    local_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-) -> Vec<u8> {
+pub fn build_arp_request(local_mac: [u8; 6], local_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
     let mut frame = vec![0u8; ETH_HLEN + ARP_PACKET_LEN];
 
     // Ethernet header: broadcast.
@@ -473,7 +465,16 @@ mod tests {
 
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 0,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            4433,
+            5000,
+            payload,
+            &mut buf,
+            0,
+            0,
             ChecksumMode::Software,
         );
 
@@ -505,7 +506,16 @@ mod tests {
         // ECT(0) = 0b10 = 2
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, &mut buf, 0x02, 42,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            1000,
+            2000,
+            payload,
+            &mut buf,
+            0x02,
+            42,
             ChecksumMode::Software,
         );
 
@@ -519,7 +529,16 @@ mod tests {
 
         // CE = 0b11 = 3
         let len = build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, &mut buf, 0x03, 43,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            1000,
+            2000,
+            payload,
+            &mut buf,
+            0x03,
+            43,
             ChecksumMode::Software,
         );
         let parsed = parse_packet(&buf[..len]).expect("should parse");
@@ -541,7 +560,16 @@ mod tests {
 
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            4433,
+            5000,
+            payload,
+            &mut buf,
+            0,
+            1,
             ChecksumMode::Software,
         );
 
@@ -565,7 +593,16 @@ mod tests {
 
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            4433,
+            5000,
+            payload,
+            &mut buf,
+            0,
+            1,
             ChecksumMode::None,
         );
 
@@ -593,7 +630,16 @@ mod tests {
 
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         let len = build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 4433, 5000, payload, &mut buf, 0, 1,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            4433,
+            5000,
+            payload,
+            &mut buf,
+            0,
+            1,
             ChecksumMode::HardwareFull,
         );
 
@@ -625,7 +671,16 @@ mod tests {
 
         let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
         build_udp_packet(
-            &src_mac, &dst_mac, src_ip, dst_ip, 1000, 2000, payload, &mut buf, 0, 0x1234,
+            &src_mac,
+            &dst_mac,
+            src_ip,
+            dst_ip,
+            1000,
+            2000,
+            payload,
+            &mut buf,
+            0,
+            0x1234,
             ChecksumMode::Software,
         );
 

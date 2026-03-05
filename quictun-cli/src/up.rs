@@ -200,9 +200,16 @@ fn run_net(
                 .map(|net| net.addr())
                 .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
+            let allowed_ips: Vec<ipnet::Ipv4Net> = peer_cfg
+                .allowed_ips
+                .iter()
+                .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                .collect();
+
             quictun_core::peer::PeerConfig {
                 spki_der: pubkey.spki_der().to_vec(),
                 tunnel_ip,
+                allowed_ips,
                 keepalive: peer_cfg.keepalive.map(Duration::from_secs),
             }
         })
@@ -416,8 +423,11 @@ fn run_dpdk(
     let all_peer_pubkeys: Vec<PublicKey> = config
         .peer
         .iter()
-        .map(|p| PublicKey::from_base64(&p.public_key).expect("invalid peer public_key"))
-        .collect();
+        .map(|p| {
+            PublicKey::from_base64(&p.public_key)
+                .with_context(|| format!("invalid peer public_key: {}", &p.public_key))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let setup = match role {
         Role::Connector => {
@@ -459,9 +469,16 @@ fn run_dpdk(
                 .and_then(|cidr| cidr.split('/').next())
                 .and_then(|ip| ip.parse().ok())
                 .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+            let allowed_ips: Vec<ipnet::Ipv4Net> = p
+                .allowed_ips
+                .iter()
+                .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                .collect();
+
             quictun_core::peer::PeerConfig {
                 spki_der: pubkey.spki_der().to_vec(),
                 tunnel_ip,
+                allowed_ips,
                 keepalive: None,
             }
         })
@@ -1013,10 +1030,17 @@ async fn run_async(
         backoff_secs = 1;
 
         // Run forwarding loop. TUN device + endpoint persist; only Connection is recycled.
+        let peer_allowed_ips: Vec<ipnet::Ipv4Net> = config.peer[0]
+            .allowed_ips
+            .iter()
+            .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
+            .collect();
+
         let result = if use_multi_queue {
             tunnel::run_forwarding_loop_multiqueue(
                 connection,
                 tun_queues.clone(),
+                peer_allowed_ips,
                 shutdown_rx.clone(),
             )
             .await
@@ -1026,6 +1050,7 @@ async fn run_async(
                 tunnel::run_forwarding_loop_offload(
                     connection,
                     tun_queues[0].clone(),
+                    peer_allowed_ips,
                     shutdown_rx.clone(),
                 )
                 .await
@@ -1036,11 +1061,18 @@ async fn run_async(
             tunnel::run_forwarding_loop_parallel(
                 connection,
                 tun_queues[0].clone(),
+                peer_allowed_ips,
                 shutdown_rx.clone(),
             )
             .await
         } else {
-            tunnel::run_forwarding_loop(connection, &tun_queues[0], shutdown_rx.clone()).await
+            tunnel::run_forwarding_loop(
+                connection,
+                &tun_queues[0],
+                peer_allowed_ips,
+                shutdown_rx.clone(),
+            )
+            .await
         };
 
         match result {
@@ -1220,9 +1252,16 @@ async fn run_async_fast(
                     .map(|net| net.addr())
                     .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
+                let allowed_ips: Vec<ipnet::Ipv4Net> = peer_cfg
+                    .allowed_ips
+                    .iter()
+                    .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                    .collect();
+
                 quictun_core::peer::PeerConfig {
                     spki_der: pubkey.spki_der().to_vec(),
                     tunnel_ip,
+                    allowed_ips,
                     keepalive: peer_cfg.keepalive.map(Duration::from_secs),
                 }
             })
@@ -1323,6 +1362,10 @@ async fn run_async_fast(
                 handshake_result.remote_addr,
                 idle_timeout,
                 keepalive,
+                peer.allowed_ips
+                    .iter()
+                    .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
+                    .collect(),
                 shutdown_rx.clone(),
             )
             .await
