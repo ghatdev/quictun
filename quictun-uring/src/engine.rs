@@ -368,7 +368,7 @@ fn run_data_plane(
     let keepalive_deadline = Instant::now() + entry.keepalive_interval;
     timer.arm(keepalive_deadline);
 
-    info!("engine: entering io_uring fast data plane event loop");
+    info!(sqpoll, "engine: entering io_uring fast data plane event loop");
     let mut stats_udp_recvs: u64 = 0;
     let mut stats_datagrams: u64 = 0;
     let mut stats_encrypts: u64 = 0;
@@ -376,12 +376,35 @@ fn run_data_plane(
     let mut stats_channel_wakes: u64 = 0;
     let mut stats_channel_packets: u64 = 0;
     let mut stats_last = Instant::now();
+    let mut stats_spins: u64 = 0;
 
     loop {
-        ring.submit_and_wait(1)
-            .context("engine: submit_and_wait failed")?;
+        // With SQPOLL: busy-poll CQ (zero syscalls in hot path).
+        // SQPOLL thread submits SQEs from shared memory; we read CQEs from shared memory.
+        // Only call submit() if SQPOLL thread went to sleep (needs wakeup).
+        //
+        // Without SQPOLL: submit_and_wait(1) blocks until ≥1 CQE (one syscall per iteration).
+        let cqes: Vec<_> = if sqpoll {
+            loop {
+                // Flush any pending SQEs + wake SQPOLL thread if it slept.
+                // submit() with SQPOLL returns immediately (no syscall) if thread is awake.
+                ring.submit().context("engine: submit failed")?;
 
-        let cqes: Vec<_> = ring.completion().collect();
+                // Poll CQ — pure shared memory read, no syscall.
+                let mut cq = ring.completion();
+                cq.sync();
+                let batch: Vec<_> = cq.collect();
+                if !batch.is_empty() {
+                    break batch;
+                }
+                stats_spins += 1;
+                std::hint::spin_loop();
+            }
+        } else {
+            ring.submit_and_wait(1)
+                .context("engine: submit_and_wait failed")?;
+            ring.completion().collect()
+        };
 
         for cqe in cqes {
             let user_data = cqe.user_data();
@@ -616,6 +639,7 @@ fn run_data_plane(
                 timers = stats_timers,
                 channel_wakes = stats_channel_wakes,
                 channel_packets = stats_channel_packets,
+                spins = stats_spins,
                 free_bufs = pool.available(),
                 "engine: stats"
             );
@@ -625,6 +649,7 @@ fn run_data_plane(
             stats_timers = 0;
             stats_channel_wakes = 0;
             stats_channel_packets = 0;
+            stats_spins = 0;
             stats_last = Instant::now();
         }
     }
