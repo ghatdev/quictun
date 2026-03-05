@@ -32,6 +32,115 @@ const MAX_PACKET: usize = 2048;
 /// Handshake response buffer size.
 const HANDSHAKE_BUF_SIZE: usize = 2048;
 
+/// Maximum packets to buffer when TUN write returns WouldBlock.
+const TUN_WRITE_BUF_CAPACITY: usize = 256;
+
+/// Ring buffer for TUN writes that couldn't complete due to WouldBlock.
+///
+/// Instead of dropping packets when the TUN device is temporarily full,
+/// we buffer them and drain on the next poll iteration. This converts
+/// packet loss into brief delay, which inner TCP handles gracefully
+/// (delays don't trigger retransmits, but drops do).
+struct TunWriteBuffer {
+    packets: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl TunWriteBuffer {
+    fn new() -> Self {
+        Self {
+            packets: std::collections::VecDeque::with_capacity(TUN_WRITE_BUF_CAPACITY),
+        }
+    }
+
+    /// Try to flush all buffered packets to TUN. Stops on WouldBlock.
+    /// Returns the number of packets successfully written.
+    fn drain(&mut self, tun: &tun_rs::SyncDevice) -> usize {
+        let mut written = 0;
+        while let Some(pkt) = self.packets.front() {
+            match tun.send(pkt) {
+                Ok(_) => {
+                    self.packets.pop_front();
+                    written += 1;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    debug!(error = %e, "TUN drain write failed, dropping packet");
+                    self.packets.pop_front();
+                }
+            }
+        }
+        written
+    }
+
+    /// Try to flush all buffered packets via raw fd write (for workers).
+    fn drain_raw(&mut self, tun_fd: RawFd) -> usize {
+        let mut written = 0;
+        while let Some(pkt) = self.packets.front() {
+            let ret =
+                unsafe { libc::write(tun_fd, pkt.as_ptr() as *const libc::c_void, pkt.len()) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                debug!(error = %err, "TUN drain write (raw) failed, dropping packet");
+            }
+            self.packets.pop_front();
+            if ret >= 0 {
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// Write a packet to TUN, buffering on WouldBlock.
+    fn write(&mut self, tun: &tun_rs::SyncDevice, data: &[u8]) {
+        // If there are buffered packets, buffer this one too (preserve ordering).
+        if !self.packets.is_empty() {
+            self.push(data);
+            return;
+        }
+        match tun.send(data) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.push(data);
+            }
+            Err(e) => {
+                debug!(error = %e, "TUN write failed, dropping packet");
+            }
+        }
+    }
+
+    /// Write a packet via raw fd, buffering on WouldBlock (for workers).
+    fn write_raw(&mut self, tun_fd: RawFd, data: &[u8]) {
+        if !self.packets.is_empty() {
+            self.push(data);
+            return;
+        }
+        let ret = unsafe { libc::write(tun_fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                self.push(data);
+            } else {
+                debug!(error = %err, "TUN write (raw) failed, dropping packet");
+            }
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        if self.packets.len() >= TUN_WRITE_BUF_CAPACITY {
+            // Buffer full — drop oldest to make room (tail drop would delay newer data).
+            self.packets.pop_front();
+        }
+        self.packets.push_back(data.to_vec());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+}
+
 // mio tokens
 const TOKEN_UDP: Token = Token(0);
 const TOKEN_TUN: Token = Token(1);
@@ -171,6 +280,7 @@ fn run_single(
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
     let mut scratch = BytesMut::with_capacity(2048);
+    let mut tun_write_buf = TunWriteBuffer::new();
 
     // Linux: batch I/O buffers.
     #[cfg(target_os = "linux")]
@@ -249,6 +359,11 @@ fn run_single(
             return Ok(RunResult::Shutdown);
         }
 
+        // ── Drain buffered TUN writes ───────────────────────────────────
+        if !tun_write_buf.is_empty() {
+            tun_write_buf.drain(&tun);
+        }
+
         // ── UDP RX ──────────────────────────────────────────────────────
         if udp_readable {
             #[cfg(target_os = "linux")]
@@ -267,6 +382,7 @@ fn run_single(
                     offload_enabled,
                     &mut gro_tx_bufs,
                     &mut gro_table,
+                    &mut tun_write_buf,
                 )?;
             }
             #[cfg(not(target_os = "linux"))]
@@ -280,6 +396,7 @@ fn run_single(
                     &mut recv_buf,
                     &mut scratch,
                     &mut response_buf,
+                    &mut tun_write_buf,
                 )?;
             }
         }
@@ -377,6 +494,28 @@ fn create_udp_socket(
     sock.set_nonblocking(true)?;
     let _ = sock.set_send_buffer_size(send_buf);
     let _ = sock.set_recv_buffer_size(recv_buf);
+
+    // Warn if kernel clamped the buffer sizes (common when rmem_max is too low).
+    if let Ok(actual_recv) = sock.recv_buffer_size() {
+        if actual_recv < recv_buf / 2 {
+            warn!(
+                requested = recv_buf,
+                actual = actual_recv,
+                "UDP recv buffer clamped by kernel — set net.core.rmem_max >= {} to avoid packet drops",
+                recv_buf,
+            );
+        }
+    }
+    if let Ok(actual_send) = sock.send_buffer_size() {
+        if actual_send < send_buf / 2 {
+            warn!(
+                requested = send_buf,
+                actual = actual_send,
+                "UDP send buffer clamped by kernel — set net.core.wmem_max >= {}",
+                send_buf,
+            );
+        }
+    }
 
     sock.bind(&addr.into())
         .with_context(|| format!("failed to bind UDP to {addr}"))?;
@@ -509,6 +648,7 @@ fn handle_udp_rx_linux(
     offload: bool,
     gro_tx_bufs: &mut Vec<Vec<u8>>,
     gro_table: &mut Option<quictun_tun::GROTable>,
+    tun_write_buf: &mut TunWriteBuffer,
 ) -> Result<()> {
     // Loop recvmmsg until WouldBlock — required for edge-triggered epoll (mio).
     loop {
@@ -582,7 +722,7 @@ fn handle_udp_rx_linux(
                                         .copy_from_slice(datagram);
                                     gro_tx_bufs.push(buf);
                                 } else {
-                                    tun_write_sync(tun, datagram);
+                                    tun_write_buf.write(tun, datagram);
                                 }
                             }
                         }
@@ -611,7 +751,10 @@ fn handle_udp_rx_linux(
                 match tun.send_multiple(gro, gro_tx_bufs, quictun_tun::VIRTIO_NET_HDR_LEN) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        debug!("TUN send_multiple would block, dropping batch");
+                        // Buffer individual packets instead of dropping the batch.
+                        for buf in gro_tx_bufs.iter() {
+                            tun_write_buf.push(buf);
+                        }
                     }
                     Err(e) => {
                         debug!(error = %e, "TUN send_multiple failed");
@@ -641,6 +784,7 @@ fn handle_udp_rx(
     recv_buf: &mut [u8],
     scratch: &mut BytesMut,
     response_buf: &mut Vec<u8>,
+    tun_write_buf: &mut TunWriteBuffer,
 ) -> Result<()> {
     loop {
         match udp.recv_from(recv_buf) {
@@ -689,7 +833,7 @@ fn handle_udp_rx(
                                                 debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
                                                 continue;
                                             }
-                                            tun_write_sync(tun, datagram);
+                                            tun_write_buf.write(tun, datagram);
                                         }
                                     }
                                     decrypted.close_received
@@ -1112,53 +1256,6 @@ fn send_responses(
         udp.send_to(&buf[..*len], addr)?;
     }
     Ok(())
-}
-
-fn tun_write_sync(tun: &tun_rs::SyncDevice, buf: &[u8]) {
-    // Best-effort TUN write: drop on WouldBlock (avoid blocking the loop).
-    match tun.send(buf) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            debug!("TUN write would block, dropping packet");
-        }
-        Err(e) => {
-            debug!(error = %e, "TUN write failed");
-        }
-    }
-}
-
-/// TUN write for workers using raw fd. Prepends zeroed virtio_net_hdr when offload is enabled.
-fn worker_tun_write(tun_fd: RawFd, datagram: &[u8], offload: bool) {
-    if offload {
-        #[cfg(target_os = "linux")]
-        {
-            let hdr_len = quictun_tun::VIRTIO_NET_HDR_LEN;
-            let mut buf = vec![0u8; hdr_len + datagram.len()];
-            buf[hdr_len..].copy_from_slice(datagram);
-            let ret =
-                unsafe { libc::write(tun_fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() != io::ErrorKind::WouldBlock {
-                    warn!(error = %err, "worker TUN write (offload) failed");
-                }
-            }
-        }
-    } else {
-        let ret = unsafe {
-            libc::write(
-                tun_fd,
-                datagram.as_ptr() as *const libc::c_void,
-                datagram.len(),
-            )
-        };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::WouldBlock {
-                warn!(error = %err, "worker TUN write failed");
-            }
-        }
-    }
 }
 
 // ── TUN RX with offload (Linux — recv_multiple GSO splitting) ────────────
@@ -1968,7 +2065,7 @@ fn run_worker(
     cid_len: usize,
     removal_tx: crossbeam_channel::Sender<RemovedConnection>,
     shutdown: Arc<AtomicBool>,
-    offload: bool,
+    #[allow(unused_variables)] offload: bool,
 ) -> Result<()> {
     info!(worker = worker_id, "worker started");
 
@@ -1982,6 +2079,7 @@ fn run_worker(
     let mut ip_to_cid: HashMap<Ipv4Addr, Vec<u8>> = HashMap::new();
 
     let mut scratch = BytesMut::with_capacity(2048);
+    let mut tun_write_buf = TunWriteBuffer::new();
     #[cfg(not(target_os = "linux"))]
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
 
@@ -2010,6 +2108,14 @@ fn run_worker(
         }
 
         let mut did_work = false;
+
+        // ── Drain buffered TUN writes ────────────────────────────────
+        if !tun_write_buf.is_empty() {
+            let drained = tun_write_buf.drain_raw(tun_fd);
+            if drained > 0 {
+                did_work = true;
+            }
+        }
 
         // ── Poll control channel ─────────────────────────────────────
         let mut got_shutdown = false;
@@ -2100,7 +2206,19 @@ fn run_worker(
                                             debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
                                             continue;
                                         }
-                                        worker_tun_write(tun_fd, datagram, offload);
+                                        #[cfg(target_os = "linux")]
+                                        if offload {
+                                            let hdr_len = quictun_tun::VIRTIO_NET_HDR_LEN;
+                                            let mut buf = vec![0u8; hdr_len + datagram.len()];
+                                            buf[hdr_len..].copy_from_slice(datagram);
+                                            tun_write_buf.write_raw(tun_fd, &buf);
+                                        } else {
+                                            tun_write_buf.write_raw(tun_fd, datagram);
+                                        }
+                                        #[cfg(not(target_os = "linux"))]
+                                        {
+                                            tun_write_buf.write_raw(tun_fd, datagram);
+                                        }
                                     }
                                 }
                                 decrypted.close_received
