@@ -45,6 +45,7 @@ pub fn run(
     no_udp_checksum: bool,
     offload: bool,
     legacy: bool,
+    threads: usize,
 ) -> Result<()> {
     let cc: CongestionControl = cc
         .parse()
@@ -103,7 +104,7 @@ pub fn run(
         ));
     }
 
-    run_net(config_path, cc, recv_buf, send_buf, send_window, initial_rtt, pin_mtu)
+    run_net(config_path, cc, recv_buf, send_buf, send_window, initial_rtt, pin_mtu, threads)
 }
 
 /// Run the synchronous blocking engine (quictun-net, default path).
@@ -116,6 +117,7 @@ fn run_net(
     _send_window: u64,
     _initial_rtt: u64,
     _pin_mtu: bool,
+    threads: usize,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -219,6 +221,7 @@ fn run_net(
         reconnect,
         recv_buf,
         send_buf,
+        threads,
     };
 
     // Backoff state for reconnection.
