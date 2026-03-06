@@ -553,7 +553,8 @@ impl crypto::ServerConfig for QuicServerConfig {
     }
 }
 
-pub(crate) fn initial_suite_from_provider(
+/// Extract the QUIC Initial cipher suite (AES-128-GCM) from a crypto provider.
+pub fn initial_suite_from_provider(
     provider: &Arc<rustls::crypto::CryptoProvider>,
 ) -> Option<Suite> {
     provider

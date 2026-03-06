@@ -29,6 +29,52 @@ fn make_crypto_provider(suites: &[CipherSuite]) -> rustls::crypto::CryptoProvide
     }
 }
 
+/// Whether the cipher suite list includes AES-128-GCM (required by QUIC for Initial packets).
+fn has_aes128gcm(suites: &[CipherSuite]) -> bool {
+    suites.iter().any(|s| matches!(s, CipherSuite::Aes128Gcm))
+}
+
+/// Get the QUIC Initial suite (AES-128-GCM) from the default provider.
+///
+/// QUIC RFC 9001 mandates AES-128-GCM for Initial packet protection regardless of
+/// the negotiated TLS cipher suite. When the user selects only ChaCha20 or AES-256-GCM,
+/// we use `with_initial()` to supply this suite separately.
+fn quic_initial_suite() -> rustls::quic::Suite {
+    use quinn_proto::crypto::rustls::initial_suite_from_provider;
+    let default_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    initial_suite_from_provider(&default_provider).expect("default provider has AES-128-GCM")
+}
+
+/// Create a `QuicServerConfig`, using `with_initial()` if the user's ciphers don't include
+/// AES-128-GCM (needed for QUIC Initial packet protection).
+pub fn make_quic_server_config(
+    tls_config: Arc<rustls::ServerConfig>,
+    cipher_suites: &[CipherSuite],
+) -> Result<quinn::crypto::rustls::QuicServerConfig> {
+    if has_aes128gcm(cipher_suites) {
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+            .context("failed to create QUIC server crypto config")
+    } else {
+        quinn::crypto::rustls::QuicServerConfig::with_initial(tls_config, quic_initial_suite())
+            .context("failed to create QUIC server crypto config with initial suite")
+    }
+}
+
+/// Create a `QuicClientConfig`, using `with_initial()` if the user's ciphers don't include
+/// AES-128-GCM (needed for QUIC Initial packet protection).
+pub fn make_quic_client_config(
+    tls_config: Arc<rustls::ClientConfig>,
+    cipher_suites: &[CipherSuite],
+) -> Result<quinn::crypto::rustls::QuicClientConfig> {
+    if has_aes128gcm(cipher_suites) {
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+            .context("failed to create QUIC client crypto config")
+    } else {
+        quinn::crypto::rustls::QuicClientConfig::with_initial(tls_config, quic_initial_suite())
+            .context("failed to create QUIC client crypto config with initial suite")
+    }
+}
+
 // ── RPK TLS builders ─────────────────────────────────────────────────────────
 
 /// Build a rustls `ServerConfig` with RPK authentication pinned to the given peer keys.
@@ -111,8 +157,7 @@ pub fn build_server_config(
 ) -> Result<quinn::ServerConfig> {
     let tls_config = build_rustls_server_tls_config(private_key, allowed_peers, cipher_suites)?;
 
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-        .context("failed to create QUIC server crypto config")?;
+    let quic_crypto = make_quic_server_config(tls_config, cipher_suites)?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(make_transport_config(keepalive, tuning)));
@@ -136,8 +181,7 @@ pub fn build_client_config(
         enable_session_resumption,
     )?;
 
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
-        .context("failed to create QUIC client crypto config")?;
+    let quic_crypto = make_quic_client_config(tls_config, cipher_suites)?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(make_transport_config(keepalive, tuning)));
@@ -260,8 +304,7 @@ pub fn build_server_config_x509(
     let tls_config =
         build_rustls_server_tls_config_x509(cert_file, key_file, client_ca_file, cipher_suites)?;
 
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-        .context("failed to create QUIC server crypto config")?;
+    let quic_crypto = make_quic_server_config(tls_config, cipher_suites)?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(make_transport_config(keepalive, tuning)));
@@ -287,8 +330,7 @@ pub fn build_client_config_x509(
         enable_session_resumption,
     )?;
 
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
-        .context("failed to create QUIC client crypto config")?;
+    let quic_crypto = make_quic_client_config(tls_config, cipher_suites)?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(make_transport_config(keepalive, tuning)));
