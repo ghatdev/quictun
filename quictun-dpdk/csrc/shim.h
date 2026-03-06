@@ -67,4 +67,12 @@ unsigned shim_rte_ring_sp_enqueue_burst(struct rte_ring *r,
 unsigned shim_rte_ring_sc_dequeue_burst(struct rte_ring *r, void **objs,
                                          unsigned n, unsigned *available);
 
+/*
+ * rte_ring MP (multi-producer) wrappers for cross-worker forwarding.
+ */
+int shim_rte_ring_mp_enqueue(struct rte_ring *r, void *obj);
+unsigned shim_rte_ring_mp_enqueue_burst(struct rte_ring *r,
+                                         void * const *objs, unsigned n,
+                                         unsigned *free_space);
+
 #endif /* QUICTUN_DPDK_SHIM_H */

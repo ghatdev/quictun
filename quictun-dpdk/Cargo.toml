@@ -16,6 +16,7 @@ tracing = { workspace = true }
 libc = { workspace = true }
 hex = { workspace = true }
 rustc-hash = { workspace = true }
+ipnet = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 bindgen = "0.71"

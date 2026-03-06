@@ -258,27 +258,172 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             dpdk_config.tunnel_mtu.saturating_sub(40) // auto: MTU - IP(20) - TCP(20)
         };
 
+        if n_cores == 1 {
+            // Single-core router: existing path.
+            tracing::info!(
+                enable_nat = dpdk_config.enable_nat,
+                mss_clamp,
+                "starting router mode (single NIC, single core)"
+            );
+
+            let result = crate::router::run_router(
+                dpdk_config.port_id,
+                0, // queue_id
+                mempool,
+                &mut multi_state,
+                &mut identity,
+                &mut arp_table,
+                shutdown.clone(),
+                dpdk_config.adaptive_poll,
+                checksum_mode,
+                &dpdk_config.peers,
+                dpdk_config.enable_nat,
+                mss_clamp,
+                dpdk_config.tunnel_ip,
+            );
+
+            shutdown.store(true, Ordering::Release);
+            port::close_port(dpdk_config.port_id);
+            return result;
+        }
+
+        // Multi-core router: dispatcher + worker architecture.
+        let n_workers = n_cores - 1;
+
+        // Restrict to listener mode.
+        let multi_server_config = server_config_clone
+            .ok_or_else(|| anyhow::anyhow!("multi-core router requires listener mode"))?;
+        let mut multi_state = MultiQuicState::new(multi_server_config);
+
+        // Reconfigure outer port for n_cores TX queues (1 RX queue, N TX queues).
+        port::close_port(dpdk_config.port_id);
+        let (new_mac, hw_udp, hw_ip) =
+            port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
+        identity.local_mac = new_mac;
+
+        let checksum_mode = if dpdk_config.no_udp_checksum {
+            ChecksumMode::None
+        } else if hw_udp && hw_ip {
+            ChecksumMode::HardwareFull
+        } else if hw_udp {
+            ChecksumMode::HardwareUdpOnly
+        } else {
+            ChecksumMode::Software
+        };
+
+        // Create per-worker ring bundles (router mode: MP forward_rx).
+        let mut worker_rings: Vec<WorkerRings> = Vec::with_capacity(n_workers);
+        for i in 0..n_workers {
+            worker_rings.push(WorkerRings::new_router_mode(i)?);
+        }
+
+        // Build dispatch table.
+        let mut dispatch_table = DpdkDispatchTable::new(n_workers);
+
+        // Compute NAT port ranges.
+        let port_ranges = quictun_core::nat::compute_port_ranges(n_workers);
+
+        let adaptive_poll = dpdk_config.adaptive_poll;
+        let outer_port_id = dpdk_config.port_id;
+        let enable_nat = dpdk_config.enable_nat;
+        let tunnel_ip = dpdk_config.tunnel_ip;
+        let peers = &dpdk_config.peers;
+
         tracing::info!(
-            enable_nat = dpdk_config.enable_nat,
+            n_workers,
+            enable_nat,
             mss_clamp,
-            "starting router mode (single NIC, no inner port)"
+            "starting router mode (multi-core)"
         );
 
-        let result = crate::router::run_router(
-            dpdk_config.port_id,
-            0, // queue_id
-            mempool,
-            &mut multi_state,
-            &mut identity,
-            &mut arp_table,
-            shutdown.clone(),
-            dpdk_config.adaptive_poll,
-            checksum_mode,
-            &dpdk_config.peers,
-            dpdk_config.enable_nat,
-            mss_clamp,
-            dpdk_config.tunnel_ip,
-        );
+        let result = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_workers);
+
+            for (idx, rings) in worker_rings.iter().enumerate() {
+                let shutdown = shutdown.clone();
+                let worker_identity = identity.clone();
+                let worker_arp = arp_table.clone();
+                let mempool = SendPtr(mempool);
+                let (port_start, port_end) = port_ranges[idx];
+                let worker_rings_ref = &worker_rings;
+                let peers_ref = peers;
+
+                handles.push(s.spawn(move || -> Result<()> {
+                    let mempool = mempool.as_ptr();
+                    let core_idx = idx + 1; // core 0 is dispatcher
+                    let tx_queue = core_idx as u16;
+
+                    // Pin thread to CPU.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                        unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
+                        let ret = unsafe {
+                            libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &cpuset,
+                            )
+                        };
+                        if ret == 0 {
+                            tracing::info!(core = core_idx, "pinned router worker to CPU");
+                        } else {
+                            tracing::warn!(core = core_idx, "failed to pin router worker to CPU");
+                        }
+                    }
+
+                    crate::router::run_router_worker(
+                        outer_port_id,
+                        tx_queue,
+                        mempool,
+                        rings,
+                        worker_rings_ref,
+                        &worker_identity,
+                        &worker_arp,
+                        &shutdown,
+                        adaptive_poll,
+                        checksum_mode,
+                        peers_ref,
+                        enable_nat,
+                        mss_clamp,
+                        tunnel_ip,
+                        core_idx,
+                        port_start,
+                        port_end,
+                    )
+                }));
+            }
+
+            // Run dispatcher on core 0 (this thread).
+            let disp_result = crate::router::run_router_dispatcher(
+                outer_port_id,
+                mempool,
+                &mut multi_state,
+                &mut dispatch_table,
+                &worker_rings,
+                &mut identity,
+                &mut arp_table,
+                &shutdown,
+                adaptive_poll,
+                checksum_mode,
+                peers,
+                enable_nat,
+                tunnel_ip,
+                n_workers,
+            );
+
+            // Signal shutdown and wait for workers.
+            shutdown.store(true, Ordering::Release);
+            let mut result = disp_result;
+            for handle in handles {
+                if let Err(e) = handle.join().expect("router worker panicked") {
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+            result
+        });
 
         shutdown.store(true, Ordering::Release);
         port::close_port(dpdk_config.port_id);

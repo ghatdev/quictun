@@ -78,6 +78,8 @@ pub struct ResolvedHandshake {
     pub cid: u64,
     /// Raw CID bytes for logging.
     pub cid_bytes: Vec<u8>,
+    /// Peer's allowed IP networks (for router-mode routing table).
+    pub allowed_ips: Vec<ipnet::Ipv4Net>,
 }
 
 /// Extract shared handshake completion logic: identify peer, resolve MAC, build CID.
@@ -90,25 +92,27 @@ pub(crate) fn resolve_completed_handshake(
     identity: &NetIdentity,
     arp_table: &ArpTable,
 ) -> Option<ResolvedHandshake> {
-    // Identify peer to get tunnel IP.
-    let tunnel_ip = peer::identify_peer(&hs.connection, peers)
-        .map(|p| p.tunnel_ip)
+    // Identify peer to get tunnel IP and allowed IPs.
+    let identified = peer::identify_peer(&hs.connection, peers)
         .or_else(|| {
             // Single-peer fallback: skip identification.
             if peers.len() == 1 {
-                Some(peers[0].tunnel_ip)
+                Some(&peers[0])
             } else {
                 None
             }
         });
 
-    let tunnel_ip = tunnel_ip.or_else(|| {
+    let identified = identified.or_else(|| {
         tracing::warn!(
             remote = %hs.remote_addr,
             "could not identify peer, rejecting"
         );
         None
     })?;
+
+    let tunnel_ip = identified.tunnel_ip;
+    let allowed_ips = identified.allowed_ips.clone();
 
     // Resolve remote MAC from ARP table or use learned identity MAC.
     let remote_ip = match hs.remote_addr.ip() {
@@ -130,6 +134,7 @@ pub(crate) fn resolve_completed_handshake(
         remote_mac,
         cid,
         cid_bytes,
+        allowed_ips,
     })
 }
 

@@ -40,6 +40,23 @@ impl SpscRing {
         Ok(Self { ring })
     }
 
+    /// Create a ring with SC dequeue only (allows MP enqueue from multiple producers).
+    ///
+    /// Used for `forward_rx` in multi-core router mode where multiple workers
+    /// may forward packets to the same target worker.
+    pub fn new_mp_sc(name: &str, count: u32, socket_id: i32) -> Result<Self> {
+        let c_name = CString::new(name).expect("ring name contains null byte");
+        let flags = ffi::RING_F_SC_DEQ; // No SP flag → allows MP enqueue.
+
+        let ring = unsafe { ffi::shim_rte_ring_create(c_name.as_ptr(), count, socket_id, flags) };
+
+        if ring.is_null() {
+            bail!("rte_ring_create({name}, count={count}) failed (MP/SC)");
+        }
+
+        Ok(Self { ring })
+    }
+
     /// Enqueue a single mbuf pointer. Returns `true` if successful, `false` if full.
     #[inline]
     pub fn enqueue(&self, mbuf: *mut ffi::rte_mbuf) -> bool {
@@ -55,6 +72,27 @@ impl SpscRing {
         // SAFETY: ring is valid; mbufs is a valid slice of pointers.
         unsafe {
             ffi::shim_rte_ring_sp_enqueue_burst(
+                self.ring,
+                mbufs.as_ptr() as *mut *mut _,
+                mbufs.len() as u32,
+                &mut free_space,
+            )
+        }
+    }
+
+    /// Enqueue a single mbuf using multi-producer mode. Returns `true` if successful.
+    #[inline]
+    pub fn enqueue_mp(&self, mbuf: *mut ffi::rte_mbuf) -> bool {
+        let ret = unsafe { ffi::shim_rte_ring_mp_enqueue(self.ring, mbuf as *mut _) };
+        ret == 0
+    }
+
+    /// Enqueue a burst of mbufs using multi-producer mode. Returns the number enqueued.
+    #[inline]
+    pub fn enqueue_burst_mp(&self, mbufs: &[*mut ffi::rte_mbuf]) -> u32 {
+        let mut free_space: u32 = 0;
+        unsafe {
+            ffi::shim_rte_ring_mp_enqueue_burst(
                 self.ring,
                 mbufs.as_ptr() as *mut *mut _,
                 mbufs.len() as u32,

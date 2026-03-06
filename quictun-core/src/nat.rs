@@ -89,12 +89,14 @@ pub struct NatTable {
     entries: Vec<Option<NatEntry>>,
     free_indices: Vec<usize>,
     next_port: u16,
+    port_start: u16,
+    port_end: u16,
     /// The local (NAT) IP address used as the source for outbound packets.
     pub local_ip: Ipv4Addr,
 }
 
 impl NatTable {
-    /// Create a new NAT table.
+    /// Create a new NAT table using the full port range.
     ///
     /// `local_ip` is the IP address used as source for SNAT'd packets.
     pub fn new(local_ip: Ipv4Addr) -> Self {
@@ -104,6 +106,24 @@ impl NatTable {
             entries: Vec::new(),
             free_indices: Vec::new(),
             next_port: NAT_PORT_START,
+            port_start: NAT_PORT_START,
+            port_end: NAT_PORT_END,
+            local_ip,
+        }
+    }
+
+    /// Create a NAT table with a restricted port range.
+    ///
+    /// Used in multi-core router mode where each worker gets a disjoint range.
+    pub fn with_port_range(local_ip: Ipv4Addr, port_start: u16, port_end: u16) -> Self {
+        Self {
+            forward: FxHashMap::default(),
+            reverse: FxHashMap::default(),
+            entries: Vec::new(),
+            free_indices: Vec::new(),
+            next_port: port_start,
+            port_start,
+            port_end,
             local_ip,
         }
     }
@@ -235,11 +255,11 @@ impl NatTable {
 
     /// Allocate a NAT port, avoiding collisions.
     fn allocate_port(&mut self, proto: u8, remote_ip: Ipv4Addr, remote_port: u16) -> Option<u16> {
-        let range_size = (NAT_PORT_END - NAT_PORT_START + 1) as u32;
+        let range_size = (self.port_end - self.port_start + 1) as u32;
         for _ in 0..range_size {
             let port = self.next_port;
-            self.next_port = if self.next_port >= NAT_PORT_END {
-                NAT_PORT_START
+            self.next_port = if self.next_port >= self.port_end {
+                self.port_start
             } else {
                 self.next_port + 1
             };
@@ -256,6 +276,40 @@ impl NatTable {
         }
         None // port exhaustion
     }
+}
+
+/// Compute disjoint NAT port ranges for `n_workers` cores.
+///
+/// Returns a vector of `(port_start, port_end)` tuples (inclusive).
+pub fn compute_port_ranges(n_workers: usize) -> Vec<(u16, u16)> {
+    let total = (NAT_PORT_END - NAT_PORT_START + 1) as usize;
+    let per_worker = total / n_workers;
+    let mut ranges = Vec::with_capacity(n_workers);
+    for i in 0..n_workers {
+        let start = NAT_PORT_START + (i * per_worker) as u16;
+        let end = if i == n_workers - 1 {
+            NAT_PORT_END
+        } else {
+            start + per_worker as u16 - 1
+        };
+        ranges.push((start, end));
+    }
+    ranges
+}
+
+/// Determine which worker owns a given NAT port.
+///
+/// Used by the dispatcher to route return traffic to the correct worker.
+pub fn worker_for_port(port: u16, n_workers: usize) -> Option<usize> {
+    if port < NAT_PORT_START || port > NAT_PORT_END {
+        return None;
+    }
+    let total = (NAT_PORT_END - NAT_PORT_START + 1) as usize;
+    let per_worker = total / n_workers;
+    let offset = (port - NAT_PORT_START) as usize;
+    let worker = offset / per_worker;
+    // Last worker absorbs the remainder.
+    Some(worker.min(n_workers - 1))
 }
 
 /// Apply SNAT to an IPv4 packet in-place.
@@ -649,5 +703,61 @@ mod tests {
         // Checksums should still be valid.
         assert!(verify_ip_checksum(&pkt[..20]));
         assert!(verify_udp_checksum(src, orig_peer, &pkt));
+    }
+
+    #[test]
+    fn test_port_range_nat() {
+        let mut table = NatTable::with_port_range(Ipv4Addr::new(192, 168, 1, 1), 1024, 2023);
+        let now = Instant::now();
+
+        let key = NatForwardKey {
+            proto: IPPROTO_TCP,
+            src_ip: Ipv4Addr::new(10, 0, 0, 2),
+            src_port: 54321,
+            dst_ip: Ipv4Addr::new(8, 8, 8, 8),
+            dst_port: 443,
+        };
+
+        let result = table
+            .lookup_or_create(&key, 1, Ipv4Addr::new(10, 0, 0, 2), now)
+            .expect("should allocate");
+
+        assert!(result.nat_port >= 1024 && result.nat_port <= 2023);
+    }
+
+    #[test]
+    fn test_compute_port_ranges_2_workers() {
+        let ranges = compute_port_ranges(2);
+        assert_eq!(ranges.len(), 2);
+        // Ranges should be disjoint and contiguous.
+        assert_eq!(ranges[0].0, NAT_PORT_START);
+        assert_eq!(ranges[0].1 + 1, ranges[1].0);
+        assert_eq!(ranges[1].1, NAT_PORT_END);
+    }
+
+    #[test]
+    fn test_compute_port_ranges_4_workers() {
+        let ranges = compute_port_ranges(4);
+        assert_eq!(ranges.len(), 4);
+        for i in 0..3 {
+            assert_eq!(ranges[i].1 + 1, ranges[i + 1].0);
+        }
+        assert_eq!(ranges[3].1, NAT_PORT_END);
+    }
+
+    #[test]
+    fn test_worker_for_port() {
+        let n = 2;
+        let ranges = compute_port_ranges(n);
+        // First port of first worker.
+        assert_eq!(worker_for_port(ranges[0].0, n), Some(0));
+        // Last port of first worker.
+        assert_eq!(worker_for_port(ranges[0].1, n), Some(0));
+        // First port of second worker.
+        assert_eq!(worker_for_port(ranges[1].0, n), Some(1));
+        // Last port (NAT_PORT_END) should be last worker.
+        assert_eq!(worker_for_port(NAT_PORT_END, n), Some(1));
+        // Port below range.
+        assert_eq!(worker_for_port(1023, n), None);
     }
 }

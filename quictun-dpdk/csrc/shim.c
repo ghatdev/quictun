@@ -88,3 +88,13 @@ unsigned shim_rte_ring_sc_dequeue_burst(struct rte_ring *r, void **objs,
                                          unsigned n, unsigned *available) {
     return rte_ring_sc_dequeue_burst(r, objs, n, available);
 }
+
+int shim_rte_ring_mp_enqueue(struct rte_ring *r, void *obj) {
+    return rte_ring_mp_enqueue(r, obj);
+}
+
+unsigned shim_rte_ring_mp_enqueue_burst(struct rte_ring *r,
+                                         void * const *objs, unsigned n,
+                                         unsigned *free_space) {
+    return rte_ring_mp_enqueue_burst(r, objs, n, free_space);
+}

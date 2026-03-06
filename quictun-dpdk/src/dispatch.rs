@@ -3,10 +3,11 @@
 //! Core 0 (dispatcher) owns the `DpdkDispatchTable` and routes packets to
 //! worker cores via SPSC rings. Workers own `LocalConnectionState` per connection.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 
 use anyhow::Result;
+use ipnet::Ipv4Net;
 use rustc_hash::FxHashMap;
 use quictun_quic::local::LocalConnectionState;
 use quinn_proto::ConnectionId;
@@ -117,6 +118,20 @@ impl WorkerRings {
             control: Mutex::new(Vec::new()),
         })
     }
+
+    /// Create ring bundle for router-mode worker `idx`.
+    ///
+    /// Router mode has no inner port, so `inner_rx`/`inner_tx` are unused placeholders.
+    /// `forward_rx` uses MP/SC mode (multiple workers can enqueue to the same ring).
+    pub fn new_router_mode(idx: usize) -> Result<Self> {
+        Ok(Self {
+            outer_rx: SpscRing::new(&format!("r_outer_rx_{idx}"), RING_CAPACITY, 0)?,
+            inner_rx: SpscRing::new(&format!("r_inner_rx_{idx}"), RING_CAPACITY, 0)?,
+            inner_tx: SpscRing::new(&format!("r_inner_tx_{idx}"), RING_CAPACITY, 0)?,
+            forward_rx: SpscRing::new_mp_sc(&format!("r_fwd_rx_{idx}"), RING_CAPACITY, 0)?,
+            control: Mutex::new(Vec::new()),
+        })
+    }
 }
 
 /// Control message sent from dispatcher to worker (rare, via Mutex<Vec>).
@@ -125,11 +140,26 @@ pub enum ControlMessage {
     AddConnection {
         conn: LocalConnectionState,
         tunnel_ip: Ipv4Addr,
-        remote_addr: std::net::SocketAddr,
+        remote_addr: SocketAddr,
         remote_mac: [u8; 6],
     },
     /// Remove a connection from this worker.
     RemoveConnection { cid: ConnectionId },
+    /// Assign a new router-mode connection to this worker (includes allowed_ips for routing).
+    AddRouterConnection {
+        conn: LocalConnectionState,
+        tunnel_ip: Ipv4Addr,
+        remote_addr: SocketAddr,
+        remote_mac: [u8; 6],
+        allowed_ips: Vec<Ipv4Net>,
+    },
+    /// Broadcast: a peer was assigned to a specific worker (all workers update peer_to_worker).
+    PeerAssignment {
+        peer_cid: u64,
+        tunnel_ip: Ipv4Addr,
+        worker_id: usize,
+        allowed_ips: Vec<Ipv4Net>,
+    },
 }
 
 /// Per-connection state held by a worker core.

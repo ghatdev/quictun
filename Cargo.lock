@@ -1114,6 +1114,7 @@ dependencies = [
  "bytes",
  "cc",
  "hex",
+ "ipnet",
  "libc",
  "pkg-config",
  "quictun-core",
