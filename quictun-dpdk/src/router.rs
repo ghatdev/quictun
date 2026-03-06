@@ -497,6 +497,11 @@ pub fn run_router(
         for frame in pending_frames.drain(..) {
             if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
                 if out_mbuf.write_packet(&frame).is_ok() {
+                    match checksum_mode {
+                        ChecksumMode::HardwareUdpOnly => out_mbuf.set_tx_udp_checksum_offload(),
+                        ChecksumMode::HardwareFull => out_mbuf.set_tx_full_checksum_offload(),
+                        _ => {}
+                    }
                     outer_tx_mbufs.push(out_mbuf.into_raw());
                 }
             }
@@ -882,6 +887,15 @@ fn encrypt_and_send(
                         checksum_mode,
                     );
                     tx_mbuf.truncate(actual_len as u16);
+                    match checksum_mode {
+                        ChecksumMode::HardwareUdpOnly => {
+                            tx_mbuf.set_tx_udp_checksum_offload();
+                        }
+                        ChecksumMode::HardwareFull => {
+                            tx_mbuf.set_tx_full_checksum_offload();
+                        }
+                        _ => {}
+                    }
                     outer_tx_mbufs.push(tx_mbuf.into_raw());
                 }
                 Err(_) => {
@@ -954,8 +968,12 @@ fn drain_handshake_transmits(
     ip_id: &mut u16,
     checksum_mode: ChecksumMode,
 ) {
-    while let Some(transmit) = connection.poll_transmit(now, 1) {
-        let payload = &transmit.contents;
+    loop {
+        transmit_buf.clear();
+        let Some(transmit) = connection.poll_transmit(now, 1, transmit_buf) else {
+            break;
+        };
+        let payload = &transmit_buf[..transmit.size];
         let remote = transmit.destination;
         let remote_ip = match remote.ip() {
             std::net::IpAddr::V4(ip) => ip,
@@ -966,24 +984,28 @@ fn drain_handshake_transmits(
             .or(identity.remote_mac)
             .unwrap_or([0xff; 6]);
 
-        transmit_buf.resize(net::HEADER_SIZE + payload.len(), 0);
-        *ip_id = ip_id.wrapping_add(1);
-        let frame_len = net::build_udp_packet(
-            &identity.local_mac,
-            &dst_mac,
-            identity.local_ip,
-            remote_ip,
-            identity.local_port,
-            remote.port(),
-            payload,
-            transmit_buf,
-            0,
-            *ip_id,
-            checksum_mode,
-        );
-
+        let frame_len = net::HEADER_SIZE + payload.len();
         if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
-            if out_mbuf.write_packet(&transmit_buf[..frame_len]).is_ok() {
+            if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
+                *ip_id = ip_id.wrapping_add(1);
+                net::build_udp_packet(
+                    &identity.local_mac,
+                    &dst_mac,
+                    identity.local_ip,
+                    remote_ip,
+                    identity.local_port,
+                    remote.port(),
+                    payload,
+                    buf,
+                    0,
+                    *ip_id,
+                    checksum_mode,
+                );
+                match checksum_mode {
+                    ChecksumMode::HardwareUdpOnly => out_mbuf.set_tx_udp_checksum_offload(),
+                    ChecksumMode::HardwareFull => out_mbuf.set_tx_full_checksum_offload(),
+                    _ => {}
+                }
                 let raw = out_mbuf.into_raw();
                 let mut tx = [raw];
                 let sent = port::tx_burst(outer_port_id, queue_id, &mut tx, 1);
@@ -1299,6 +1321,11 @@ pub fn run_router_dispatcher(
         for frame in pending_frames.drain(..) {
             if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
                 if out_mbuf.write_packet(&frame).is_ok() {
+                    match checksum_mode {
+                        ChecksumMode::HardwareUdpOnly => out_mbuf.set_tx_udp_checksum_offload(),
+                        ChecksumMode::HardwareFull => out_mbuf.set_tx_full_checksum_offload(),
+                        _ => {}
+                    }
                     let raw = out_mbuf.into_raw();
                     let mut tx = [raw];
                     let sent = port::tx_burst(outer_port_id, 0, &mut tx, 1);

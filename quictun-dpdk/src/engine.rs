@@ -300,6 +300,7 @@ pub fn run(
                         }
                     }
                     Some(ParsedPacket::Arp(arp)) => RxAction::Arp(arp),
+                    Some(ParsedPacket::Ipv4Raw(_)) => RxAction::Skip,
                     None => RxAction::Skip,
                 }
             };
@@ -1005,7 +1006,7 @@ pub fn run_handshake_only(
                         pending_frames.push(reply);
                     }
                 }
-                None => {}
+                Some(ParsedPacket::Ipv4Raw(_)) | None => {}
             }
         }
 
@@ -1260,7 +1261,7 @@ pub fn run_dispatcher(
                         pending_frames.push(reply);
                     }
                 }
-                None => {}
+                Some(ParsedPacket::Ipv4Raw(_)) | None => {}
             }
         }
 
@@ -1623,6 +1624,10 @@ pub fn run_worker(
                                 "worker: removed connection"
                             );
                         }
+                    }
+                    ControlMessage::AddRouterConnection { .. }
+                    | ControlMessage::PeerAssignment { .. } => {
+                        // Not used in engine mode.
                     }
                 }
             }
