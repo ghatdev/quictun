@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::time::Instant;
 
 use crate::checksum;
 
@@ -56,32 +57,72 @@ pub struct NetIdentity {
     pub remote_port: u16,
 }
 
-/// Simple ARP table mapping IPv4 → MAC.
+/// ARP stale threshold in seconds. Entries older than this are considered stale.
+const ARP_STALE_SECS: u64 = 60;
+
+/// A learned ARP entry with a timestamp.
+#[derive(Clone)]
+struct ArpEntry {
+    mac: [u8; 6],
+    last_confirmed: Instant,
+}
+
+/// ARP table with static and dynamic entries.
+///
+/// Static entries (from `--dpdk-gateway-mac`) never expire.
+/// Learned entries expire after `ARP_STALE_SECS`.
 #[derive(Clone)]
 pub struct ArpTable {
-    entries: HashMap<Ipv4Addr, [u8; 6]>,
+    static_entries: HashMap<Ipv4Addr, [u8; 6]>,
+    entries: HashMap<Ipv4Addr, ArpEntry>,
 }
 
 impl ArpTable {
     pub fn new() -> Self {
         Self {
+            static_entries: HashMap::new(),
             entries: HashMap::new(),
         }
     }
 
-    /// Insert a static entry (e.g., from --dpdk-gateway-mac).
+    /// Insert a static entry (e.g., from --dpdk-gateway-mac). Never expires.
     pub fn insert(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        self.entries.insert(ip, mac);
+        self.static_entries.insert(ip, mac);
     }
 
     /// Learn a MAC from an incoming packet.
     pub fn learn(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        self.entries.insert(ip, mac);
+        self.entries.insert(ip, ArpEntry {
+            mac,
+            last_confirmed: Instant::now(),
+        });
     }
 
-    /// Look up the MAC for an IP.
+    /// Look up the MAC for an IP. Static entries checked first, then dynamic.
+    /// Returns `None` if the dynamic entry is older than `ARP_STALE_SECS`.
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<[u8; 6]> {
-        self.entries.get(&ip).copied()
+        if let Some(&mac) = self.static_entries.get(&ip) {
+            return Some(mac);
+        }
+        if let Some(entry) = self.entries.get(&ip) {
+            if entry.last_confirmed.elapsed().as_secs() < ARP_STALE_SECS {
+                return Some(entry.mac);
+            }
+        }
+        None
+    }
+
+    /// Return IPs with dynamic entries older than `threshold_secs` (for ARP refresh).
+    pub fn stale_entries(&self, threshold_secs: u64) -> Vec<Ipv4Addr> {
+        self.entries
+            .iter()
+            .filter(|(ip, entry)| {
+                // Don't refresh IPs that have static entries.
+                !self.static_entries.contains_key(ip)
+                    && entry.last_confirmed.elapsed().as_secs() >= threshold_secs
+            })
+            .map(|(ip, _)| *ip)
+            .collect()
     }
 }
 

@@ -280,6 +280,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 dpdk_config.enable_nat,
                 mss_clamp,
                 dpdk_config.tunnel_ip,
+                dpdk_config.tunnel_mtu,
             );
 
             shutdown.store(true, Ordering::Release);
@@ -327,6 +328,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         let outer_port_id = dpdk_config.port_id;
         let enable_nat = dpdk_config.enable_nat;
         let tunnel_ip = dpdk_config.tunnel_ip;
+        let tunnel_mtu = dpdk_config.tunnel_mtu;
         let peers = &dpdk_config.peers;
 
         tracing::info!(
@@ -387,6 +389,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                         enable_nat,
                         mss_clamp,
                         tunnel_ip,
+                        tunnel_mtu,
                         core_idx,
                         port_start,
                         port_end,

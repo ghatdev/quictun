@@ -72,22 +72,34 @@ pub fn echo_reply_inplace(packet: &mut [u8]) -> bool {
 ///
 /// Returns the complete IPv4 + ICMP packet, or None if trigger is too short.
 pub fn build_time_exceeded(trigger_packet: &[u8], src_ip: Ipv4Addr) -> Option<Vec<u8>> {
-    build_icmp_error(ICMP_TIME_EXCEEDED, 0, trigger_packet, src_ip)
+    build_icmp_error(ICMP_TIME_EXCEEDED, 0, trigger_packet, src_ip, 0)
 }
 
 /// Build an ICMP Destination Unreachable (port unreachable) message.
 pub fn build_dest_unreachable(trigger_packet: &[u8], src_ip: Ipv4Addr, code: u8) -> Option<Vec<u8>> {
-    build_icmp_error(ICMP_DEST_UNREACHABLE, code, trigger_packet, src_ip)
+    build_icmp_error(ICMP_DEST_UNREACHABLE, code, trigger_packet, src_ip, 0)
+}
+
+/// Build an ICMP Fragmentation Needed (Type 3, Code 4) message.
+///
+/// Sets the next-hop MTU in the ICMP header per RFC 792/RFC 1191.
+pub fn build_frag_needed(trigger_packet: &[u8], src_ip: Ipv4Addr, mtu: u16) -> Option<Vec<u8>> {
+    let header_rest = (mtu as u32).to_be_bytes();
+    // Rest-of-header: bytes [24..28] = [0, 0, mtu_hi, mtu_lo]
+    let rest = u32::from_be_bytes([0, 0, header_rest[2], header_rest[3]]);
+    build_icmp_error(ICMP_DEST_UNREACHABLE, 4, trigger_packet, src_ip, rest)
 }
 
 /// Build a generic ICMP error message.
 ///
 /// Per RFC 792: ICMP error includes IP header + first 8 bytes of original datagram.
+/// `header_rest` is the 4-byte "rest of header" field at ICMP bytes [4..8] (e.g., next-hop MTU).
 fn build_icmp_error(
     icmp_type: u8,
     icmp_code: u8,
     trigger_packet: &[u8],
     src_ip: Ipv4Addr,
+    header_rest: u32,
 ) -> Option<Vec<u8>> {
     // Need at least IP header of trigger.
     if trigger_packet.len() < 20 {
@@ -122,7 +134,8 @@ fn build_icmp_error(
     pkt[20] = icmp_type;
     pkt[21] = icmp_code;
     // Checksum at [22..24] = 0 initially.
-    // Unused/next-hop MTU at [24..28] = 0.
+    // Rest-of-header (unused/next-hop MTU) at [24..28].
+    pkt[24..28].copy_from_slice(&header_rest.to_be_bytes());
     pkt[28..28 + trigger_data.len()].copy_from_slice(trigger_data);
 
     // ICMP checksum over entire ICMP message.
@@ -260,6 +273,34 @@ mod tests {
 
         // ICMP type = Time Exceeded.
         assert_eq!(icmp_pkt[20], ICMP_TIME_EXCEEDED);
+
+        // Checksums valid.
+        let ihl = (icmp_pkt[0] & 0x0f) as usize * 4;
+        assert!(verify_checksum(&icmp_pkt[..ihl]));
+        assert!(verify_checksum(&icmp_pkt[ihl..]));
+    }
+
+    #[test]
+    fn test_frag_needed() {
+        let trigger_src = Ipv4Addr::new(10, 0, 0, 2);
+        let trigger_dst = Ipv4Addr::new(8, 8, 8, 8);
+        let trigger = build_echo_request(trigger_src, trigger_dst, 1, 1);
+
+        let local_ip = Ipv4Addr::new(192, 168, 100, 10);
+        let mtu: u16 = 1280;
+        let icmp_pkt = build_frag_needed(&trigger, local_ip, mtu).expect("should build");
+
+        // ICMP type = Dest Unreachable, code = 4 (Frag Needed).
+        assert_eq!(icmp_pkt[20], ICMP_DEST_UNREACHABLE);
+        assert_eq!(icmp_pkt[21], 4);
+
+        // Next-hop MTU at bytes [26..28].
+        let got_mtu = u16::from_be_bytes([icmp_pkt[26], icmp_pkt[27]]);
+        assert_eq!(got_mtu, mtu);
+
+        // Bytes [24..26] should be zero (unused upper half).
+        assert_eq!(icmp_pkt[24], 0);
+        assert_eq!(icmp_pkt[25], 0);
 
         // Checksums valid.
         let ihl = (icmp_pkt[0] & 0x0f) as usize * 4;

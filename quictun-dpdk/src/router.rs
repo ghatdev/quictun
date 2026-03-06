@@ -18,7 +18,7 @@ use crate::mbuf::Mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{BUF_SIZE, MultiQuicState};
-use quictun_core::mss;
+use quictun_core::{icmp, mss};
 use quictun_core::nat::{self, NatForwardKey, NatTable};
 use quictun_core::peer::PeerConfig;
 use quictun_core::routing::{RouteAction, RoutingTable};
@@ -42,6 +42,12 @@ const ETH_HLEN: usize = 14;
 /// NAT sweep interval.
 const NAT_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
+/// ARP refresh interval (send ARP requests for stale entries).
+const ARP_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// ARP stale threshold for refresh probing (seconds).
+const ARP_STALE_THRESHOLD_SECS: u64 = 30;
+
 /// Run the single-core router-mode polling loop.
 ///
 /// A single NIC handles:
@@ -63,6 +69,7 @@ pub fn run_router(
     enable_nat: bool,
     mss_clamp_val: u16,
     tunnel_ip: Ipv4Addr,
+    tunnel_mtu: u16,
 ) -> Result<()> {
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
@@ -96,8 +103,14 @@ pub fn run_router(
     let mut nat_forward: u64 = 0;
     let mut nat_reverse: u64 = 0;
     let mut hub_spoke: u64 = 0;
+    let mut ttl_drop: u64 = 0;
+    let mut no_route_drop: u64 = 0;
+    let mut frag_needed: u64 = 0;
+    let mut mac_fail: u64 = 0;
+    let mut arp_refresh_count: u64 = 0;
     let mut last_stats = Instant::now();
     let mut last_nat_sweep = Instant::now();
+    let mut last_arp_refresh = Instant::now();
 
     // Adaptive polling.
     let mut empty_polls: u32 = 0;
@@ -228,7 +241,13 @@ pub fn run_router(
                                         &mut pkt_buf,
                                         &mut nat_forward,
                                         &mut hub_spoke,
+                                        &mut ttl_drop,
+                                        &mut no_route_drop,
+                                        &mut frag_needed,
+                                        &mut mac_fail,
                                         now,
+                                        tunnel_ip,
+                                        tunnel_mtu,
                                     );
                                 }
                             }
@@ -525,6 +544,17 @@ pub fn run_router(
             last_nat_sweep = now;
         }
 
+        // ARP refresh.
+        if now.duration_since(last_arp_refresh) >= ARP_REFRESH_INTERVAL {
+            let stale = arp_table.stale_entries(ARP_STALE_THRESHOLD_SECS);
+            for stale_ip in &stale {
+                let request = net::build_arp_request(identity.local_mac, identity.local_ip, *stale_ip);
+                pending_frames.push(request);
+                arp_refresh_count += 1;
+            }
+            last_arp_refresh = now;
+        }
+
         // Stats.
         if now.duration_since(last_stats) >= Duration::from_secs(10) {
             now = Instant::now();
@@ -536,6 +566,11 @@ pub fn run_router(
                 nat_fwd = nat_forward,
                 nat_rev = nat_reverse,
                 hub_spoke,
+                ttl_drop,
+                no_route_drop,
+                frag_needed,
+                mac_fail,
+                arp_refresh = arp_refresh_count,
                 nat_entries = nat_table.len(),
                 connections = connections.len(),
                 "router stats"
@@ -585,10 +620,39 @@ fn handle_decrypted_packet(
     pkt_buf: &mut [u8],
     nat_forward_count: &mut u64,
     hub_spoke_count: &mut u64,
+    ttl_drop_count: &mut u64,
+    no_route_drop_count: &mut u64,
+    frag_needed_count: &mut u64,
+    mac_fail_count: &mut u64,
     now: Instant,
+    tunnel_ip: Ipv4Addr,
+    tunnel_mtu: u16,
 ) {
     if inner_pkt.len() < 20 {
         return;
+    }
+
+    // Fragmentation Needed check: if packet exceeds tunnel MTU and DF bit is set.
+    if tunnel_mtu > 0 && inner_pkt.len() > tunnel_mtu as usize {
+        let df_set = (inner_pkt[6] & 0x40) != 0;
+        if df_set {
+            *frag_needed_count += 1;
+            if let Some(icmp_pkt) = icmp::build_frag_needed(inner_pkt, tunnel_ip, tunnel_mtu) {
+                if let Some(entry) = connections.get_mut(&src_cid) {
+                    encrypt_and_send(
+                        &icmp_pkt,
+                        entry,
+                        identity,
+                        mempool,
+                        outer_tx_mbufs,
+                        ip_id,
+                        checksum_mode,
+                        pkt_buf,
+                    );
+                }
+            }
+            return;
+        }
     }
 
     let dst_ip = Ipv4Addr::new(inner_pkt[16], inner_pkt[17], inner_pkt[18], inner_pkt[19]);
@@ -641,7 +705,8 @@ fn handle_decrypted_packet(
                 identity.remote_mac
             });
             let Some(dst_mac) = dst_mac else {
-                return; // no MAC for destination
+                *mac_fail_count += 1;
+                return;
             };
 
             let frame_len = ETH_HLEN + inner_pkt.len();
@@ -665,7 +730,22 @@ fn handle_decrypted_packet(
             // Decrement TTL.
             let ttl = pkt_buf[ETH_HLEN + 8];
             if ttl <= 1 {
-                return; // TTL expired
+                *ttl_drop_count += 1;
+                if let Some(icmp_pkt) = icmp::build_time_exceeded(inner_pkt, tunnel_ip) {
+                    if let Some(entry) = connections.get_mut(&src_cid) {
+                        encrypt_and_send(
+                            &icmp_pkt,
+                            entry,
+                            identity,
+                            mempool,
+                            outer_tx_mbufs,
+                            ip_id,
+                            checksum_mode,
+                            pkt_buf,
+                        );
+                    }
+                }
+                return;
             }
             pkt_buf[ETH_HLEN + 8] = ttl - 1;
             // Fix IP checksum for TTL change.
@@ -696,7 +776,23 @@ fn handle_decrypted_packet(
                 }
             }
         }
-        RouteAction::Drop => {}
+        RouteAction::Drop => {
+            *no_route_drop_count += 1;
+            if let Some(icmp_pkt) = icmp::build_dest_unreachable(inner_pkt, tunnel_ip, 0) {
+                if let Some(entry) = connections.get_mut(&src_cid) {
+                    encrypt_and_send(
+                        &icmp_pkt,
+                        entry,
+                        identity,
+                        mempool,
+                        outer_tx_mbufs,
+                        ip_id,
+                        checksum_mode,
+                        pkt_buf,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -938,7 +1034,9 @@ pub fn run_router_dispatcher(
     let mut tx_pkts: u64 = 0;
     let mut dispatch_miss: u64 = 0;
     let mut return_dispatch: u64 = 0;
+    let mut arp_refresh_count: u64 = 0;
     let mut last_stats = Instant::now();
+    let mut last_arp_refresh = Instant::now();
 
     // Adaptive polling.
     let mut empty_polls: u32 = 0;
@@ -1215,12 +1313,24 @@ pub fn run_router_dispatcher(
 
         // ── Stats ──
 
+        // ARP refresh.
+        if now.duration_since(last_arp_refresh) >= ARP_REFRESH_INTERVAL {
+            let stale = arp_table.stale_entries(ARP_STALE_THRESHOLD_SECS);
+            for stale_ip in &stale {
+                let request = net::build_arp_request(identity.local_mac, identity.local_ip, *stale_ip);
+                pending_frames.push(request);
+                arp_refresh_count += 1;
+            }
+            last_arp_refresh = now;
+        }
+
         if now.duration_since(last_stats) >= Duration::from_secs(10) {
             tracing::info!(
                 rx = rx_pkts,
                 tx = tx_pkts,
                 dispatch_miss,
                 return_dispatch,
+                arp_refresh = arp_refresh_count,
                 handshakes = multi_state.handshakes.len(),
                 "router dispatcher stats"
             );
@@ -1266,6 +1376,7 @@ pub fn run_router_worker(
     enable_nat: bool,
     mss_clamp_val: u16,
     tunnel_ip: Ipv4Addr,
+    tunnel_mtu: u16,
     core_id: usize,
     port_start: u16,
     port_end: u16,
@@ -1304,6 +1415,10 @@ pub fn run_router_worker(
     let mut hub_spoke: u64 = 0;
     let mut fwd_rx_count: u64 = 0;
     let mut fwd_rx_drop: u64 = 0;
+    let mut ttl_drop: u64 = 0;
+    let mut no_route_drop: u64 = 0;
+    let mut frag_needed: u64 = 0;
+    let mut mac_fail: u64 = 0;
     let mut last_stats = Instant::now();
     let mut last_nat_sweep = Instant::now();
 
@@ -1472,16 +1587,40 @@ pub fn run_router_worker(
                                 }
 
                                 let inner_pkt = &data[*abs_start..*abs_end];
+
+                                // Find the CID for the source connection.
+                                let src_cid = cid_to_u64(
+                                    &data[payload_offset + 1..payload_offset + 1 + CID_LEN],
+                                );
+
+                                // Fragmentation Needed check.
+                                if tunnel_mtu > 0 && inner_pkt.len() > tunnel_mtu as usize {
+                                    let df_set = (inner_pkt[6] & 0x40) != 0;
+                                    if df_set {
+                                        frag_needed += 1;
+                                        if let Some(icmp_pkt) = icmp::build_frag_needed(inner_pkt, tunnel_ip, tunnel_mtu) {
+                                            if let Some(entry) = connections.get_mut(&src_cid) {
+                                                encrypt_and_send(
+                                                    &icmp_pkt,
+                                                    entry,
+                                                    identity,
+                                                    mempool,
+                                                    &mut outer_tx_mbufs,
+                                                    &mut ip_id,
+                                                    checksum_mode,
+                                                    &mut pkt_buf,
+                                                );
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+
                                 let dst_ip = Ipv4Addr::new(
                                     inner_pkt[16],
                                     inner_pkt[17],
                                     inner_pkt[18],
                                     inner_pkt[19],
-                                );
-
-                                // Find the CID for the source connection.
-                                let src_cid = cid_to_u64(
-                                    &data[payload_offset + 1..payload_offset + 1 + CID_LEN],
                                 );
 
                                 match routing_table.lookup(dst_ip) {
@@ -1571,6 +1710,7 @@ pub fn run_router_worker(
                                             identity.remote_mac
                                         });
                                         let Some(dst_mac) = dst_mac else {
+                                            mac_fail += 1;
                                             continue;
                                         };
 
@@ -1593,6 +1733,21 @@ pub fn run_router_worker(
 
                                         let ttl = pkt_buf[ETH_HLEN + 8];
                                         if ttl <= 1 {
+                                            ttl_drop += 1;
+                                            if let Some(icmp_pkt) = icmp::build_time_exceeded(inner_pkt, tunnel_ip) {
+                                                if let Some(entry) = connections.get_mut(&src_cid) {
+                                                    encrypt_and_send(
+                                                        &icmp_pkt,
+                                                        entry,
+                                                        identity,
+                                                        mempool,
+                                                        &mut outer_tx_mbufs,
+                                                        &mut ip_id,
+                                                        checksum_mode,
+                                                        &mut pkt_buf,
+                                                    );
+                                                }
+                                            }
                                             continue;
                                         }
                                         pkt_buf[ETH_HLEN + 8] = ttl - 1;
@@ -1626,7 +1781,23 @@ pub fn run_router_worker(
                                             }
                                         }
                                     }
-                                    RouteAction::Drop => {}
+                                    RouteAction::Drop => {
+                                        no_route_drop += 1;
+                                        if let Some(icmp_pkt) = icmp::build_dest_unreachable(inner_pkt, tunnel_ip, 0) {
+                                            if let Some(entry) = connections.get_mut(&src_cid) {
+                                                encrypt_and_send(
+                                                    &icmp_pkt,
+                                                    entry,
+                                                    identity,
+                                                    mempool,
+                                                    &mut outer_tx_mbufs,
+                                                    &mut ip_id,
+                                                    checksum_mode,
+                                                    &mut pkt_buf,
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1822,6 +1993,10 @@ pub fn run_router_worker(
                 hub_spoke,
                 fwd_rx = fwd_rx_count,
                 fwd_rx_drop,
+                ttl_drop,
+                no_route_drop,
+                frag_needed,
+                mac_fail,
                 nat_entries = nat_table.len(),
                 connections = connections.len(),
                 "router worker stats"
