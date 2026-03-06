@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use quictun_core::config::CipherSuite;
 use quictun_core::connection::{self, TransportTuning};
 use quictun_crypto::PrivateKey;
 
@@ -13,10 +14,10 @@ fn test_tuning() -> TransportTuning {
     TransportTuning::default()
 }
 
-/// Create server + client endpoints with RPK auth, custom CID length and FIPS flag.
+/// Create server + client endpoints with RPK auth and custom CID length.
 fn make_endpoints(
     cid_length: usize,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
 ) -> Result<(
     PrivateKey,
     PrivateKey,
@@ -32,19 +33,19 @@ fn make_endpoints(
     let keepalive = Some(Duration::from_secs(5));
     let tuning = test_tuning();
 
-    let server_config = connection::build_server_config_ext(
+    let server_config = connection::build_server_config(
         &server_key,
         &[client_pubkey],
         keepalive,
         &tuning,
-        fips_mode,
+        cipher_suites,
     )?;
-    let client_config = connection::build_client_config_ext(
+    let client_config = connection::build_client_config(
         &client_key,
         &server_pubkey,
         keepalive,
         &tuning,
-        fips_mode,
+        cipher_suites,
         false,
     )?;
 
@@ -111,7 +112,7 @@ fn spawn_echo_server(
 
 #[tokio::test]
 async fn connection_lost_returns_retriable() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, &CipherSuite::all())?;
 
     // Use a oneshot to coordinate: server waits for client signal before closing.
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
@@ -176,20 +177,22 @@ async fn idle_timeout_config() -> Result<()> {
     let server_pubkey = server_key.public_key()?;
     let client_pubkey = client_key.public_key()?;
 
+    let all_ciphers = CipherSuite::all();
+
     // Build with tight idle timeout, NO keepalive
-    let server_config = connection::build_server_config_ext(
+    let server_config = connection::build_server_config(
         &server_key,
         &[client_pubkey],
         None, // no keepalive
         &tuning,
-        false,
+        &all_ciphers,
     )?;
-    let client_config = connection::build_client_config_ext(
+    let client_config = connection::build_client_config(
         &client_key,
         &server_pubkey,
         None,
         &tuning,
-        false,
+        &all_ciphers,
         false,
     )?;
 
@@ -221,12 +224,12 @@ async fn idle_timeout_config() -> Result<()> {
     Ok(())
 }
 
-// ── Phase 2: FIPS Mode ──────────────────────────────────────────────────────
+// ── Phase 2: Cipher Selection ────────────────────────────────────────────────
 
 #[tokio::test]
-async fn fips_mode_echo_round_trip() -> Result<()> {
-    // FIPS mode: only AES-GCM + P-256/P-384, no ChaCha20/x25519
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, true)?;
+async fn aes_only_cipher_echo_round_trip() -> Result<()> {
+    let aes_only = vec![CipherSuite::Aes128Gcm, CipherSuite::Aes256Gcm];
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, &aes_only)?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -242,7 +245,7 @@ async fn fips_mode_echo_round_trip() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_0_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(0, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(0, &CipherSuite::all())?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -256,7 +259,7 @@ async fn cid_length_0_works() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_4_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(4, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(4, &CipherSuite::all())?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -270,7 +273,7 @@ async fn cid_length_4_works() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_8_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, false)?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, &CipherSuite::all())?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -294,21 +297,22 @@ async fn session_resumption_reconnect() -> Result<()> {
     let keepalive = Some(Duration::from_secs(5));
     let tuning = test_tuning();
 
-    let server_config = connection::build_server_config_ext(
+    let all_ciphers = CipherSuite::all();
+    let server_config = connection::build_server_config(
         &server_key,
         &[client_pubkey],
         keepalive,
         &tuning,
-        false,
+        &all_ciphers,
     )?;
 
     // Enable session resumption
-    let client_config = connection::build_client_config_ext(
+    let client_config = connection::build_client_config(
         &client_key,
         &server_pubkey,
         keepalive,
         &tuning,
-        false,
+        &all_ciphers,
         true, // enable_session_resumption
     )?;
 
@@ -426,7 +430,7 @@ async fn x509_echo_round_trip() -> Result<()> {
         &ca_path, // trust client certs signed by this CA
         keepalive,
         &tuning,
-        false,
+        &CipherSuite::all(),
     )?;
 
     let client_config = connection::build_client_config_x509(
@@ -435,7 +439,7 @@ async fn x509_echo_round_trip() -> Result<()> {
         &ca_path, // trust server certs signed by this CA
         keepalive,
         &tuning,
-        false,
+        &CipherSuite::all(),
         false,
     )?;
 
@@ -479,7 +483,7 @@ async fn x509_rejects_untrusted_client() -> Result<()> {
         &ca_path,
         keepalive,
         &tuning,
-        false,
+        &CipherSuite::all(),
     )?;
 
     // Client uses rogue cert NOT signed by the CA
@@ -489,7 +493,7 @@ async fn x509_rejects_untrusted_client() -> Result<()> {
         &ca_path, // client trusts server (which IS valid)
         keepalive,
         &tuning,
-        false,
+        &CipherSuite::all(),
         false,
     )?;
 
@@ -530,94 +534,82 @@ async fn x509_rejects_untrusted_client() -> Result<()> {
 
 #[test]
 fn config_validates_cid_length() {
-    let toml = r#"
+    // cid_length = 3 is invalid (must be 0, 4, or 8)
+    let result = quictun_core::config::Config::from_toml(
+        r#"
 [interface]
+mode = "listener"
 private_key = "dGVzdA=="
 address = "10.0.0.1/24"
+listen_port = 443
 cid_length = 3
 
-[[peer]]
+[[peers]]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.2/32"]
-"#;
-    let config: quictun_core::config::Config = toml::from_str(toml).unwrap();
-    let result = std::panic::catch_unwind(|| {
-        // validate is private, but load() calls it. We can test via load semantics.
-        // Since validate is called in load, let's test the parsed config's cid_length.
-        assert_eq!(config.interface.cid_length, 3);
-    });
-    assert!(result.is_ok());
-    // The validation happens in Config::load, which we can't call without a file.
-    // But we can verify the parsed value is 3 (invalid), which would fail validation.
+"#,
+    );
+    assert!(result.is_err());
 }
 
 #[test]
 fn config_default_auth_mode_is_rpk() {
-    let toml = r#"
+    let config = quictun_core::config::Config::from_toml(
+        r#"
 [interface]
+mode = "listener"
 private_key = "dGVzdA=="
 address = "10.0.0.1/24"
+listen_port = 443
 
-[[peer]]
+[[peers]]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.2/32"]
-"#;
-    let config: quictun_core::config::Config = toml::from_str(toml).unwrap();
+"#,
+    )
+    .unwrap();
     assert_eq!(config.interface.auth_mode, "rpk");
     assert_eq!(config.interface.cid_length, 8);
-    assert!(!config.interface.fips_mode);
     assert!(!config.interface.zero_rtt);
 }
 
 #[test]
-fn config_x509_requires_all_files() {
-    let toml = r#"
+fn config_cipher_selection_parses() {
+    let config = quictun_core::config::Config::from_toml(
+        r#"
 [interface]
+mode = "connector"
 private_key = "dGVzdA=="
-address = "10.0.0.1/24"
-auth_mode = "x509"
-cert_file = "/tmp/cert.pem"
+address = "10.0.0.2/24"
+cipher = "chacha20"
 
-[[peer]]
+[peer]
 public_key = "dGVzdA=="
-allowed_ips = ["10.0.0.2/32"]
-"#;
-    let config: quictun_core::config::Config = toml::from_str(toml).unwrap();
-    // x509 without key_file and ca_file would fail validation in Config::load
-    assert_eq!(config.interface.auth_mode, "x509");
-    assert!(config.interface.key_file.is_none());
-    assert!(config.interface.ca_file.is_none());
-}
-
-#[test]
-fn config_fips_mode_parses() {
-    let toml = r#"
-[interface]
-private_key = "dGVzdA=="
-address = "10.0.0.1/24"
-fips_mode = true
-
-[[peer]]
-public_key = "dGVzdA=="
-allowed_ips = ["10.0.0.2/32"]
-"#;
-    let config: quictun_core::config::Config = toml::from_str(toml).unwrap();
-    assert!(config.interface.fips_mode);
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+    )
+    .unwrap();
+    let suites = config.client_cipher_suites().unwrap();
+    assert_eq!(suites, vec![CipherSuite::ChaCha20]);
 }
 
 #[test]
 fn config_reconnect_interval_parses() {
-    let toml = r#"
+    let config = quictun_core::config::Config::from_toml(
+        r#"
 [interface]
+mode = "connector"
 private_key = "dGVzdA=="
 address = "10.0.0.2/24"
 
-[[peer]]
+[peer]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.1/32"]
 endpoint = "1.2.3.4:443"
 reconnect_interval = 5
-"#;
-    let config: quictun_core::config::Config = toml::from_str(toml).unwrap();
-    assert_eq!(config.peer[0].reconnect_interval, Some(5));
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.all_peers()[0].reconnect_interval, Some(5));
 }

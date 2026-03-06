@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Result;
+use quictun_core::config::CipherSuite;
 use quictun_core::connection::{self, TransportTuning};
 use quictun_crypto::PrivateKey;
 
@@ -18,17 +19,21 @@ async fn datagram_echo_round_trip() -> Result<()> {
     let keepalive = Some(Duration::from_secs(5));
 
     // Build configs pinned to each other's keys
+    let all_ciphers = CipherSuite::all();
     let server_config = connection::build_server_config(
         &server_key,
         &[client_pubkey],
         keepalive,
         &TransportTuning::default(),
+        &all_ciphers,
     )?;
     let client_config = connection::build_client_config(
         &client_key,
         &server_pubkey,
         keepalive,
         &TransportTuning::default(),
+        &all_ciphers,
+        false,
     )?;
 
     // Bind server on ephemeral port
@@ -92,12 +97,15 @@ async fn rejects_unknown_client_key() -> Result<()> {
 
     let keepalive = Some(Duration::from_secs(5));
 
+    let all_ciphers = CipherSuite::all();
+
     // Server only allows the authorized client
     let server_config = connection::build_server_config(
         &server_key,
         &[authorized_pubkey],
         keepalive,
         &TransportTuning::default(),
+        &all_ciphers,
     )?;
 
     // Unauthorized client tries to connect
@@ -106,6 +114,8 @@ async fn rejects_unknown_client_key() -> Result<()> {
         &server_pubkey,
         keepalive,
         &TransportTuning::default(),
+        &all_ciphers,
+        false,
     )?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;

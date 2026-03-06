@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::config::CipherSuite;
 use crate::connection::{self, TransportTuning};
 use quictun_crypto::{PrivateKey, PublicKey};
 
@@ -15,8 +16,15 @@ pub fn build_proto_client_config(
     server_pubkey: &PublicKey,
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
+    cipher_suites: &[CipherSuite],
+    enable_session_resumption: bool,
 ) -> Result<quinn_proto::ClientConfig> {
-    let tls = connection::build_rustls_client_tls_config(private_key, server_pubkey, false, false)?;
+    let tls = connection::build_rustls_client_tls_config(
+        private_key,
+        server_pubkey,
+        cipher_suites,
+        enable_session_resumption,
+    )?;
     let quic_crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(tls)
         .context("failed to create QUIC client crypto config")?;
     let mut config = quinn_proto::ClientConfig::new(Arc::new(quic_crypto));
@@ -35,8 +43,9 @@ pub fn build_proto_server_config(
     allowed_peers: &[PublicKey],
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
+    cipher_suites: &[CipherSuite],
 ) -> Result<Arc<quinn_proto::ServerConfig>> {
-    let tls = connection::build_rustls_server_tls_config(private_key, allowed_peers, false)?;
+    let tls = connection::build_rustls_server_tls_config(private_key, allowed_peers, cipher_suites)?;
     let quic_crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(tls)
         .context("failed to create QUIC server crypto config")?;
     let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(quic_crypto));

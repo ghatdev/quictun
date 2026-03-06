@@ -5,87 +5,24 @@ use std::time::Duration;
 #[cfg(not(target_os = "linux"))]
 use anyhow::bail;
 use anyhow::{Context, Result};
-use quictun_core::config::{Config, Role};
+use quictun_core::config::{Backend, Config, Mode};
 use quictun_core::connection::{CongestionControl, TransportTuning};
 use quictun_core::proto_config;
 use quictun_crypto::{PrivateKey, PublicKey};
 
 use crate::state;
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    config_path: &str,
-    cc: &str,
-    recv_buf: usize,
-    send_buf: usize,
-    send_window: u64,
-    initial_rtt: u64,
-    pin_mtu: bool,
-    dpdk: Option<String>,
-    dpdk_local_ip: Option<String>,
-    dpdk_remote_ip: Option<String>,
-    dpdk_local_port: Option<u16>,
-    dpdk_gateway_mac: Option<String>,
-    dpdk_eal_args: String,
-    dpdk_port: u16,
-    no_adaptive_poll: bool,
-    dpdk_cores: usize,
-    no_udp_checksum: bool,
-    no_nat: bool,
-    mss_clamp: u16,
-    offload: bool,
-    threads: usize,
-) -> Result<()> {
-    let cc: CongestionControl = cc.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+pub fn run(config_path: &str) -> Result<()> {
+    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
 
-    if let Some(dpdk_mode) = dpdk {
-        return run_dpdk(
-            config_path,
-            cc,
-            recv_buf,
-            send_buf,
-            send_window,
-            &dpdk_mode,
-            dpdk_local_ip,
-            dpdk_remote_ip,
-            dpdk_local_port,
-            dpdk_gateway_mac,
-            dpdk_eal_args,
-            dpdk_port,
-            no_adaptive_poll,
-            dpdk_cores,
-            no_udp_checksum,
-            no_nat,
-            mss_clamp,
-        );
+    match config.engine.backend {
+        Backend::Kernel => run_net(config_path, &config),
+        Backend::DpdkVirtio | Backend::DpdkRouter => run_dpdk(config_path, &config),
     }
-
-    run_net(
-        config_path,
-        cc,
-        recv_buf,
-        send_buf,
-        send_window,
-        initial_rtt,
-        pin_mtu,
-        threads,
-        offload,
-    )
 }
 
 /// Run the synchronous blocking engine (quictun-net, default path).
-#[allow(clippy::too_many_arguments)]
-fn run_net(
-    config_path: &str,
-    cc: CongestionControl,
-    recv_buf: usize,
-    send_buf: usize,
-    _send_window: u64,
-    _initial_rtt: u64,
-    _pin_mtu: bool,
-    threads: usize,
-    offload: bool,
-) -> Result<()> {
+fn run_net(config_path: &str, config: &Config) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -93,16 +30,14 @@ fn run_net(
         )
         .init();
 
-    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
-    let role = config.role();
+    let mode = config.mode();
     let addr = config.parse_address()?;
 
     let private_key = PrivateKey::from_base64(&config.interface.private_key)
         .context("invalid interface private_key")?;
 
-    // Parse all peer public keys.
-    let peer_pubkeys: Vec<PublicKey> = config
-        .peer
+    let peers = config.all_peers();
+    let peer_pubkeys: Vec<PublicKey> = peers
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -111,34 +46,37 @@ fn run_net(
         })
         .collect::<Result<_>>()?;
 
+    let cc: CongestionControl = config
+        .engine
+        .cc
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
     let tuning = TransportTuning {
-        datagram_recv_buffer: recv_buf,
-        datagram_send_buffer: send_buf,
-        send_window: _send_window,
+        datagram_recv_buffer: config.engine.recv_buf,
+        datagram_send_buffer: config.engine.send_buf,
+        send_window: config.engine.send_window,
         cc,
         max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
-        initial_rtt_ms: _initial_rtt,
-        pin_mtu: _pin_mtu,
+        initial_rtt_ms: config.engine.initial_rtt_ms,
+        pin_mtu: config.engine.pin_mtu,
         ..Default::default()
     };
 
     tracing::info!(
-        role = ?role,
+        mode = %mode,
         address = %addr,
         mtu = config.mtu(),
-        peers = config.peer.len(),
+        peers = peers.len(),
         cc = %cc,
         "starting quictun (net engine)"
     );
 
-    // Resolve interface name from config.
     let iface_name = config.interface_name(Path::new(config_path));
 
-    // Write PID file.
     state::write_pid_file(&iface_name)?;
     let _pid_guard = state::PidFileGuard::new(iface_name.clone());
 
-    // Idle timeout.
     let idle_timeout = if config.interface.max_idle_timeout_ms > 0 {
         Duration::from_millis(config.interface.max_idle_timeout_ms)
     } else {
@@ -147,9 +85,7 @@ fn run_net(
 
     let cid_len = config.interface.cid_length as usize;
 
-    // Build peer configs for identity matching.
-    let resolved_peers: Vec<quictun_core::peer::PeerConfig> = config
-        .peer
+    let resolved_peers: Vec<quictun_core::peer::PeerConfig> = peers
         .iter()
         .zip(peer_pubkeys.iter())
         .map(|(peer_cfg, pubkey)| {
@@ -175,14 +111,12 @@ fn run_net(
         })
         .collect();
 
-    let reconnect = config.peer[0].reconnect_interval.is_some();
+    let reconnect = peers[0].reconnect_interval.is_some();
 
-    // Build UDP bind address.
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
-    // Build endpoint setup.
-    let first_keepalive = config.peer[0].keepalive.map(Duration::from_secs);
+    let first_keepalive = peers[0].keepalive.map(Duration::from_secs);
 
     let net_config = quictun_net::engine::NetConfig {
         tunnel_ip: addr.addr(),
@@ -193,29 +127,33 @@ fn run_net(
         cid_len,
         peers: resolved_peers,
         reconnect,
-        recv_buf,
-        send_buf,
-        threads,
-        offload,
+        recv_buf: config.engine.recv_buf,
+        send_buf: config.engine.send_buf,
+        threads: config.engine.threads,
+        offload: config.engine.offload,
     };
 
-    // Backoff state for reconnection.
+    // Resolve cipher suites.
+    let server_ciphers = config.server_cipher_suites()?;
+    let client_ciphers = config.client_cipher_suites()?;
+
     let mut backoff_secs: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
 
     loop {
-        let setup = match role {
-            Role::Listener => {
+        let setup = match mode {
+            Mode::Listener => {
                 let server_config = proto_config::build_proto_server_config(
                     &private_key,
                     &peer_pubkeys,
                     first_keepalive,
                     &tuning,
+                    &server_ciphers,
                 )?;
                 quictun_net::engine::EndpointSetup::Listener { server_config }
             }
-            Role::Connector => {
-                let peer = &config.peer[0];
+            Mode::Connector => {
+                let peer = &peers[0];
                 let peer_pubkey = &peer_pubkeys[0];
                 let keepalive = peer.keepalive.map(Duration::from_secs);
                 let client_config = proto_config::build_proto_client_config(
@@ -223,6 +161,8 @@ fn run_net(
                     peer_pubkey,
                     keepalive,
                     &tuning,
+                    &client_ciphers,
+                    config.interface.zero_rtt,
                 )?;
                 let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
                 quictun_net::engine::EndpointSetup::Connector {
@@ -261,55 +201,12 @@ fn run_net(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-fn run_dpdk(
-    _config_path: &str,
-    _cc: CongestionControl,
-    _recv_buf: usize,
-    _send_buf: usize,
-    _send_window: u64,
-    _dpdk_mode: &str,
-    _dpdk_local_ip: Option<String>,
-    _dpdk_remote_ip: Option<String>,
-    _dpdk_local_port: Option<u16>,
-    _dpdk_gateway_mac: Option<String>,
-    _dpdk_eal_args: String,
-    _dpdk_port: u16,
-    _no_adaptive_poll: bool,
-    _dpdk_cores: usize,
-    _no_udp_checksum: bool,
-    _no_nat: bool,
-    _mss_clamp: u16,
-) -> Result<()> {
-    bail!("--dpdk requires Linux");
+fn run_dpdk(_config_path: &str, _config: &Config) -> Result<()> {
+    bail!("DPDK backends require Linux");
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn run_dpdk(
-    config_path: &str,
-    cc: CongestionControl,
-    recv_buf: usize,
-    send_buf: usize,
-    send_window: u64,
-    dpdk_mode: &str,
-    dpdk_local_ip: Option<String>,
-    dpdk_remote_ip: Option<String>,
-    dpdk_local_port: Option<u16>,
-    dpdk_gateway_mac: Option<String>,
-    dpdk_eal_args: String,
-    dpdk_port: u16,
-    no_adaptive_poll: bool,
-    dpdk_cores: usize,
-    no_udp_checksum: bool,
-    no_nat: bool,
-    mss_clamp: u16,
-) -> Result<()> {
-    // Validate mode.
-    if dpdk_mode != "tap" && dpdk_mode != "virtio" && dpdk_mode != "router" {
-        anyhow::bail!("--dpdk mode must be 'tap', 'virtio', or 'router', got '{dpdk_mode}'");
-    }
-
+fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -317,56 +214,80 @@ fn run_dpdk(
         )
         .init();
 
-    let config = Config::load(Path::new(config_path)).context("failed to load config")?;
-    let role = config.role();
+    let mode = config.mode();
     let addr = config.parse_address()?;
 
     let private_key = PrivateKey::from_base64(&config.interface.private_key)
         .context("invalid interface private_key")?;
 
-    let peer = &config.peer[0];
+    let peers = config.all_peers();
+    let peer = &peers[0];
     let peer_pubkey =
         PublicKey::from_base64(&peer.public_key).context("invalid peer public_key")?;
 
     let keepalive = peer.keepalive.map(Duration::from_secs);
 
+    let cc: CongestionControl = config
+        .engine
+        .cc
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
     let tuning = TransportTuning {
-        datagram_recv_buffer: recv_buf,
-        datagram_send_buffer: send_buf,
-        send_window,
+        datagram_recv_buffer: config.engine.recv_buf,
+        datagram_send_buffer: config.engine.send_buf,
+        send_window: config.engine.send_window,
         cc,
         ..Default::default()
     };
 
     // Parse DPDK-specific IPs.
-    let dpdk_local_ip: std::net::Ipv4Addr = dpdk_local_ip
-        .context("--dpdk-local-ip is required with --dpdk")?
+    let dpdk_local_ip: std::net::Ipv4Addr = config
+        .engine
+        .dpdk_local_ip
+        .as_ref()
+        .context("dpdk_local_ip is required for DPDK backends")?
         .parse()
-        .context("invalid --dpdk-local-ip")?;
+        .context("invalid dpdk_local_ip")?;
 
-    let dpdk_remote_ip: std::net::Ipv4Addr = dpdk_remote_ip
-        .context("--dpdk-remote-ip is required with --dpdk")?
+    let dpdk_remote_ip: std::net::Ipv4Addr = config
+        .engine
+        .dpdk_remote_ip
+        .as_ref()
+        .context("dpdk_remote_ip is required for DPDK backends")?
         .parse()
-        .context("invalid --dpdk-remote-ip")?;
+        .context("invalid dpdk_remote_ip")?;
 
-    // Parse optional gateway MAC (e.g., "bc:24:11:ab:cd:ef").
-    let gateway_mac = dpdk_gateway_mac
-        .map(|s| parse_mac(&s))
+    let gateway_mac = config
+        .engine
+        .dpdk_gateway_mac
+        .as_ref()
+        .map(|s| parse_mac(s))
         .transpose()
-        .context("invalid --dpdk-gateway-mac (expected xx:xx:xx:xx:xx:xx)")?;
+        .context("invalid dpdk_gateway_mac (expected xx:xx:xx:xx:xx:xx)")?;
 
-    let eal_args: Vec<String> = dpdk_eal_args.split(';').map(|s| s.to_string()).collect();
+    let eal_args: Vec<String> = config
+        .engine
+        .dpdk_eal_args
+        .split(';')
+        .map(|s| s.to_string())
+        .collect();
 
-    // Resolve interface name from config.
     let iface_name = config.interface_name(Path::new(config_path));
 
+    let dpdk_mode = match config.engine.backend {
+        Backend::DpdkVirtio => "virtio",
+        Backend::DpdkRouter => "router",
+        _ => unreachable!(),
+    };
+
     tracing::info!(
-        role = ?role,
+        mode = %mode,
         address = %addr,
         mtu = config.mtu(),
         dpdk_local_ip = %dpdk_local_ip,
         dpdk_remote_ip = %dpdk_remote_ip,
-        dpdk_port,
+        dpdk_port = config.engine.dpdk_port,
         dpdk_mode,
         cc = %cc,
         "starting quictun (DPDK)"
@@ -376,17 +297,18 @@ fn run_dpdk(
     let tunnel_prefix = addr.prefix_len();
     let tunnel_mtu = config.mtu();
 
-    // Write PID file.
     state::write_pid_file(&iface_name)?;
     let _pid_guard = state::PidFileGuard::new(iface_name.clone());
 
-    // Build quinn-proto configs.
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
-    // Parse all peer public keys for server config and peer identification.
-    let all_peer_pubkeys: Vec<PublicKey> = config
-        .peer
+    // Resolve cipher suites.
+    let server_ciphers = config.server_cipher_suites()?;
+    let client_ciphers = config.client_cipher_suites()?;
+
+    // Parse all peer public keys.
+    let all_peer_pubkeys: Vec<PublicKey> = peers
         .iter()
         .map(|p| {
             PublicKey::from_base64(&p.public_key)
@@ -394,37 +316,36 @@ fn run_dpdk(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let setup = match role {
-        Role::Connector => {
+    let setup = match mode {
+        Mode::Connector => {
             let cc = quictun_dpdk::quic::build_proto_client_config(
                 &private_key,
                 &peer_pubkey,
                 keepalive,
                 &tuning,
+                &client_ciphers,
+                config.interface.zero_rtt,
             )?;
             let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
-            // Override remote_addr IP with DPDK IP, keep the port.
             let dpdk_remote_addr = SocketAddr::new(dpdk_remote_ip.into(), remote_addr.port());
             quictun_dpdk::event_loop::EndpointSetup::Connector {
                 remote_addr: dpdk_remote_addr,
                 client_config: cc,
             }
         }
-        Role::Listener => {
-            // Always pass ALL peer public keys (not just peer[0]).
+        Mode::Listener => {
             let sc = quictun_dpdk::quic::build_proto_server_config(
                 &private_key,
                 &all_peer_pubkeys,
                 keepalive,
                 &tuning,
+                &server_ciphers,
             )?;
             quictun_dpdk::event_loop::EndpointSetup::Listener { server_config: sc }
         }
     };
 
-    // Always build peer configs for identification (listener and connector).
-    let dpdk_peers: Vec<quictun_core::peer::PeerConfig> = config
-        .peer
+    let dpdk_peers: Vec<quictun_core::peer::PeerConfig> = peers
         .iter()
         .zip(all_peer_pubkeys.iter())
         .map(|(p, pubkey)| {
@@ -449,25 +370,29 @@ fn run_dpdk(
         })
         .collect();
 
-    let is_router = dpdk_mode == "router";
+    let is_router = config.engine.backend == Backend::DpdkRouter;
+    let routing = config.routing.as_ref();
+    let enable_nat = routing.map(|r| r.nat).unwrap_or(true);
+    let mss_clamp = routing.map(|r| r.mss_clamp).unwrap_or(0);
+
     let dpdk_config = quictun_dpdk::event_loop::DpdkConfig {
-        mode: if is_router { "router".to_string() } else { dpdk_mode.to_string() },
+        mode: dpdk_mode.to_string(),
         eal_args,
-        port_id: dpdk_port,
+        port_id: config.engine.dpdk_port,
         local_ip: dpdk_local_ip,
         remote_ip: dpdk_remote_ip,
-        local_port: dpdk_local_port,
+        local_port: config.engine.dpdk_local_port,
         gateway_mac,
         tunnel_ip,
         tunnel_prefix,
         tunnel_mtu,
         tunnel_iface: iface_name,
-        adaptive_poll: !no_adaptive_poll,
-        n_cores: dpdk_cores,
-        no_udp_checksum,
+        adaptive_poll: config.engine.adaptive_poll,
+        n_cores: config.engine.dpdk_cores,
+        no_udp_checksum: config.engine.no_udp_checksum,
         peers: dpdk_peers,
         router: is_router,
-        enable_nat: !no_nat,
+        enable_nat,
         mss_clamp,
     };
 
@@ -488,4 +413,3 @@ fn parse_mac(s: &str) -> Result<[u8; 6]> {
     }
     Ok(mac)
 }
-

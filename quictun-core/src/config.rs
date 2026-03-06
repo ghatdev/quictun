@@ -14,48 +14,249 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+// ── Cipher suite ─────────────────────────────────────────────────────────────
+
+/// TLS 1.3 cipher suite for QUIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherSuite {
+    Aes128Gcm,
+    Aes256Gcm,
+    ChaCha20,
+}
+
+impl CipherSuite {
+    /// Parse a cipher suite name from the config file.
+    pub fn from_name(name: &str) -> Result<Self, ConfigError> {
+        match name {
+            "aes-128-gcm" => Ok(Self::Aes128Gcm),
+            "aes-256-gcm" => Ok(Self::Aes256Gcm),
+            "chacha20" => Ok(Self::ChaCha20),
+            other => Err(ConfigError::Invalid(format!(
+                "unknown cipher: \"{other}\" (expected \"aes-128-gcm\", \"aes-256-gcm\", or \"chacha20\")"
+            ))),
+        }
+    }
+
+    /// All supported cipher suites in default preference order.
+    pub fn all() -> Vec<Self> {
+        vec![Self::Aes128Gcm, Self::Aes256Gcm, Self::ChaCha20]
+    }
+}
+
+impl std::fmt::Display for CipherSuite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Aes128Gcm => write!(f, "aes-128-gcm"),
+            Self::Aes256Gcm => write!(f, "aes-256-gcm"),
+            Self::ChaCha20 => write!(f, "chacha20"),
+        }
+    }
+}
+
+// ── Mode ─────────────────────────────────────────────────────────────────────
+
+/// Tunnel operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Listener,
+    Connector,
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "listener" => Ok(Mode::Listener),
+            "connector" => Ok(Mode::Connector),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown mode: \"{other}\" (expected \"listener\" or \"connector\")"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listener => write!(f, "listener"),
+            Self::Connector => write!(f, "connector"),
+        }
+    }
+}
+
+// ── Engine backend ───────────────────────────────────────────────────────────
+
+/// Data plane backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Kernel,
+    DpdkVirtio,
+    DpdkRouter,
+}
+
+impl<'de> Deserialize<'de> for Backend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "kernel" => Ok(Backend::Kernel),
+            "dpdk-virtio" => Ok(Backend::DpdkVirtio),
+            "dpdk-router" => Ok(Backend::DpdkRouter),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown backend: \"{other}\" (expected \"kernel\", \"dpdk-virtio\", or \"dpdk-router\")"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kernel => write!(f, "kernel"),
+            Self::DpdkVirtio => write!(f, "dpdk-virtio"),
+            Self::DpdkRouter => write!(f, "dpdk-router"),
+        }
+    }
+}
+
+fn default_backend() -> Backend {
+    Backend::Kernel
+}
+
+// ── Top-level config ─────────────────────────────────────────────────────────
+
 /// Top-level tunnel configuration.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub interface: InterfaceConfig,
-    pub peer: Vec<PeerConfig>,
+    #[serde(default)]
+    pub engine: EngineConfig,
+    pub routing: Option<RoutingConfig>,
+    /// Single peer (connector mode). Use `[peer]` in TOML.
+    pub peer: Option<PeerConfig>,
+    /// Multiple peers (listener mode). Use `[[peers]]` in TOML.
+    pub peers: Option<Vec<PeerConfig>>,
 }
 
 /// Local interface configuration.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
+    pub mode: Mode,
     pub private_key: String,
     pub address: String,
     pub listen_port: Option<u16>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
-    /// Optional explicit interface name (e.g. "connector"). If omitted,
-    /// `Config::interface_name()` derives it from the config filename.
     pub name: Option<String>,
-    /// Max QUIC idle timeout in milliseconds. 0 = quinn default.
     #[serde(default)]
     pub max_idle_timeout_ms: u64,
-    /// Enable FIPS-only ciphersuites (AES-GCM + P-256/P-384, no ChaCha20/x25519).
-    /// Requires the `fips` cargo feature.
-    #[serde(default)]
-    pub fips_mode: bool,
-    /// QUIC Connection ID length in bytes. Valid values: 0, 4, 8. Default 8.
     #[serde(default = "default_cid_length")]
     pub cid_length: u8,
-    /// Enable 0-RTT session resumption on reconnect (connector only).
+    /// Preferred cipher suite for outbound connections (connector, or listener initiating).
+    /// Single value: "aes-128-gcm", "aes-256-gcm", or "chacha20".
+    pub cipher: Option<String>,
+    /// Accepted cipher suites for inbound connections (listener).
+    /// Array of: "aes-128-gcm", "aes-256-gcm", "chacha20".
+    pub ciphers: Option<Vec<String>>,
     #[serde(default)]
     pub zero_rtt: bool,
-    /// Authentication mode: "rpk" (default) or "x509".
     #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
-    /// PEM certificate chain file (x509 mode).
     pub cert_file: Option<String>,
-    /// PEM private key file (x509 mode, alternative to base64 private_key).
     pub key_file: Option<String>,
-    /// PEM CA bundle for peer verification (x509 mode).
     pub ca_file: Option<String>,
+}
+
+/// Engine / data plane configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineConfig {
+    #[serde(default = "default_backend")]
+    pub backend: Backend,
+    #[serde(default = "default_threads")]
+    pub threads: usize,
+    #[serde(default = "default_cc")]
+    pub cc: String,
+    #[serde(default = "default_buf_size")]
+    pub recv_buf: usize,
+    #[serde(default = "default_buf_size")]
+    pub send_buf: usize,
+    #[serde(default)]
+    pub send_window: u64,
+    #[serde(default)]
+    pub initial_rtt_ms: u64,
+    #[serde(default)]
+    pub pin_mtu: bool,
+    #[serde(default)]
+    pub offload: bool,
+    #[serde(default = "default_dpdk_cores")]
+    pub dpdk_cores: usize,
+    pub dpdk_local_ip: Option<String>,
+    pub dpdk_remote_ip: Option<String>,
+    pub dpdk_local_port: Option<u16>,
+    pub dpdk_gateway_mac: Option<String>,
+    #[serde(default = "default_dpdk_eal_args")]
+    pub dpdk_eal_args: String,
+    #[serde(default)]
+    pub dpdk_port: u16,
+    #[serde(default)]
+    pub no_udp_checksum: bool,
+    #[serde(default = "default_adaptive_poll")]
+    pub adaptive_poll: bool,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            backend: Backend::Kernel,
+            threads: 1,
+            cc: "bbr".to_owned(),
+            recv_buf: 8 * 1024 * 1024,
+            send_buf: 8 * 1024 * 1024,
+            send_window: 0,
+            initial_rtt_ms: 0,
+            pin_mtu: false,
+            offload: false,
+            dpdk_cores: 1,
+            dpdk_local_ip: None,
+            dpdk_remote_ip: None,
+            dpdk_local_port: None,
+            dpdk_gateway_mac: None,
+            dpdk_eal_args: "-l;0;-n;4".to_owned(),
+            dpdk_port: 0,
+            no_udp_checksum: false,
+            adaptive_poll: true,
+        }
+    }
+}
+
+/// Router-mode configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfig {
+    #[serde(default = "default_true")]
+    pub nat: bool,
+    #[serde(default)]
+    pub mss_clamp: u16,
+}
+
+/// Remote peer configuration.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    pub public_key: String,
+    pub allowed_ips: Vec<String>,
+    pub endpoint: Option<SocketAddr>,
+    pub keepalive: Option<u64>,
+    #[serde(default)]
+    pub reconnect_interval: Option<u64>,
 }
 
 fn default_mtu() -> u16 {
@@ -70,25 +271,35 @@ fn default_auth_mode() -> String {
     "rpk".to_owned()
 }
 
-/// Remote peer configuration.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeerConfig {
-    pub public_key: String,
-    pub allowed_ips: Vec<String>,
-    pub endpoint: Option<SocketAddr>,
-    pub keepalive: Option<u64>,
-    /// Auto-reconnect interval in seconds. None = no auto-reconnect (process exits on drop).
-    #[serde(default)]
-    pub reconnect_interval: Option<u64>,
+fn default_threads() -> usize {
+    1
 }
 
-/// Whether this node acts as a listener (server) or connector (client).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Listener,
-    Connector,
+fn default_cc() -> String {
+    "bbr".to_owned()
 }
+
+fn default_buf_size() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_dpdk_cores() -> usize {
+    1
+}
+
+fn default_dpdk_eal_args() -> String {
+    "-l;0;-n;4".to_owned()
+}
+
+fn default_adaptive_poll() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ── Config methods ───────────────────────────────────────────────────────────
 
 impl Config {
     /// Load and validate configuration from a TOML file.
@@ -99,21 +310,92 @@ impl Config {
         Ok(config)
     }
 
+    /// Parse from a TOML string and validate.
+    pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
+        let config: Config = toml::from_str(s).map_err(ConfigError::Parse)?;
+        config.validate()?;
+        Ok(config)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.peer.is_empty() {
-            return Err(ConfigError::Invalid("at least one peer is required".into()));
+        let mode = self.interface.mode;
+
+        // ── Peer validation ──
+        match mode {
+            Mode::Connector => {
+                if self.peers.is_some() {
+                    return Err(ConfigError::Invalid(
+                        "connector mode uses [peer], not [[peers]]".into(),
+                    ));
+                }
+                let peer = self.peer.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("connector mode requires [peer] section".into())
+                })?;
+                if peer.endpoint.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "connector peer requires endpoint".into(),
+                    ));
+                }
+            }
+            Mode::Listener => {
+                if self.peer.is_some() {
+                    return Err(ConfigError::Invalid(
+                        "listener mode uses [[peers]], not [peer]".into(),
+                    ));
+                }
+                let peers = self.peers.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("listener mode requires [[peers]] section".into())
+                })?;
+                if peers.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "listener requires at least one peer".into(),
+                    ));
+                }
+            }
         }
-        // Connector mode requires exactly one peer (with endpoint).
-        // Listener mode supports multiple peers (multi-client).
-        if self.peer.len() > 1 && self.role() == Role::Connector {
+
+        // ── listen_port ──
+        match mode {
+            Mode::Connector => {
+                if self.interface.listen_port.is_some() {
+                    return Err(ConfigError::Invalid(
+                        "connector mode must not set listen_port".into(),
+                    ));
+                }
+            }
+            Mode::Listener => {
+                if self.interface.listen_port.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "listener mode requires listen_port".into(),
+                    ));
+                }
+            }
+        }
+
+        // ── Cipher validation ──
+        if let Some(ref cipher) = self.interface.cipher {
+            CipherSuite::from_name(cipher)?;
+        }
+        if let Some(ref ciphers) = self.interface.ciphers {
+            if ciphers.is_empty() {
+                return Err(ConfigError::Invalid("ciphers must not be empty".into()));
+            }
+            for c in ciphers {
+                CipherSuite::from_name(c)?;
+            }
+        }
+
+        // ── zero_rtt only for connector ──
+        if mode == Mode::Listener && self.interface.zero_rtt {
             return Err(ConfigError::Invalid(
-                "connector mode supports exactly one peer".into(),
+                "zero_rtt is only valid for connector mode".into(),
             ));
         }
-        // Validate address parses as IPv4 network
+
+        // ── Address validation ──
         self.parse_address()?;
 
-        // Validate CID length
+        // ── CID length ──
         match self.interface.cid_length {
             0 | 4 | 8 => {}
             other => {
@@ -123,7 +405,7 @@ impl Config {
             }
         }
 
-        // Validate auth_mode
+        // ── Auth mode ──
         match self.interface.auth_mode.as_str() {
             "rpk" => {}
             "x509" => {
@@ -150,16 +432,41 @@ impl Config {
             }
         }
 
+        // ── Backend validation ──
+        let backend = self.engine.backend;
+        if mode == Mode::Connector && backend == Backend::DpdkRouter {
+            return Err(ConfigError::Invalid(
+                "connector mode cannot use dpdk-router backend".into(),
+            ));
+        }
+
+        // ── Routing section validation ──
+        if self.routing.is_some() && backend != Backend::DpdkRouter {
+            return Err(ConfigError::Invalid(
+                "[routing] section requires backend = \"dpdk-router\"".into(),
+            ));
+        }
+
+        // ── DPDK field validation ──
+        if backend != Backend::Kernel {
+            if self.engine.dpdk_local_ip.is_none() {
+                return Err(ConfigError::Invalid(
+                    "DPDK backends require dpdk_local_ip in [engine]".into(),
+                ));
+            }
+            if self.engine.dpdk_remote_ip.is_none() {
+                return Err(ConfigError::Invalid(
+                    "DPDK backends require dpdk_remote_ip in [engine]".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
-    /// Determine the role based on the first peer's endpoint.
-    pub fn role(&self) -> Role {
-        if self.peer[0].endpoint.is_some() {
-            Role::Connector
-        } else {
-            Role::Listener
-        }
+    /// Operating mode.
+    pub fn mode(&self) -> Mode {
+        self.interface.mode
     }
 
     /// Parse the interface address as an IPv4 network (e.g. "10.0.0.1/24").
@@ -186,6 +493,35 @@ impl Config {
             .unwrap_or("quictun")
             .to_owned()
     }
+
+    /// Get all peer configs as a slice, regardless of mode.
+    pub fn all_peers(&self) -> &[PeerConfig] {
+        if let Some(ref peers) = self.peers {
+            peers
+        } else if let Some(ref peer) = self.peer {
+            std::slice::from_ref(peer)
+        } else {
+            &[]
+        }
+    }
+
+    /// Resolve cipher suites for server (inbound) TLS config.
+    /// Uses `ciphers` if set, otherwise all.
+    pub fn server_cipher_suites(&self) -> Result<Vec<CipherSuite>, ConfigError> {
+        match &self.interface.ciphers {
+            Some(names) => names.iter().map(|n| CipherSuite::from_name(n)).collect(),
+            None => Ok(CipherSuite::all()),
+        }
+    }
+
+    /// Resolve cipher suites for client (outbound) TLS config.
+    /// Uses `cipher` if set, otherwise all.
+    pub fn client_cipher_suites(&self) -> Result<Vec<CipherSuite>, ConfigError> {
+        match &self.interface.cipher {
+            Some(name) => Ok(vec![CipherSuite::from_name(name)?]),
+            None => Ok(CipherSuite::all()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,134 +530,474 @@ mod tests {
 
     #[test]
     fn parse_listener_config() {
-        let toml = r#"
+        let config = Config::from_toml(
+            r#"
 [interface]
+mode = "listener"
 private_key = "dGVzdA=="
 address = "10.0.0.1/24"
 listen_port = 443
 
-[[peer]]
+[[peers]]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.2/32"]
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.role(), Role::Listener);
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.mode(), Mode::Listener);
     }
 
     #[test]
     fn parse_connector_config() {
-        let toml = r#"
+        let config = Config::from_toml(
+            r#"
 [interface]
+mode = "connector"
 private_key = "dGVzdA=="
 address = "10.0.0.2/24"
 
-[[peer]]
+[peer]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.1/32"]
 endpoint = "1.2.3.4:443"
 keepalive = 25
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.role(), Role::Connector);
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.mode(), Mode::Connector);
         assert_eq!(config.mtu(), 1380);
     }
 
     #[test]
     fn default_mtu_is_1380() {
-        let toml = r#"
+        let config = Config::from_toml(
+            r#"
 [interface]
-private_key = "dGVzdA=="
-address = "10.0.0.1/24"
-
-[[peer]]
-public_key = "dGVzdA=="
-allowed_ips = ["10.0.0.2/32"]
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.mtu(), 1380);
-    }
-
-    #[test]
-    fn rejects_no_peers() {
-        let config = Config {
-            interface: InterfaceConfig {
-                private_key: "dGVzdA==".into(),
-                address: "10.0.0.1/24".into(),
-                listen_port: None,
-                mtu: 1380,
-                name: None,
-                max_idle_timeout_ms: 0,
-                fips_mode: false,
-                cid_length: 8,
-                zero_rtt: false,
-                auth_mode: "rpk".into(),
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            peer: vec![],
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn multi_peer_listener_allowed() {
-        let toml = r#"
-[interface]
+mode = "listener"
 private_key = "dGVzdA=="
 address = "10.0.0.1/24"
 listen_port = 443
 
-[[peer]]
+[[peers]]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.2/32"]
-
-[[peer]]
-public_key = "dGVzdB=="
-allowed_ips = ["10.0.0.3/32"]
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.role(), Role::Listener);
-        assert_eq!(config.peer.len(), 2);
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.mtu(), 1380);
     }
 
     #[test]
-    fn multi_peer_connector_rejected() {
-        let toml = r#"
+    fn connector_rejects_no_peer() {
+        let result = Config::from_toml(
+            r#"
 [interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connector_rejects_peers_array() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
 private_key = "dGVzdA=="
 address = "10.0.0.2/24"
 
-[[peer]]
+[[peers]]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.1/32"]
 endpoint = "1.2.3.4:443"
+"#,
+        );
+        assert!(result.is_err());
+    }
 
-[[peer]]
+    #[test]
+    fn connector_rejects_no_endpoint() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn listener_rejects_single_peer() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn listener_requires_listen_port() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connector_rejects_listen_port() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+listen_port = 443
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_peer_listener() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+
+[[peers]]
 public_key = "dGVzdB=="
 allowed_ips = ["10.0.0.3/32"]
-endpoint = "1.2.3.5:443"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.validate().is_err());
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.mode(), Mode::Listener);
+        assert_eq!(config.all_peers().len(), 2);
+    }
+
+    #[test]
+    fn cipher_selection() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+cipher = "chacha20"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+        )
+        .unwrap();
+        let suites = config.client_cipher_suites().unwrap();
+        assert_eq!(suites, vec![CipherSuite::ChaCha20]);
+    }
+
+    #[test]
+    fn ciphers_selection() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+ciphers = ["aes-256-gcm", "chacha20"]
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        )
+        .unwrap();
+        let suites = config.server_cipher_suites().unwrap();
+        assert_eq!(suites, vec![CipherSuite::Aes256Gcm, CipherSuite::ChaCha20]);
+    }
+
+    #[test]
+    fn invalid_cipher_rejected() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+cipher = "rc4"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
     fn rejects_unknown_fields() {
-        let toml = r#"
+        let result = Config::from_toml(
+            r#"
 [interface]
+mode = "listener"
 private_key = "dGVzdA=="
 address = "10.0.0.1/24"
+listen_port = 443
 bogus_field = true
 
-[[peer]]
+[[peers]]
 public_key = "dGVzdA=="
 allowed_ips = ["10.0.0.2/32"]
-"#;
-        let result: Result<Config, _> = toml::from_str(toml);
+"#,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn connector_rejects_dpdk_router() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+
+[engine]
+backend = "dpdk-virtio"
+dpdk_local_ip = "10.23.30.100"
+dpdk_remote_ip = "10.23.30.46"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+        );
+        // dpdk-virtio is fine for connector
+        assert!(result.is_ok());
+
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+
+[engine]
+backend = "dpdk-router"
+dpdk_local_ip = "10.23.30.100"
+dpdk_remote_ip = "10.23.30.46"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn routing_requires_dpdk_router() {
+        let result = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[routing]
+nat = true
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn engine_defaults() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.engine.backend, Backend::Kernel);
+        assert_eq!(config.engine.threads, 1);
+        assert_eq!(config.engine.cc, "bbr");
+        assert_eq!(config.engine.recv_buf, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn all_peers_connector() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.all_peers().len(), 1);
+    }
+
+    #[test]
+    fn default_cipher_suites() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        )
+        .unwrap();
+        let server_suites = config.server_cipher_suites().unwrap();
+        assert_eq!(server_suites, CipherSuite::all());
+        let client_suites = config.client_cipher_suites().unwrap();
+        assert_eq!(client_suites, CipherSuite::all());
+    }
+
+    #[test]
+    fn listener_with_cipher_for_outbound() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+cipher = "aes-256-gcm"
+ciphers = ["aes-256-gcm", "chacha20"]
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+endpoint = "2.3.4.5:443"
+keepalive = 25
+"#,
+        )
+        .unwrap();
+        let server = config.server_cipher_suites().unwrap();
+        assert_eq!(server, vec![CipherSuite::Aes256Gcm, CipherSuite::ChaCha20]);
+        let client = config.client_cipher_suites().unwrap();
+        assert_eq!(client, vec![CipherSuite::Aes256Gcm]);
+    }
+
+    #[test]
+    fn reconnect_interval_parses() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "connector"
+private_key = "dGVzdA=="
+address = "10.0.0.2/24"
+
+[peer]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.1/32"]
+endpoint = "1.2.3.4:443"
+reconnect_interval = 5
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.all_peers()[0].reconnect_interval, Some(5));
+    }
+
+    #[test]
+    fn dpdk_router_with_routing() {
+        let config = Config::from_toml(
+            r#"
+[interface]
+mode = "listener"
+private_key = "dGVzdA=="
+address = "10.0.0.1/24"
+listen_port = 443
+
+[engine]
+backend = "dpdk-router"
+dpdk_cores = 4
+dpdk_local_ip = "10.23.30.100"
+dpdk_remote_ip = "10.23.30.46"
+dpdk_gateway_mac = "1e:0b:8b:e2:ef:50"
+
+[routing]
+nat = true
+mss_clamp = 1360
+
+[[peers]]
+public_key = "dGVzdA=="
+allowed_ips = ["10.0.0.2/32"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.engine.backend, Backend::DpdkRouter);
+        assert_eq!(config.engine.dpdk_cores, 4);
+        let routing = config.routing.as_ref().unwrap();
+        assert!(routing.nat);
+        assert_eq!(routing.mss_clamp, 1360);
     }
 }

@@ -6,25 +6,26 @@ use anyhow::{Context, Result, bail};
 use quictun_crypto::{PinnedRpkClientVerifier, PinnedRpkServerVerifier, PrivateKey, PublicKey};
 
 use crate::ALPN_QUICTUN_V1;
+use crate::config::CipherSuite;
 
 // ── Crypto provider ──────────────────────────────────────────────────────────
 
-/// Build a `CryptoProvider` with FIPS-only ciphersuites when requested.
-fn make_crypto_provider(fips_mode: bool) -> rustls::crypto::CryptoProvider {
-    if fips_mode {
-        rustls::crypto::CryptoProvider {
-            cipher_suites: vec![
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
-            ],
-            kx_groups: vec![
-                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
-                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
-            ],
-            ..rustls::crypto::aws_lc_rs::default_provider()
-        }
-    } else {
-        rustls::crypto::aws_lc_rs::default_provider()
+/// Build a `CryptoProvider` with the specified cipher suites.
+fn make_crypto_provider(suites: &[CipherSuite]) -> rustls::crypto::CryptoProvider {
+    use rustls::crypto::aws_lc_rs::cipher_suite;
+
+    let cipher_suites: Vec<rustls::SupportedCipherSuite> = suites
+        .iter()
+        .map(|s| match s {
+            CipherSuite::Aes128Gcm => cipher_suite::TLS13_AES_128_GCM_SHA256,
+            CipherSuite::Aes256Gcm => cipher_suite::TLS13_AES_256_GCM_SHA384,
+            CipherSuite::ChaCha20 => cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        })
+        .collect();
+
+    rustls::crypto::CryptoProvider {
+        cipher_suites,
+        ..rustls::crypto::aws_lc_rs::default_provider()
     }
 }
 
@@ -36,13 +37,13 @@ fn make_crypto_provider(fips_mode: bool) -> rustls::crypto::CryptoProvider {
 pub fn build_rustls_server_tls_config(
     private_key: &PrivateKey,
     allowed_peers: &[PublicKey],
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
 ) -> Result<Arc<rustls::ServerConfig>> {
     let certified_key = private_key
         .to_certified_key()
         .context("failed to build server certified key")?;
 
-    let provider = make_crypto_provider(fips_mode);
+    let provider = make_crypto_provider(cipher_suites);
     let verifier = PinnedRpkClientVerifier::new(allowed_peers);
 
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
@@ -69,14 +70,14 @@ pub fn build_rustls_server_tls_config(
 pub fn build_rustls_client_tls_config(
     private_key: &PrivateKey,
     server_pubkey: &PublicKey,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
 ) -> Result<Arc<rustls::ClientConfig>> {
     let certified_key = private_key
         .to_certified_key()
         .context("failed to build client certified key")?;
 
-    let provider = make_crypto_provider(fips_mode);
+    let provider = make_crypto_provider(cipher_suites);
     let verifier = PinnedRpkServerVerifier::new(std::slice::from_ref(server_pubkey));
 
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -106,19 +107,9 @@ pub fn build_server_config(
     allowed_peers: &[PublicKey],
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
+    cipher_suites: &[CipherSuite],
 ) -> Result<quinn::ServerConfig> {
-    build_server_config_ext(private_key, allowed_peers, keepalive, tuning, false)
-}
-
-/// Build a quinn `ServerConfig` with RPK authentication and optional FIPS mode.
-pub fn build_server_config_ext(
-    private_key: &PrivateKey,
-    allowed_peers: &[PublicKey],
-    keepalive: Option<Duration>,
-    tuning: &TransportTuning,
-    fips_mode: bool,
-) -> Result<quinn::ServerConfig> {
-    let tls_config = build_rustls_server_tls_config(private_key, allowed_peers, fips_mode)?;
+    let tls_config = build_rustls_server_tls_config(private_key, allowed_peers, cipher_suites)?;
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
         .context("failed to create QUIC server crypto config")?;
@@ -135,23 +126,13 @@ pub fn build_client_config(
     server_pubkey: &PublicKey,
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
-) -> Result<quinn::ClientConfig> {
-    build_client_config_ext(private_key, server_pubkey, keepalive, tuning, false, false)
-}
-
-/// Build a quinn `ClientConfig` with RPK authentication, optional FIPS + session resumption.
-pub fn build_client_config_ext(
-    private_key: &PrivateKey,
-    server_pubkey: &PublicKey,
-    keepalive: Option<Duration>,
-    tuning: &TransportTuning,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
 ) -> Result<quinn::ClientConfig> {
     let tls_config = build_rustls_client_tls_config(
         private_key,
         server_pubkey,
-        fips_mode,
+        cipher_suites,
         enable_session_resumption,
     )?;
 
@@ -208,13 +189,13 @@ pub fn build_rustls_server_tls_config_x509(
     cert_file: &Path,
     key_file: &Path,
     client_ca_file: &Path,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
 ) -> Result<Arc<rustls::ServerConfig>> {
     let cert_chain = load_certs_from_pem(cert_file)?;
     let private_key = load_private_key_from_pem(key_file)?;
     let client_ca_roots = load_ca_roots(client_ca_file)?;
 
-    let provider = make_crypto_provider(fips_mode);
+    let provider = make_crypto_provider(cipher_suites);
 
     let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_ca_roots))
         .build()
@@ -239,14 +220,14 @@ pub fn build_rustls_client_tls_config_x509(
     cert_file: &Path,
     key_file: &Path,
     server_ca_file: &Path,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
 ) -> Result<Arc<rustls::ClientConfig>> {
     let cert_chain = load_certs_from_pem(cert_file)?;
     let private_key = load_private_key_from_pem(key_file)?;
     let server_ca_roots = load_ca_roots(server_ca_file)?;
 
-    let provider = make_crypto_provider(fips_mode);
+    let provider = make_crypto_provider(cipher_suites);
 
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -274,10 +255,10 @@ pub fn build_server_config_x509(
     client_ca_file: &Path,
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
 ) -> Result<quinn::ServerConfig> {
     let tls_config =
-        build_rustls_server_tls_config_x509(cert_file, key_file, client_ca_file, fips_mode)?;
+        build_rustls_server_tls_config_x509(cert_file, key_file, client_ca_file, cipher_suites)?;
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
         .context("failed to create QUIC server crypto config")?;
@@ -295,14 +276,14 @@ pub fn build_client_config_x509(
     server_ca_file: &Path,
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
-    fips_mode: bool,
+    cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
 ) -> Result<quinn::ClientConfig> {
     let tls_config = build_rustls_client_tls_config_x509(
         cert_file,
         key_file,
         server_ca_file,
-        fips_mode,
+        cipher_suites,
         enable_session_resumption,
     )?;
 
