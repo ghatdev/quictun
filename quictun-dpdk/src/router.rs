@@ -1239,8 +1239,8 @@ pub fn run_router_dispatcher(
 
                 // Assign to least-loaded worker.
                 let worker_id = dispatch_table.least_loaded_worker();
-                let local_cid = hs.local_cid;
-                dispatch_table.register_cid(&local_cid, worker_id);
+                // Register the quictun-quic CID (not the quinn-proto handshake CID).
+                dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
                 dispatch_table.add_route(resolved.tunnel_ip, worker_id);
 
                 // Drain final handshake transmits.
@@ -1312,6 +1312,27 @@ pub fn run_router_dispatcher(
             if let Some(t) = hs.connection.poll_timeout() {
                 if now >= t {
                     hs.connection.handle_timeout(now);
+                }
+            }
+        }
+
+        // ── Drain worker TX rings (workers enqueue, dispatcher sends) ──
+
+        for w in workers.iter() {
+            let mut worker_tx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
+                [std::ptr::null_mut(); BURST_SIZE];
+            let nb_worker_tx = w.inner_tx.dequeue_burst(&mut worker_tx_mbufs);
+            if nb_worker_tx > 0 {
+                let n = nb_worker_tx as usize;
+                let sent = port::tx_burst(
+                    outer_port_id,
+                    0,
+                    &mut worker_tx_mbufs,
+                    nb_worker_tx as u16,
+                );
+                tx_pkts += sent as u64;
+                for raw in &worker_tx_mbufs[sent as usize..n] {
+                    unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
                 }
             }
         }
@@ -1389,8 +1410,8 @@ pub fn run_router_dispatcher(
 /// and handles cross-core forwarding via forward_rx rings.
 #[allow(clippy::too_many_arguments)]
 pub fn run_router_worker(
-    outer_port_id: u16,
-    tx_queue_id: u16,
+    _outer_port_id: u16,
+    _tx_queue_id: u16,
     mempool: *mut ffi::rte_mempool,
     rings: &WorkerRings,
     workers: &[WorkerRings],
@@ -1458,11 +1479,9 @@ pub fn run_router_worker(
     let mut outer_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
     let mut fwd_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
     let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
-    let mut pending_outer_tx: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
 
     tracing::info!(
         core = core_id,
-        tx_queue = tx_queue_id,
         nat_ports = format!("{port_start}-{port_end}"),
         "router worker started"
     );
@@ -1964,29 +1983,17 @@ pub fn run_router_worker(
             had_work = true;
         }
 
-        // ── 3. TX burst ──
+        // ── 3. TX: enqueue to inner_tx ring for dispatcher to send ──
+        // Workers cannot TX directly — virtio doesn't support multi-queue TX.
+        // Dispatcher drains inner_tx and sends on TX queue 0.
 
-        // Retry pending from last iteration.
-        if !pending_outer_tx.is_empty() {
-            let nb = pending_outer_tx.len() as u16;
-            let sent = port::tx_burst(outer_port_id, tx_queue_id, &mut pending_outer_tx, nb);
-            if sent < nb {
-                for raw in &pending_outer_tx[sent as usize..] {
+        if !outer_tx_mbufs.is_empty() {
+            for raw in &outer_tx_mbufs {
+                if !rings.inner_tx.enqueue(*raw) {
                     unsafe { ffi::shim_rte_pktmbuf_free(*raw) };
                 }
             }
-            pending_outer_tx.clear();
-        }
-
-        if !outer_tx_mbufs.is_empty() {
-            let nb = outer_tx_mbufs.len() as u16;
-            let sent = port::tx_burst(outer_port_id, tx_queue_id, &mut outer_tx_mbufs, nb);
-            tx_pkts += sent as u64;
-            if sent < nb {
-                for raw in &outer_tx_mbufs[sent as usize..] {
-                    pending_outer_tx.push(*raw);
-                }
-            }
+            tx_pkts += outer_tx_mbufs.len() as u64;
         }
 
         // ── 4. Periodic tasks ──

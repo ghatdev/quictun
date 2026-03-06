@@ -132,7 +132,9 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         ffi::MEMPOOL_CACHE_SIZE,
     )?;
 
-    let (local_mac, hw_udp_cksum, hw_ip_cksum) = if n_cores > 1 {
+    let (local_mac, hw_udp_cksum, hw_ip_cksum) = if n_cores > 1 && !dpdk_config.router {
+        // Multi-queue RSS for non-router modes (tap/virtio).
+        // Router mode uses dispatcher pattern: single RX queue, reconfigured later.
         port::configure_port_multiqueue(dpdk_config.port_id, n_cores as u16, mempool)?
     } else {
         port::configure_port(dpdk_config.port_id, mempool)?
@@ -296,10 +298,12 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             .ok_or_else(|| anyhow::anyhow!("multi-core router requires listener mode"))?;
         let mut multi_state = MultiQuicState::new(multi_server_config);
 
-        // Reconfigure outer port for n_cores TX queues (1 RX queue, N TX queues).
-        port::close_port(dpdk_config.port_id);
+        // Reconfigure outer port: 1 RX queue, 1 TX queue.
+        // Workers TX via inner_tx ring to dispatcher (virtio doesn't support multi-queue TX).
+        // Stop (not close) so we can reconfigure the same device.
+        port::stop_port(dpdk_config.port_id);
         let (new_mac, hw_udp, hw_ip) =
-            port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
+            port::configure_port_dispatcher(dpdk_config.port_id, 1, mempool)?;
         identity.local_mac = new_mac;
 
         let checksum_mode = if dpdk_config.no_udp_checksum {

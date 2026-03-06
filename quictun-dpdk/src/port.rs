@@ -346,6 +346,13 @@ pub fn configure_port_dispatcher(
 }
 
 /// Stop and close a DPDK port.
+/// Stop a DPDK port without closing it, allowing reconfiguration.
+pub fn stop_port(port_id: u16) {
+    unsafe {
+        let _ = ffi::rte_eth_dev_stop(port_id);
+    }
+}
+
 pub fn close_port(port_id: u16) {
     // SAFETY: port_id was previously configured and started; stop+close is the
     // correct shutdown sequence. Called once during cleanup.

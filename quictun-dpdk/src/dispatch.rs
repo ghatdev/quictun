@@ -54,6 +54,13 @@ impl DpdkDispatchTable {
         self.worker_load[worker_id] += 1;
     }
 
+    /// Register a CID → worker mapping from raw bytes (quictun-quic CID).
+    pub fn register_cid_raw(&mut self, cid: &[u8], worker_id: usize) {
+        self.connections
+            .insert(cid_to_u64(cid), DispatchEntry { worker_id });
+        self.worker_load[worker_id] += 1;
+    }
+
     /// Add an IP route (called after peer identification).
     pub fn add_route(&mut self, tunnel_ip: Ipv4Addr, worker_id: usize) {
         self.routes.insert(tunnel_ip, DispatchEntry { worker_id });
