@@ -18,7 +18,7 @@ use quictun_quic::cid_to_u64;
 use quictun_quic::local::LocalConnectionState;
 
 /// Maximum burst size for rx/tx.
-const BURST_SIZE: usize = 32;
+pub(crate) const BURST_SIZE: usize = 32;
 
 /// Smaller burst size for inner→outer pipeline in quictun-quic mode.
 /// Pending mbuf retry + back-pressure handle TX ring overflow; safe to raise.
@@ -63,11 +63,11 @@ pub struct InnerPort {
 }
 
 /// Number of consecutive empty polls before entering backoff sleep.
-const EMPTY_POLL_THRESHOLD: u32 = 1024;
+pub(crate) const EMPTY_POLL_THRESHOLD: u32 = 1024;
 /// Minimum sleep duration in microseconds during adaptive backoff.
-const MIN_DELAY_US: u32 = 1;
+pub(crate) const MIN_DELAY_US: u32 = 1;
 /// Maximum sleep duration in microseconds during adaptive backoff.
-const MAX_DELAY_US: u32 = 100;
+pub(crate) const MAX_DELAY_US: u32 = 100;
 
 /// Result of resolving a completed handshake into connection metadata.
 pub struct ResolvedHandshake {
@@ -83,7 +83,7 @@ pub struct ResolvedHandshake {
 /// Extract shared handshake completion logic: identify peer, resolve MAC, build CID.
 ///
 /// Returns `None` if the peer cannot be identified (rejects the connection).
-pub fn resolve_completed_handshake(
+pub(crate) fn resolve_completed_handshake(
     hs: &shared::HandshakeState,
     conn_state: LocalConnectionState,
     peers: &[PeerConfig],

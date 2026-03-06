@@ -45,7 +45,7 @@ enum Command {
         /// Pin min_mtu = initial_mtu and disable DPLPMTUD (use when path MTU is known)
         #[arg(long)]
         pin_mtu: bool,
-        /// Use DPDK kernel-bypass data plane. MODE: tap (default) or virtio
+        /// Use DPDK kernel-bypass data plane. MODE: tap (default), virtio, or router
         #[arg(long, value_name = "MODE", default_missing_value = "tap", num_args = 0..=1)]
         dpdk: Option<String>,
         /// IP address for the DPDK port (e.g., 192.168.100.10)
@@ -75,6 +75,12 @@ enum Command {
         /// Skip UDP checksum (write 0x0000; valid for IPv4, for benchmarking)
         #[arg(long)]
         no_udp_checksum: bool,
+        /// Disable NAT in router mode (default: NAT enabled)
+        #[arg(long)]
+        no_nat: bool,
+        /// TCP MSS clamp value for router mode (0 = auto: tunnel_mtu - 40)
+        #[arg(long, default_value = "0")]
+        mss_clamp: u16,
         /// Enable TUN GSO/GRO offload for batched I/O (Linux only, kernel 6.2+)
         #[arg(long)]
         offload: bool,
@@ -113,6 +119,8 @@ fn main() -> anyhow::Result<()> {
             no_adaptive_poll,
             dpdk_cores,
             no_udp_checksum,
+            no_nat,
+            mss_clamp,
             offload,
             threads,
         } => up::run(
@@ -133,9 +141,11 @@ fn main() -> anyhow::Result<()> {
             no_adaptive_poll,
             dpdk_cores,
             no_udp_checksum,
+            no_nat,
+            mss_clamp,
             offload,
             threads,
-        ),
+),
         Command::Down { config } => down::run(&config),
     }
 }

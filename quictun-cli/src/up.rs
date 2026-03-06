@@ -31,6 +31,8 @@ pub fn run(
     no_adaptive_poll: bool,
     dpdk_cores: usize,
     no_udp_checksum: bool,
+    no_nat: bool,
+    mss_clamp: u16,
     offload: bool,
     threads: usize,
 ) -> Result<()> {
@@ -53,6 +55,8 @@ pub fn run(
             no_adaptive_poll,
             dpdk_cores,
             no_udp_checksum,
+            no_nat,
+            mss_clamp,
         );
     }
 
@@ -274,6 +278,8 @@ fn run_dpdk(
     _no_adaptive_poll: bool,
     _dpdk_cores: usize,
     _no_udp_checksum: bool,
+    _no_nat: bool,
+    _mss_clamp: u16,
 ) -> Result<()> {
     bail!("--dpdk requires Linux");
 }
@@ -296,10 +302,12 @@ fn run_dpdk(
     no_adaptive_poll: bool,
     dpdk_cores: usize,
     no_udp_checksum: bool,
+    no_nat: bool,
+    mss_clamp: u16,
 ) -> Result<()> {
     // Validate mode.
-    if dpdk_mode != "tap" && dpdk_mode != "virtio" {
-        anyhow::bail!("--dpdk mode must be 'tap' or 'virtio', got '{dpdk_mode}'");
+    if dpdk_mode != "tap" && dpdk_mode != "virtio" && dpdk_mode != "router" {
+        anyhow::bail!("--dpdk mode must be 'tap', 'virtio', or 'router', got '{dpdk_mode}'");
     }
 
     tracing_subscriber::fmt()
@@ -441,8 +449,9 @@ fn run_dpdk(
         })
         .collect();
 
+    let is_router = dpdk_mode == "router";
     let dpdk_config = quictun_dpdk::event_loop::DpdkConfig {
-        mode: dpdk_mode.to_string(),
+        mode: if is_router { "router".to_string() } else { dpdk_mode.to_string() },
         eal_args,
         port_id: dpdk_port,
         local_ip: dpdk_local_ip,
@@ -457,6 +466,9 @@ fn run_dpdk(
         n_cores: dpdk_cores,
         no_udp_checksum,
         peers: dpdk_peers,
+        router: is_router,
+        enable_nat: !no_nat,
+        mss_clamp,
     };
 
     quictun_dpdk::event_loop::run(local_addr, setup, dpdk_config)

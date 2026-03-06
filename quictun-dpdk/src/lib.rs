@@ -17,6 +17,8 @@ mod net;
 #[cfg(target_os = "linux")]
 mod port;
 #[cfg(target_os = "linux")]
+mod router;
+#[cfg(target_os = "linux")]
 pub mod quic;
 #[cfg(target_os = "linux")]
 mod ring;

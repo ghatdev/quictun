@@ -90,16 +90,19 @@ impl DpdkDispatchTable {
     }
 }
 
-/// Per-worker ring bundle: 3 SPSC rings + a control channel.
+/// Per-worker ring bundle: SPSC rings + a control channel.
 ///
 /// - `outer_rx`: core 0 → worker (outer RX mbufs dispatched by CID)
 /// - `inner_rx`: core 0 → worker (inner RX mbufs dispatched by dest IP)
 /// - `inner_tx`: worker → core 0 (decrypted inner TX mbufs for inner port)
+/// - `forward_rx`: core N → worker (hub-and-spoke: packet decrypted on one core,
+///   re-encrypt on another because the destination peer lives on a different worker)
 /// - `control`: rare messages (new connection assignments, removals)
 pub struct WorkerRings {
     pub outer_rx: SpscRing,
     pub inner_rx: SpscRing,
     pub inner_tx: SpscRing,
+    pub forward_rx: SpscRing,
     pub control: Mutex<Vec<ControlMessage>>,
 }
 
@@ -110,6 +113,7 @@ impl WorkerRings {
             outer_rx: SpscRing::new(&format!("outer_rx_{idx}"), RING_CAPACITY, 0)?,
             inner_rx: SpscRing::new(&format!("inner_rx_{idx}"), RING_CAPACITY, 0)?,
             inner_tx: SpscRing::new(&format!("inner_tx_{idx}"), RING_CAPACITY, 0)?,
+            forward_rx: SpscRing::new(&format!("forward_rx_{idx}"), RING_CAPACITY, 0)?,
             control: Mutex::new(Vec::new()),
         })
     }

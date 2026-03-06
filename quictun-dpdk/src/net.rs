@@ -107,9 +107,23 @@ pub struct ParsedArp {
     pub is_request: bool,
 }
 
+/// A parsed non-UDP IPv4 packet (TCP, ICMP, etc.) for router mode.
+pub struct ParsedIpv4<'a> {
+    pub src_mac: [u8; 6],
+    pub src_ip: Ipv4Addr,
+    pub dst_ip: Ipv4Addr,
+    pub protocol: u8,
+    pub ttl: u8,
+    pub ip_header_len: usize,
+    /// Full IP packet starting from IP header (i.e., `data[ETH_HLEN..]`).
+    pub payload: &'a [u8],
+}
+
 /// Result of parsing an Ethernet frame.
 pub enum ParsedPacket<'a> {
     Udp(ParsedUdp<'a>),
+    /// Non-UDP IPv4 packet (TCP, ICMP, etc.) — only returned by `parse_packet_extended`.
+    Ipv4Raw(ParsedIpv4<'a>),
     Arp(ParsedArp),
 }
 
@@ -420,6 +434,137 @@ pub fn build_arp_request(local_mac: [u8; 6], local_ip: Ipv4Addr, target_ip: Ipv4
     arp[24..28].copy_from_slice(&target_ip.octets());
 
     frame
+}
+
+// ── Extended parsing (router mode) ─────────────────────────────────
+
+/// Parse an Ethernet frame, returning `Ipv4Raw` for non-UDP IPv4 packets.
+///
+/// Unlike `parse_packet`, this does NOT discard non-UDP IPv4 frames.
+/// Used by router mode to handle return traffic (TCP, ICMP, etc.).
+pub fn parse_packet_extended(data: &[u8]) -> Option<ParsedPacket<'_>> {
+    if data.len() < ETH_HLEN {
+        return None;
+    }
+
+    let src_mac: [u8; 6] = data[6..12].try_into().expect("slice len checked above");
+    let ethertype = u16::from_be_bytes([data[12], data[13]]);
+
+    match ethertype {
+        ETHERTYPE_IPV4 => parse_ipv4_extended(data, src_mac),
+        ETHERTYPE_ARP => parse_arp(data, src_mac),
+        _ => None,
+    }
+}
+
+/// Parse IPv4: UDP → ParsedUdp, other protocols → ParsedIpv4 (raw).
+fn parse_ipv4_extended<'a>(data: &'a [u8], src_mac: [u8; 6]) -> Option<ParsedPacket<'a>> {
+    if data.len() < ETH_HLEN + IPV4_HLEN {
+        return None;
+    }
+
+    let ip = &data[ETH_HLEN..];
+
+    let version = ip[0] >> 4;
+    if version != 4 {
+        return None;
+    }
+    let ihl = (ip[0] & 0x0f) as usize * 4;
+    if ihl < IPV4_HLEN || data.len() < ETH_HLEN + ihl {
+        return None;
+    }
+
+    let protocol = ip[9];
+    let ttl = ip[8];
+    let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+    let dst_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+
+    if protocol == 17 {
+        // UDP — parse as before.
+        if data.len() < ETH_HLEN + ihl + UDP_HLEN {
+            return None;
+        }
+        let ecn = quinn_proto::EcnCodepoint::from_bits(ip[1] & 0x03);
+        let udp = &data[ETH_HLEN + ihl..];
+        let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+        let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+        let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+
+        if udp_len < UDP_HLEN || data.len() < ETH_HLEN + ihl + udp_len {
+            return None;
+        }
+        let payload = &udp[UDP_HLEN..udp_len];
+        Some(ParsedPacket::Udp(ParsedUdp {
+            src_mac,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            payload,
+            ecn,
+        }))
+    } else {
+        // Non-UDP: TCP, ICMP, etc.
+        Some(ParsedPacket::Ipv4Raw(ParsedIpv4 {
+            src_mac,
+            src_ip,
+            dst_ip,
+            protocol,
+            ttl,
+            ip_header_len: ihl,
+            payload: &data[ETH_HLEN..],
+        }))
+    }
+}
+
+/// Rewrite an Ethernet + IPv4 frame in-place for plaintext forwarding.
+///
+/// - Replaces src/dst MAC
+/// - Decrements TTL
+/// - Fixes IP header checksum incrementally
+///
+/// Returns `false` if TTL would reach 0 (should send ICMP Time Exceeded instead).
+pub fn build_ipv4_forward_inplace(
+    data: &mut [u8],
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+) -> bool {
+    if data.len() < ETH_HLEN + IPV4_HLEN {
+        return false;
+    }
+
+    let ttl = data[ETH_HLEN + 8];
+    if ttl <= 1 {
+        return false;
+    }
+
+    // Rewrite Ethernet header.
+    data[0..6].copy_from_slice(dst_mac);
+    data[6..12].copy_from_slice(src_mac);
+
+    // Decrement TTL.
+    let new_ttl = ttl - 1;
+    data[ETH_HLEN + 8] = new_ttl;
+
+    // Incremental IP checksum update for TTL change (RFC 1624).
+    // TTL is at byte offset 8 in IP header. It's the high byte of the u16 word at offset 8.
+    let old_word = u16::from_be_bytes([ttl, data[ETH_HLEN + 9]]);
+    let new_word = u16::from_be_bytes([new_ttl, data[ETH_HLEN + 9]]);
+    let old_cksum = u16::from_be_bytes([data[ETH_HLEN + 10], data[ETH_HLEN + 11]]);
+
+    let mut sum: i32 = !(old_cksum) as u16 as i32;
+    sum += !(old_word) as u16 as i32;
+    sum += new_word as i32;
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    while sum < 0 {
+        sum += 0x10000;
+    }
+    let new_cksum = !(sum as u16);
+    data[ETH_HLEN + 10..ETH_HLEN + 12].copy_from_slice(&new_cksum.to_be_bytes());
+
+    true
 }
 
 // ── Checksums ─────────────────────────────────────────────────────

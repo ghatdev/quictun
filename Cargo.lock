@@ -1078,6 +1078,7 @@ dependencies = [
  "quinn",
  "quinn-proto",
  "rcgen",
+ "rustc-hash",
  "rustls",
  "rustls-pemfile",
  "serde",

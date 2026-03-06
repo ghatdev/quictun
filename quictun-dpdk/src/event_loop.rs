@@ -73,6 +73,12 @@ pub struct DpdkConfig {
     pub no_udp_checksum: bool,
     /// Peer configurations for peer identification (listener with >1 peer).
     pub peers: Vec<PeerConfig>,
+    /// Enable router mode (single NIC, no inner port).
+    pub router: bool,
+    /// Enable NAT in router mode (default: true).
+    pub enable_nat: bool,
+    /// MSS clamp value for router mode (0 = auto from tunnel_mtu - 40).
+    pub mss_clamp: u16,
 }
 
 /// Run the DPDK data plane.
@@ -233,9 +239,51 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         }
     }
 
-    // ── 6. Build inner interface ─────────────────────────────────
+    // ── 6. Build inner interface (skip in router mode) ────────────
 
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Router mode: no inner port, single NIC handles everything.
+    if dpdk_config.router {
+        // Set up signal handler.
+        let sig_shutdown = shutdown.clone();
+        unsafe {
+            libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+        }
+        SHUTDOWN_FLAG.store(Arc::into_raw(sig_shutdown) as usize, Ordering::Release);
+
+        let mss_clamp = if dpdk_config.mss_clamp > 0 {
+            dpdk_config.mss_clamp
+        } else {
+            dpdk_config.tunnel_mtu.saturating_sub(40) // auto: MTU - IP(20) - TCP(20)
+        };
+
+        tracing::info!(
+            enable_nat = dpdk_config.enable_nat,
+            mss_clamp,
+            "starting router mode (single NIC, no inner port)"
+        );
+
+        let result = crate::router::run_router(
+            dpdk_config.port_id,
+            0, // queue_id
+            mempool,
+            &mut multi_state,
+            &mut identity,
+            &mut arp_table,
+            shutdown.clone(),
+            dpdk_config.adaptive_poll,
+            checksum_mode,
+            &dpdk_config.peers,
+            dpdk_config.enable_nat,
+            mss_clamp,
+            dpdk_config.tunnel_ip,
+        );
+
+        shutdown.store(true, Ordering::Release);
+        port::close_port(dpdk_config.port_id);
+        return result;
+    }
 
     let mut inner_ports: Vec<InnerPort> = Vec::with_capacity(n_cores);
 
