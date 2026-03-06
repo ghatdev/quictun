@@ -131,6 +131,14 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         send_buf: config.engine.send_buf,
         threads: config.engine.threads,
         offload: config.engine.offload,
+        batch_size: config.engine.batch_size,
+        gso_max_segments: config.engine.gso_max_segments,
+        encrypt_threads: config.engine.encrypt_threads,
+        parallel_threshold: config.engine.parallel_threshold,
+        ack_interval: config.engine.ack_interval,
+        tun_write_buf_capacity: config.engine.tun_write_buf,
+        channel_capacity: config.engine.channel_capacity,
+        poll_events: config.engine.poll_events,
     };
 
     // Resolve cipher suites.

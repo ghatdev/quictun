@@ -210,6 +210,30 @@ pub struct EngineConfig {
     pub no_udp_checksum: bool,
     #[serde(default = "default_adaptive_poll")]
     pub adaptive_poll: bool,
+    /// recvmmsg/sendmmsg batch count.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    /// UDP GSO segments per sendmsg.
+    #[serde(default = "default_gso_max_segments")]
+    pub gso_max_segments: usize,
+    /// Parallel encrypt workers. 0=auto (ncpus-1), 1=sequential.
+    #[serde(default)]
+    pub encrypt_threads: usize,
+    /// Min batch size to trigger parallel encrypt.
+    #[serde(default = "default_parallel_threshold")]
+    pub parallel_threshold: usize,
+    /// Packets between ACK generation.
+    #[serde(default = "default_ack_interval")]
+    pub ack_interval: u32,
+    /// TUN write backpressure buffer (packets).
+    #[serde(default = "default_tun_write_buf")]
+    pub tun_write_buf: usize,
+    /// Dispatcher↔worker channel size (multi-thread).
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+    /// mio Events capacity.
+    #[serde(default = "default_poll_events")]
+    pub poll_events: usize,
 }
 
 impl Default for EngineConfig {
@@ -233,6 +257,14 @@ impl Default for EngineConfig {
             dpdk_port: 0,
             no_udp_checksum: false,
             adaptive_poll: true,
+            batch_size: 64,
+            gso_max_segments: 44,
+            encrypt_threads: 0,
+            parallel_threshold: 8,
+            ack_interval: 64,
+            tun_write_buf: 256,
+            channel_capacity: 4096,
+            poll_events: 64,
         }
     }
 }
@@ -293,6 +325,34 @@ fn default_dpdk_eal_args() -> String {
 
 fn default_adaptive_poll() -> bool {
     true
+}
+
+fn default_batch_size() -> usize {
+    64
+}
+
+fn default_gso_max_segments() -> usize {
+    44
+}
+
+fn default_parallel_threshold() -> usize {
+    8
+}
+
+fn default_ack_interval() -> u32 {
+    64
+}
+
+fn default_tun_write_buf() -> usize {
+    256
+}
+
+fn default_channel_capacity() -> usize {
+    4096
+}
+
+fn default_poll_events() -> usize {
+    64
 }
 
 fn default_true() -> bool {

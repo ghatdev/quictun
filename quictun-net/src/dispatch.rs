@@ -66,8 +66,12 @@ impl Default for WorkerChannels {
 
 impl WorkerChannels {
     pub fn new() -> Self {
-        let (outer_tx, outer_rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
-        let (inner_tx, inner_rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
+        Self::with_capacity(CHANNEL_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (outer_tx, outer_rx) = crossbeam_channel::bounded(capacity);
+        let (inner_tx, inner_rx) = crossbeam_channel::bounded(capacity);
         Self {
             outer_tx,
             outer_rx,

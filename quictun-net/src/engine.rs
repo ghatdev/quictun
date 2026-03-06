@@ -24,17 +24,86 @@ use crate::dispatch::{
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::{BUF_SIZE, MultiQuicState};
 use quictun_quic::cid_to_u64;
+#[cfg(target_os = "linux")]
+use quictun_quic::local::{PreparedPacket, SealKeys};
 use quictun_quic::local::LocalConnectionState;
+#[cfg(target_os = "linux")]
+use quictun_quic::{EncryptResult, encrypt_packet};
 use quictun_tun::TunOptions;
+#[cfg(target_os = "linux")]
+use smallvec::SmallVec;
 
 /// Maximum QUIC packet size.
 const MAX_PACKET: usize = 2048;
+
+/// Get the number of available CPUs.
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
 
 /// Handshake response buffer size.
 const HANDSHAKE_BUF_SIZE: usize = 2048;
 
 /// Maximum packets to buffer when TUN write returns WouldBlock.
 const TUN_WRITE_BUF_CAPACITY: usize = 256;
+
+/// Pool of reusable buffers for GRO TX coalescing.
+///
+/// Avoids per-datagram heap allocation on the decrypt→TUN path.
+/// Inner Vecs are never dropped — only truncated and reused via `resize()`.
+#[cfg(target_os = "linux")]
+struct GroTxPool {
+    bufs: Vec<Vec<u8>>,
+    active: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl GroTxPool {
+    fn new() -> Self {
+        Self {
+            bufs: Vec::new(),
+            active: 0,
+        }
+    }
+
+    /// Add a datagram to the pool, prepending VIRTIO_NET_HDR_LEN zero bytes.
+    fn push_datagram(&mut self, datagram: &[u8]) {
+        let hdr_len = quictun_tun::VIRTIO_NET_HDR_LEN;
+        let total = hdr_len + datagram.len();
+        if self.active < self.bufs.len() {
+            let buf = &mut self.bufs[self.active];
+            buf.resize(total, 0);
+            buf[..hdr_len].fill(0);
+            buf[hdr_len..].copy_from_slice(datagram);
+        } else {
+            let mut buf = vec![0u8; total];
+            buf[hdr_len..].copy_from_slice(datagram);
+            self.bufs.push(buf);
+        }
+        self.active += 1;
+    }
+
+    /// Return the active buffers as a mutable slice (for `send_multiple`).
+    fn as_mut_slice(&mut self) -> &mut [Vec<u8>] {
+        &mut self.bufs[..self.active]
+    }
+
+    /// Iterator over active buffers (for fallback WouldBlock buffering).
+    fn iter(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.bufs[..self.active].iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active == 0
+    }
+
+    /// Reset the pool without dropping inner Vecs.
+    fn reset(&mut self) {
+        self.active = 0;
+    }
+}
 
 /// Ring buffer for TUN writes that couldn't complete due to WouldBlock.
 ///
@@ -48,8 +117,12 @@ struct TunWriteBuffer {
 
 impl TunWriteBuffer {
     fn new() -> Self {
+        Self::with_capacity(TUN_WRITE_BUF_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            packets: std::collections::VecDeque::with_capacity(TUN_WRITE_BUF_CAPACITY),
+            packets: std::collections::VecDeque::with_capacity(capacity),
         }
     }
 
@@ -130,7 +203,7 @@ impl TunWriteBuffer {
     }
 
     fn push(&mut self, data: &[u8]) {
-        if self.packets.len() >= TUN_WRITE_BUF_CAPACITY {
+        if self.packets.len() >= self.packets.capacity().max(TUN_WRITE_BUF_CAPACITY) {
             // Buffer full — drop oldest to make room (tail drop would delay newer data).
             self.packets.pop_front();
         }
@@ -173,6 +246,14 @@ pub struct NetConfig {
     pub send_buf: usize,
     pub threads: usize,
     pub offload: bool,
+    pub batch_size: usize,
+    pub gso_max_segments: usize,
+    pub encrypt_threads: usize,
+    pub parallel_threshold: usize,
+    pub ack_interval: u32,
+    pub tun_write_buf_capacity: usize,
+    pub channel_capacity: usize,
+    pub poll_events: usize,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -196,6 +277,19 @@ struct ConnEntry {
 ///
 /// Routes to single-thread or multi-thread path based on `config.threads`.
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
+    // Configure rayon thread pool for parallel encrypt.
+    let encrypt_threads = if config.encrypt_threads == 0 {
+        // Auto: use all available cores minus 1 (leave one for the main loop).
+        num_cpus().saturating_sub(1).max(1)
+    } else {
+        config.encrypt_threads
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(encrypt_threads)
+        .build_global()
+        .ok(); // Ignore if already initialized.
+    info!(encrypt_threads, "rayon thread pool configured");
+
     if config.threads > 1 {
         run_multi(local_addr, setup, config)
     } else {
@@ -239,7 +333,7 @@ fn run_single(
 
     // 4. Create mio poll and register sources.
     let mut poll = Poll::new().context("failed to create mio::Poll")?;
-    let mut events = Events::with_capacity(64);
+    let mut events = Events::with_capacity(config.poll_events);
 
     let udp_raw_fd = udp_socket.as_raw_fd();
     poll.registry()
@@ -260,6 +354,7 @@ fn run_single(
         EndpointSetup::Listener { server_config } => MultiQuicState::new(server_config.clone()),
         EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
+    multi_state.ack_interval = config.ack_interval;
 
     if let EndpointSetup::Connector {
         remote_addr,
@@ -281,18 +376,22 @@ fn run_single(
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
     let mut scratch = BytesMut::with_capacity(2048);
-    let mut tun_write_buf = TunWriteBuffer::new();
+    let mut tun_write_buf = TunWriteBuffer::with_capacity(config.tun_write_buf_capacity);
 
-    // Linux: batch I/O buffers.
+    // Linux: batch I/O buffers (sized from config).
     #[cfg(target_os = "linux")]
-    let mut gso_buf = vec![0u8; quictun_core::batch_io::GSO_BUF_SIZE];
+    let gso_buf_size = config.gso_max_segments * MAX_PACKET;
     #[cfg(target_os = "linux")]
-    let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; quictun_core::batch_io::BATCH_SIZE];
+    let mut gso_buf = vec![0u8; gso_buf_size];
     #[cfg(target_os = "linux")]
-    let mut recv_lens = vec![0usize; quictun_core::batch_io::BATCH_SIZE];
+    let batch_size = config.batch_size;
+    #[cfg(target_os = "linux")]
+    let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; batch_size];
+    #[cfg(target_os = "linux")]
+    let mut recv_lens = vec![0usize; batch_size];
     #[cfg(target_os = "linux")]
     let mut recv_addrs =
-        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); quictun_core::batch_io::BATCH_SIZE];
+        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); batch_size];
 
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -325,9 +424,9 @@ fn run_single(
     } else {
         None
     };
-    // GRO TX accumulation buffers: each has VIRTIO_NET_HDR_LEN offset for the header.
+    // GRO TX buffer pool: reuses allocations across batches.
     #[cfg(target_os = "linux")]
-    let mut gro_tx_bufs: Vec<Vec<u8>> = Vec::new();
+    let mut gro_tx_pool = GroTxPool::new();
 
     // 7. Main poll loop.
     loop {
@@ -381,7 +480,7 @@ fn run_single(
                     &mut scratch,
                     &mut response_buf,
                     offload_enabled,
-                    &mut gro_tx_bufs,
+                    &mut gro_tx_pool,
                     &mut gro_table,
                     &mut tun_write_buf,
                 )?;
@@ -416,6 +515,7 @@ fn run_single(
                         &mut tun_original_buf,
                         &mut tun_split_bufs,
                         &mut tun_split_sizes,
+                        config.parallel_threshold,
                     )?;
                 } else {
                     handle_tun_rx_linux(
@@ -647,18 +747,19 @@ fn handle_udp_rx_linux(
     scratch: &mut BytesMut,
     response_buf: &mut Vec<u8>,
     offload: bool,
-    gro_tx_bufs: &mut Vec<Vec<u8>>,
+    gro_tx_pool: &mut GroTxPool,
     gro_table: &mut Option<quictun_tun::GROTable>,
     tun_write_buf: &mut TunWriteBuffer,
 ) -> Result<()> {
     // Loop recvmmsg until WouldBlock — required for edge-triggered epoll (mio).
     loop {
+        let max_batch = recv_bufs.len();
         let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
             udp,
             recv_bufs,
             recv_lens,
             recv_addrs,
-            quictun_core::batch_io::BATCH_SIZE,
+            max_batch,
         ) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -716,12 +817,7 @@ fn handle_udp_rx_linux(
                                     continue;
                                 }
                                 if offload {
-                                    // Accumulate for GRO coalescing via send_multiple.
-                                    let mut buf =
-                                        vec![0u8; quictun_tun::VIRTIO_NET_HDR_LEN + datagram.len()];
-                                    buf[quictun_tun::VIRTIO_NET_HDR_LEN..]
-                                        .copy_from_slice(datagram);
-                                    gro_tx_bufs.push(buf);
+                                    gro_tx_pool.push_datagram(datagram);
                                 } else {
                                     tun_write_buf.write(tun, datagram);
                                 }
@@ -747,13 +843,12 @@ fn handle_udp_rx_linux(
         }
 
         // Flush accumulated GRO TX buffers.
-        if offload && !gro_tx_bufs.is_empty() {
+        if offload && !gro_tx_pool.is_empty() {
             if let Some(gro) = gro_table {
-                match tun.send_multiple(gro, gro_tx_bufs, quictun_tun::VIRTIO_NET_HDR_LEN) {
+                match tun.send_multiple(gro, gro_tx_pool.as_mut_slice(), quictun_tun::VIRTIO_NET_HDR_LEN) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Buffer individual packets instead of dropping the batch.
-                        for buf in gro_tx_bufs.iter() {
+                        for buf in gro_tx_pool.iter() {
                             tun_write_buf.push(buf);
                         }
                     }
@@ -761,12 +856,12 @@ fn handle_udp_rx_linux(
                         debug!(error = %e, "TUN send_multiple failed");
                     }
                 }
-                gro_tx_bufs.clear();
+                gro_tx_pool.reset();
             }
         }
 
-        // If we got fewer than BATCH_SIZE, the socket is drained.
-        if n_msgs < quictun_core::batch_io::BATCH_SIZE {
+        // If we got fewer than batch size, the socket is drained.
+        if n_msgs < max_batch {
             return Ok(());
         }
     }
@@ -875,7 +970,7 @@ fn handle_tun_rx_linux(
     gso_buf: &mut [u8],
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
-    let max_segs = quictun_core::batch_io::GSO_MAX_SEGMENTS;
+    let max_segs = gso_buf.len() / MAX_PACKET;
     let mut gso_pos = 0usize;
     let mut gso_segment_size = 0usize;
     let mut gso_count = 0usize;
@@ -1043,6 +1138,204 @@ fn wait_writable(fd: i32) {
     if ret < 0 {
         tracing::trace!(error = %io::Error::last_os_error(), "poll(POLLOUT) failed");
     }
+}
+
+// ── Parallel encrypt helpers ─────────────────────────────────────────────
+
+/// Encrypt a batch of packets in parallel using rayon.
+///
+/// Each packet is written into a stride-spaced slot in `gso_buf`.
+/// Returns per-packet `EncryptResult` with actual encrypted length.
+#[cfg(target_os = "linux")]
+fn seal_batch_parallel(
+    payloads: &[&[u8]],
+    prepared: &[PreparedPacket],
+    ack_ranges: Option<&SmallVec<[std::ops::Range<u64>; 8]>>,
+    keys: &SealKeys<'_>,
+    gso_buf: &mut [u8],
+    stride: usize,
+) -> SmallVec<[EncryptResult; 64]> {
+    use rayon::prelude::*;
+
+    let count = payloads.len().min(prepared.len());
+
+    // Split gso_buf into non-overlapping stride-sized chunks.
+    // We'll use unsafe to get non-overlapping &mut [u8] slices for parallel access.
+    let buf_ptr = gso_buf.as_mut_ptr();
+    let buf_len = gso_buf.len();
+
+    let results: Vec<EncryptResult> = (0..count)
+        .into_par_iter()
+        .map(|i| {
+            let offset = i * stride;
+            if offset + stride > buf_len {
+                return EncryptResult { len: 0, pn: prepared[i].pn };
+            }
+            // SAFETY: Each thread writes to non-overlapping [offset..offset+stride].
+            let chunk = unsafe {
+                std::slice::from_raw_parts_mut(buf_ptr.add(offset), stride)
+            };
+
+            let ack = if i == 0 {
+                ack_ranges.map(|r| r.as_slice())
+            } else {
+                None
+            };
+
+            match encrypt_packet(
+                payloads[i],
+                ack,
+                keys.remote_cid,
+                prepared[i].pn,
+                prepared[i].largest_acked,
+                prepared[i].key_phase,
+                keys.tx_packet_key,
+                keys.tx_header_key,
+                keys.tag_len,
+                chunk,
+            ) {
+                Ok(result) => result,
+                Err(_) => EncryptResult { len: 0, pn: prepared[i].pn },
+            }
+        })
+        .collect();
+
+    SmallVec::from_vec(results)
+}
+
+/// Encrypt a batch of packets sequentially (small batches, avoids rayon overhead).
+#[cfg(target_os = "linux")]
+fn seal_batch_sequential(
+    payloads: &[&[u8]],
+    prepared: &[PreparedPacket],
+    ack_ranges: Option<&SmallVec<[std::ops::Range<u64>; 8]>>,
+    keys: &SealKeys<'_>,
+    gso_buf: &mut [u8],
+    stride: usize,
+) -> SmallVec<[EncryptResult; 64]> {
+    let count = payloads.len().min(prepared.len());
+    let mut results = SmallVec::with_capacity(count);
+
+    for i in 0..count {
+        let offset = i * stride;
+        if offset + stride > gso_buf.len() {
+            break;
+        }
+        let chunk = &mut gso_buf[offset..offset + stride];
+        let ack = if i == 0 {
+            ack_ranges.map(|r| r.as_slice())
+        } else {
+            None
+        };
+
+        match encrypt_packet(
+            payloads[i],
+            ack,
+            keys.remote_cid,
+            prepared[i].pn,
+            prepared[i].largest_acked,
+            prepared[i].key_phase,
+            keys.tx_packet_key,
+            keys.tx_header_key,
+            keys.tag_len,
+            chunk,
+        ) {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                warn!(error = %e, "encrypt failed in batch, dropping packet");
+            }
+        }
+    }
+
+    results
+}
+
+/// Compact stride-spaced encrypted packets and send via GSO.
+///
+/// After parallel encrypt, packets sit at stride-spaced offsets. GSO needs them
+/// contiguous with uniform segment size. Handles the first-packet-different case
+/// (when it has an ACK and differs in size from the rest).
+#[cfg(target_os = "linux")]
+fn compact_and_send_gso(
+    udp: &std::net::UdpSocket,
+    gso_buf: &mut [u8],
+    results: &[EncryptResult],
+    stride: usize,
+    remote_addr: SocketAddr,
+) -> Result<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+
+    // Filter out zero-length failures.
+    let valid: SmallVec<[(usize, usize); 64]> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.len > 0)
+        .map(|(i, r)| (i, r.len))
+        .collect();
+
+    if valid.is_empty() {
+        return Ok(());
+    }
+
+    // Check if all valid packets have the same size.
+    let first_len = valid[0].1;
+    let all_same = valid.iter().all(|(_, len)| *len == first_len);
+
+    if all_same && valid.len() == 1 {
+        // Single packet — just send directly from its stride position.
+        let offset = valid[0].0 * stride;
+        let len = valid[0].1;
+        loop {
+            match udp.send_to(&gso_buf[offset..offset + len], remote_addr) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_writable(udp.as_raw_fd());
+                }
+                Err(e) => return Err(e).context("send_to failed"),
+            }
+        }
+    } else if all_same {
+        // All same size — compact into contiguous positions and GSO send.
+        let mut write_pos = 0;
+        for &(idx, len) in &valid {
+            let read_pos = idx * stride;
+            if write_pos != read_pos {
+                gso_buf.copy_within(read_pos..read_pos + len, write_pos);
+            }
+            write_pos += len;
+        }
+        flush_gso_sync(udp, gso_buf, write_pos, first_len, remote_addr)?;
+    } else {
+        // First packet has different size (ACK). Send it alone, then compact+GSO the rest.
+        let first_offset = valid[0].0 * stride;
+        let first_len = valid[0].1;
+        loop {
+            match udp.send_to(&gso_buf[first_offset..first_offset + first_len], remote_addr) {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_writable(udp.as_raw_fd());
+                }
+                Err(e) => return Err(e).context("send_to failed"),
+            }
+        }
+
+        if valid.len() > 1 {
+            let rest_len = valid[1].1; // All remaining should be same size.
+            let mut write_pos = 0;
+            for &(idx, len) in &valid[1..] {
+                let read_pos = idx * stride;
+                if write_pos != read_pos {
+                    gso_buf.copy_within(read_pos..read_pos + len, write_pos);
+                }
+                write_pos += len;
+            }
+            flush_gso_sync(udp, gso_buf, write_pos, rest_len, remote_addr)?;
+        }
+    }
+
+    Ok(())
 }
 
 // ── TUN RX (non-Linux — per-packet send) ─────────────────────────────────
@@ -1271,15 +1564,9 @@ fn handle_tun_rx_linux_offload(
     original_buf: &mut [u8],
     split_bufs: &mut [Vec<u8>],
     split_sizes: &mut [usize],
+    parallel_threshold: usize,
 ) -> Result<()> {
-    let max_segs = quictun_core::batch_io::GSO_MAX_SEGMENTS;
-
-    // GSO batching state for UDP send.
-    let mut gso_pos = 0usize;
-    let mut gso_segment_size = 0usize;
-    let mut gso_count = 0usize;
-    let mut current_cid: Option<u64> = None;
-    let mut current_remote: Option<SocketAddr> = None;
+    let max_segs = gso_buf.len() / MAX_PACKET;
 
     loop {
         let n_pkts = match tun.recv_multiple(original_buf, split_bufs, split_sizes, 0) {
@@ -1288,112 +1575,119 @@ fn handle_tun_rx_linux_offload(
             Err(e) => return Err(e).context("TUN recv_multiple failed"),
         };
 
+        // Collect valid payloads and group by CID.
+        // Common case: all packets go to the same connection.
+        let mut batch_payloads: SmallVec<[usize; 64]> = SmallVec::new(); // indices into split_bufs
+        let mut batch_cid: Option<u64> = None;
+
         for i in 0..n_pkts {
             let pkt_len = split_sizes[i];
             if pkt_len < 20 {
                 continue;
             }
             let packet = &split_bufs[i][..pkt_len];
-
             let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
             let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
                 cid
             } else if connections.len() == 1 {
-                *connections
-                    .keys()
-                    .next()
-                    .expect("single connection")
+                *connections.keys().next().expect("single connection")
             } else {
                 debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
                 continue;
             };
 
-            // Flush current GSO batch if connection changed or batch full.
-            if let Some(ref cur_cid) = current_cid {
-                if *cur_cid != cid || gso_count >= max_segs || gso_pos + MAX_PACKET > gso_buf.len()
-                {
-                    if gso_count > 0 {
-                        flush_gso_sync(
-                            udp,
-                            gso_buf,
-                            gso_pos,
-                            gso_segment_size,
-                            current_remote.expect("remote set"),
-                        )?;
-                        if let Some(entry) = connections.get_mut(cur_cid) {
-                            entry.last_tx = Instant::now();
-                        }
-                    }
-                    gso_pos = 0;
-                    gso_segment_size = 0;
-                    gso_count = 0;
+            // If CID changed, flush the current batch first.
+            if let Some(prev_cid) = batch_cid {
+                if prev_cid != cid && !batch_payloads.is_empty() {
+                    flush_offload_batch(
+                        udp, connections, gso_buf, split_bufs, split_sizes,
+                        &batch_payloads, prev_cid, max_segs, parallel_threshold,
+                    )?;
+                    batch_payloads.clear();
                 }
             }
+            batch_cid = Some(cid);
+            batch_payloads.push(i);
 
-            let entry = match connections.get_mut(&cid) {
-                Some(e) => e,
-                None => continue,
-            };
+            // Flush if batch full (max GSO segments).
+            if batch_payloads.len() >= max_segs {
+                flush_offload_batch(
+                    udp, connections, gso_buf, split_bufs, split_sizes,
+                    &batch_payloads, cid, max_segs, parallel_threshold,
+                )?;
+                batch_payloads.clear();
+            }
+        }
 
-            current_cid = Some(cid);
-            current_remote = Some(entry.remote_addr);
-
-            let ack_ranges = if entry.conn.needs_ack() {
-                Some(entry.conn.generate_ack_ranges())
-            } else {
-                None
-            };
-            match entry.conn.encrypt_datagram(
-                packet,
-                ack_ranges.as_deref(),
-                &mut gso_buf[gso_pos..],
-            ) {
-                Ok(result) => {
-                    if gso_count == 0 {
-                        gso_segment_size = result.len;
-                        gso_pos += result.len;
-                        gso_count += 1;
-                    } else if result.len == gso_segment_size {
-                        gso_pos += result.len;
-                        gso_count += 1;
-                    } else {
-                        if gso_count > 0 {
-                            flush_gso_sync(
-                                udp,
-                                gso_buf,
-                                gso_pos,
-                                gso_segment_size,
-                                entry.remote_addr,
-                            )?;
-                        }
-                        gso_buf.copy_within(gso_pos..gso_pos + result.len, 0);
-                        gso_segment_size = result.len;
-                        gso_pos = result.len;
-                        gso_count = 1;
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "encrypt failed, dropping packet");
-                }
+        // Flush remaining batch.
+        if let Some(cid) = batch_cid {
+            if !batch_payloads.is_empty() {
+                flush_offload_batch(
+                    udp, connections, gso_buf, split_bufs, split_sizes,
+                    &batch_payloads, cid, max_segs, parallel_threshold,
+                )?;
             }
         }
     }
 
-    // Flush remaining GSO batch.
-    if gso_count > 0 {
-        flush_gso_sync(
-            udp,
-            gso_buf,
-            gso_pos,
-            gso_segment_size,
-            current_remote.expect("remote set"),
+    Ok(())
+}
+
+/// Flush a batch of TUN packets for a single connection via parallel or sequential encrypt.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn flush_offload_batch(
+    udp: &std::net::UdpSocket,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    gso_buf: &mut [u8],
+    split_bufs: &[Vec<u8>],
+    split_sizes: &[usize],
+    indices: &[usize],
+    cid: u64,
+    _max_segs: usize,
+    parallel_threshold: usize,
+) -> Result<()> {
+    let entry = match connections.get_mut(&cid) {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+
+    let count = indices.len();
+
+    // Collect payload references.
+    let payloads: SmallVec<[&[u8]; 64]> = indices
+        .iter()
+        .map(|&i| &split_bufs[i][..split_sizes[i]])
+        .collect();
+
+    // Phase 1: Sequential — assign PNs and generate ACK.
+    let (prepared, ack_ranges) = entry.conn.prepare_batch(count);
+    let actual_count = prepared.len(); // may be truncated at key update boundary
+
+    // Phase 2: Encrypt (parallel or sequential).
+    let stride = MAX_PACKET;
+    let keys = entry.conn.seal_keys();
+    let payloads_slice = &payloads[..actual_count];
+
+    let results = if actual_count >= parallel_threshold {
+        seal_batch_parallel(payloads_slice, &prepared, ack_ranges.as_ref(), &keys, gso_buf, stride)
+    } else {
+        seal_batch_sequential(payloads_slice, &prepared, ack_ranges.as_ref(), &keys, gso_buf, stride)
+    };
+
+    // Phase 3: Compact + GSO send.
+    let remote = entry.remote_addr;
+    entry.last_tx = Instant::now();
+    compact_and_send_gso(udp, gso_buf, &results, stride, remote)?;
+
+    // If prepare_batch truncated at key update, process remainder.
+    if actual_count < count {
+        let remaining_indices: SmallVec<[usize; 64]> = indices[actual_count..].iter().copied().collect();
+        flush_offload_batch(
+            udp, connections, gso_buf, split_bufs, split_sizes,
+            &remaining_indices, cid, _max_segs, parallel_threshold,
         )?;
-        if let Some(ref cid) = current_cid {
-            if let Some(entry) = connections.get_mut(&cid) {
-                entry.last_tx = Instant::now();
-            }
-        }
     }
 
     Ok(())
@@ -1443,6 +1737,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
         EndpointSetup::Listener { server_config } => MultiQuicState::new(server_config.clone()),
         EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
+    multi_state.ack_interval = config.ack_interval;
 
     if let EndpointSetup::Connector {
         remote_addr,
@@ -1461,8 +1756,9 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
     }
 
     // 3. Create per-worker channels.
+    let channel_capacity = config.channel_capacity;
     let worker_channels: Vec<Arc<WorkerChannels>> = (0..n_workers)
-        .map(|_| Arc::new(WorkerChannels::new()))
+        .map(|_| Arc::new(WorkerChannels::with_capacity(channel_capacity)))
         .collect();
 
     // 4. Worker→dispatcher removal channel (all workers share the sender).
@@ -1579,7 +1875,7 @@ fn run_dispatcher(
 ) -> Result<RunResult> {
     // Register with mio.
     let mut poll = Poll::new().context("failed to create mio::Poll")?;
-    let mut events = Events::with_capacity(64);
+    let mut events = Events::with_capacity(config.poll_events);
 
     let udp_raw_fd = udp.as_raw_fd();
     poll.registry()
@@ -1599,14 +1895,16 @@ fn run_dispatcher(
     let mut active_connections: usize = 0;
     let mut had_connection = false;
 
-    // Linux: batch RX buffers.
+    // Linux: batch RX buffers (sized from config).
     #[cfg(target_os = "linux")]
-    let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; quictun_core::batch_io::BATCH_SIZE];
+    let dispatch_batch_size = config.batch_size;
     #[cfg(target_os = "linux")]
-    let mut recv_lens = vec![0usize; quictun_core::batch_io::BATCH_SIZE];
+    let mut recv_bufs = vec![vec![0u8; MAX_PACKET]; dispatch_batch_size];
+    #[cfg(target_os = "linux")]
+    let mut recv_lens = vec![0usize; dispatch_batch_size];
     #[cfg(target_os = "linux")]
     let mut recv_addrs =
-        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); quictun_core::batch_io::BATCH_SIZE];
+        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); dispatch_batch_size];
 
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -1790,12 +2088,13 @@ fn dispatch_udp_rx_linux(
     response_buf: &mut Vec<u8>,
 ) -> Result<()> {
     loop {
+        let max_batch = recv_bufs.len();
         let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
             udp,
             recv_bufs,
             recv_lens,
             recv_addrs,
-            quictun_core::batch_io::BATCH_SIZE,
+            max_batch,
         ) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -1835,7 +2134,7 @@ fn dispatch_udp_rx_linux(
             }
         }
 
-        if n_msgs < quictun_core::batch_io::BATCH_SIZE {
+        if n_msgs < max_batch {
             return Ok(());
         }
     }
@@ -2098,6 +2397,10 @@ fn run_worker(
     #[cfg(target_os = "linux")]
     let mut encrypt_buf = vec![0u8; MAX_PACKET];
 
+    // Reusable buffer for TUN writes with virtio-net header (avoids per-datagram alloc).
+    #[cfg(target_os = "linux")]
+    let mut vnet_buf: Vec<u8> = Vec::with_capacity(quictun_tun::VIRTIO_NET_HDR_LEN + 1500);
+
     // Adaptive sleep: start at 1μs, backoff to 100μs when idle.
     let mut idle_iters = 0u32;
 
@@ -2209,9 +2512,10 @@ fn run_worker(
                                         #[cfg(target_os = "linux")]
                                         if offload {
                                             let hdr_len = quictun_tun::VIRTIO_NET_HDR_LEN;
-                                            let mut buf = vec![0u8; hdr_len + datagram.len()];
-                                            buf[hdr_len..].copy_from_slice(datagram);
-                                            tun_write_buf.write_raw(tun_fd, &buf);
+                                            vnet_buf.resize(hdr_len + datagram.len(), 0);
+                                            vnet_buf[..hdr_len].fill(0);
+                                            vnet_buf[hdr_len..].copy_from_slice(datagram);
+                                            tun_write_buf.write_raw(tun_fd, &vnet_buf);
                                         } else {
                                             tun_write_buf.write_raw(tun_fd, datagram);
                                         }

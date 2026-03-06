@@ -21,6 +21,29 @@ use crate::{
     prepare_key_generations, unprotect_header,
 };
 
+/// Pre-assigned metadata for one packet in a batch (parallel encrypt).
+pub struct PreparedPacket {
+    pub pn: u64,
+    pub largest_acked: u64,
+    pub key_phase: bool,
+}
+
+/// Immutable key snapshot for parallel sealing.
+///
+/// Holds references to the TX keys. `PacketKey` and `HeaderKey` are `Send + Sync`,
+/// so this can be shared across rayon threads.
+pub struct SealKeys<'a> {
+    pub remote_cid: &'a ConnectionId,
+    pub tx_packet_key: &'a dyn PacketKey,
+    pub tx_header_key: &'a dyn HeaderKey,
+    pub tag_len: usize,
+}
+
+// SAFETY: PacketKey and HeaderKey are Send + Sync (confirmed in quinn-proto).
+// SealKeys only holds immutable references to them.
+unsafe impl Send for SealKeys<'_> {}
+unsafe impl Sync for SealKeys<'_> {}
+
 /// Non-atomic QUIC 1-RTT connection state for single-task use.
 ///
 /// All methods take `&mut self`. No locks, no atomics, no Arc.
@@ -60,12 +83,26 @@ pub struct LocalConnectionState {
 
 impl LocalConnectionState {
     /// Create from quinn-proto keys after handshake.
+    ///
+    /// `ack_interval`: packets between ACK generation. Pass `None` for default (64).
     pub fn new(
         keys: crypto::Keys,
         key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
         local_cid: ConnectionId,
         remote_cid: ConnectionId,
         is_server: bool,
+    ) -> Self {
+        Self::with_ack_interval(keys, key_generations, local_cid, remote_cid, is_server, DEFAULT_ACK_INTERVAL)
+    }
+
+    /// Create with a custom ACK interval.
+    pub fn with_ack_interval(
+        keys: crypto::Keys,
+        key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
+        local_cid: ConnectionId,
+        remote_cid: ConnectionId,
+        is_server: bool,
+        ack_interval: u32,
     ) -> Self {
         let tag_len = keys.packet.local.tag_len();
         let (tx_packet_key, rx_packet_key) = (keys.packet.local, keys.packet.remote);
@@ -93,7 +130,7 @@ impl LocalConnectionState {
             largest_rx_pn: 0,
             received: Bitmap::new(),
             rx_since_last_ack: 0,
-            ack_interval: DEFAULT_ACK_INTERVAL,
+            ack_interval,
         }
     }
 
@@ -298,6 +335,59 @@ impl LocalConnectionState {
     /// Returns `true` if keys are exhausted and the connection must be closed.
     pub fn is_key_exhausted(&self) -> bool {
         self.key_exhausted
+    }
+
+    /// Assign packet numbers for a batch of `count` packets.
+    ///
+    /// Handles the key update boundary: if the batch would cross the 7M threshold,
+    /// it truncates at the boundary. The caller should re-call for the remainder.
+    ///
+    /// Also generates ACK ranges if needed (attached to the first packet only).
+    pub fn prepare_batch(&mut self, count: usize) -> (SmallVec<[PreparedPacket; 64]>, Option<SmallVec<[Range<u64>; 8]>>) {
+        let mut prepared = SmallVec::with_capacity(count);
+        let ack_ranges = if self.rx_since_last_ack >= self.ack_interval {
+            Some(self.generate_ack_ranges())
+        } else {
+            None
+        };
+
+        for _ in 0..count {
+            // Check key update threshold before assigning PN.
+            self.packets_since_key_update += 1;
+            if self.packets_since_key_update == KEY_UPDATE_THRESHOLD {
+                self.initiate_key_update();
+                // Truncate batch here — caller will re-call for remainder with new keys.
+                if prepared.is_empty() {
+                    // At least emit one packet with the new keys.
+                } else {
+                    break;
+                }
+            }
+
+            let pn = self.pn_counter;
+            self.pn_counter += 1;
+
+            prepared.push(PreparedPacket {
+                pn,
+                largest_acked: self.largest_acked,
+                key_phase: self.key_phase,
+            });
+        }
+
+        (prepared, ack_ranges)
+    }
+
+    /// Return immutable references to the current TX keys for parallel encryption.
+    ///
+    /// Call after `prepare_batch`. The returned references are valid until the next
+    /// mutable operation on this connection.
+    pub fn seal_keys(&self) -> SealKeys<'_> {
+        SealKeys {
+            remote_cid: &self.remote_cid,
+            tx_packet_key: &*self.tx_packet_key,
+            tx_header_key: &*self.tx_header_key,
+            tag_len: self.tag_len,
+        }
     }
 
     fn handle_key_update_rx(&mut self, new_phase: bool) {
