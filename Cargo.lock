@@ -1140,12 +1140,14 @@ name = "quictun-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bytes",
  "crossbeam-channel",
  "hex",
  "ipnet",
  "libc",
  "mio",
+ "parking_lot",
  "quictun-core",
  "quictun-quic",
  "quictun-tun",
@@ -1163,6 +1165,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "parking_lot",
  "quinn-proto",
  "rustls",
  "smallvec",

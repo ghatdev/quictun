@@ -16,7 +16,7 @@ use tracing::warn;
 use crate::bitmap::Bitmap;
 use crate::frame::AckFrame;
 use crate::{
-    DEFAULT_ACK_INTERVAL, DecryptedInPlace, DecryptedPacket, EncryptResult, KEY_UPDATE_THRESHOLD,
+    DecryptedInPlace, DecryptedPacket, EncryptResult, KEY_UPDATE_THRESHOLD,
     MAX_ACK_RANGES, ParseError, decrypt_payload, decrypt_payload_in_place, encrypt_packet,
     prepare_key_generations, unprotect_header,
 };
@@ -77,32 +77,18 @@ pub struct LocalConnectionState {
     // RX state.
     pub(crate) largest_rx_pn: u64,
     pub(crate) received: Bitmap,
-    pub(crate) rx_since_last_ack: u32,
-    pub(crate) ack_interval: u32,
+    /// Largest RX PN at the time of the last ACK send (for timer-driven ACKs).
+    pub(crate) last_acked_pn: u64,
 }
 
 impl LocalConnectionState {
     /// Create from quinn-proto keys after handshake.
-    ///
-    /// `ack_interval`: packets between ACK generation. Pass `None` for default (64).
     pub fn new(
         keys: crypto::Keys,
         key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
         local_cid: ConnectionId,
         remote_cid: ConnectionId,
         is_server: bool,
-    ) -> Self {
-        Self::with_ack_interval(keys, key_generations, local_cid, remote_cid, is_server, DEFAULT_ACK_INTERVAL)
-    }
-
-    /// Create with a custom ACK interval.
-    pub fn with_ack_interval(
-        keys: crypto::Keys,
-        key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
-        local_cid: ConnectionId,
-        remote_cid: ConnectionId,
-        is_server: bool,
-        ack_interval: u32,
     ) -> Self {
         let tag_len = keys.packet.local.tag_len();
         let (tx_packet_key, rx_packet_key) = (keys.packet.local, keys.packet.remote);
@@ -129,9 +115,20 @@ impl LocalConnectionState {
             largest_acked: 0,
             largest_rx_pn: 0,
             received: Bitmap::new(),
-            rx_since_last_ack: 0,
-            ack_interval,
+            last_acked_pn: 0,
         }
+    }
+
+    /// Create with a custom ACK interval (kept for API compat, interval is ignored).
+    pub fn with_ack_interval(
+        keys: crypto::Keys,
+        key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
+        local_cid: ConnectionId,
+        remote_cid: ConnectionId,
+        is_server: bool,
+        _ack_interval: u32,
+    ) -> Self {
+        Self::new(keys, key_generations, local_cid, remote_cid, is_server)
     }
 
     /// Decrypt an incoming 1-RTT packet, reusing a caller-provided BytesMut.
@@ -166,7 +163,6 @@ impl LocalConnectionState {
         if hdr.pn > self.largest_rx_pn {
             self.largest_rx_pn = hdr.pn;
         }
-        self.rx_since_last_ack += 1;
 
         Ok(result)
     }
@@ -205,7 +201,6 @@ impl LocalConnectionState {
         if hdr.pn > self.largest_rx_pn {
             self.largest_rx_pn = hdr.pn;
         }
-        self.rx_since_last_ack += 1;
 
         Ok(result)
     }
@@ -316,15 +311,18 @@ impl LocalConnectionState {
         })
     }
 
-    /// Check if an ACK should be sent.
+    /// Check if an ACK should be sent (timer-driven).
+    ///
+    /// Returns true if any packets have been received since the last ACK.
+    /// Called by the engine's ACK timer (~20ms), not per-packet.
     pub fn needs_ack(&self) -> bool {
-        self.rx_since_last_ack >= self.ack_interval
+        self.largest_rx_pn > self.last_acked_pn
     }
 
     /// Generate ACK ranges from the received bitmap.
     pub fn generate_ack_ranges(&mut self) -> SmallVec<[Range<u64>; 8]> {
         let ranges = generate_ack_ranges_from_bitmap(&self.received, self.largest_rx_pn);
-        self.rx_since_last_ack = 0;
+        self.last_acked_pn = self.largest_rx_pn;
         // Advance base past fully-ACKed regions to keep the scan window small.
         // With contiguous delivery (common in VPN), a single range [base..largest+1]
         // means base never advances. Use the first (largest) range's start instead,

@@ -107,6 +107,16 @@ impl TxState {
         Arc::clone(&self.tx_header_key)
     }
 
+    /// Store a new TX packet key (for key rotation from SharedConnectionState).
+    pub fn store_packet_key(&self, key: Arc<Box<dyn PacketKey>>) {
+        self.tx_packet_key.store(key);
+    }
+
+    /// Set the key phase bit.
+    pub fn set_key_phase(&self, phase: bool) {
+        self.key_phase.store(phase, Ordering::Relaxed);
+    }
+
     /// Encrypt a datagram payload using shared state. No `&mut self` needed.
     pub fn encrypt_datagram(
         &self,
@@ -138,8 +148,7 @@ pub struct RxState {
     rx_header_key: Arc<Box<dyn HeaderKey>>,
     received: Bitmap,
     largest_rx_pn: u64,
-    rx_since_last_ack: u32,
-    ack_interval: u32,
+    last_acked_pn: u64,
     peer_key_phase: bool,
     pending_rx_key: Option<Box<dyn PacketKey>>,
     local_cid: ConnectionId,
@@ -152,9 +161,34 @@ impl RxState {
         Arc::clone(&self.rx_packet_key)
     }
 
+    /// Take ownership of the RX packet key Arc (for SharedConnectionState).
+    pub fn take_packet_key(&self) -> Arc<Box<dyn PacketKey>> {
+        Arc::clone(&self.rx_packet_key)
+    }
+
     /// Clone of the RX header key (for decrypt workers).
     pub fn header_key(&self) -> Arc<Box<dyn HeaderKey>> {
         Arc::clone(&self.rx_header_key)
+    }
+
+    /// Take ownership of the RX header key (for SharedConnectionState).
+    pub fn take_header_key(&mut self) -> Arc<Box<dyn HeaderKey>> {
+        Arc::clone(&self.rx_header_key)
+    }
+
+    /// Take the bitmap out (for SharedConnectionState).
+    pub fn take_bitmap(&mut self) -> Bitmap {
+        std::mem::replace(&mut self.received, Bitmap::new())
+    }
+
+    /// Current peer key phase.
+    pub fn peer_key_phase(&self) -> bool {
+        self.peer_key_phase
+    }
+
+    /// Take the pending RX key.
+    pub fn take_pending_rx_key(&mut self) -> Option<Box<dyn PacketKey>> {
+        self.pending_rx_key.take()
     }
 
     /// Current largest received PN (for PN decoding in workers).
@@ -172,15 +206,15 @@ impl RxState {
         &self.local_cid
     }
 
-    /// Check if an ACK should be sent.
+    /// Check if an ACK should be sent (timer-driven).
     pub fn needs_ack(&self) -> bool {
-        self.rx_since_last_ack >= self.ack_interval
+        self.largest_rx_pn > self.last_acked_pn
     }
 
     /// Generate ACK ranges from the received bitmap.
     pub fn generate_ack_ranges(&mut self) -> SmallVec<[Range<u64>; 8]> {
         let ranges = generate_ack_ranges_from_bitmap(&self.received, self.largest_rx_pn);
-        self.rx_since_last_ack = 0;
+        self.last_acked_pn = self.largest_rx_pn;
         if let Some(first_range) = ranges.first() {
             let new_base = first_range.start.saturating_sub(256);
             if new_base > self.received.base() {
@@ -225,7 +259,6 @@ impl RxState {
         if hdr.pn > self.largest_rx_pn {
             self.largest_rx_pn = hdr.pn;
         }
-        self.rx_since_last_ack += 1;
 
         Ok(result)
     }
@@ -261,7 +294,6 @@ impl RxState {
         if hdr.pn > self.largest_rx_pn {
             self.largest_rx_pn = hdr.pn;
         }
-        self.rx_since_last_ack += 1;
 
         Ok(result)
     }
@@ -269,7 +301,7 @@ impl RxState {
     /// Sequential replay check + state update after a decrypt worker completes.
     ///
     /// The worker only did AEAD open. The I/O thread must still check replay
-    /// and update RX state (bitmap, largest_rx_pn, rx_since_last_ack).
+    /// and update RX state (bitmap, largest_rx_pn).
     ///
     /// Returns `true` if the packet is valid (not a duplicate).
     pub fn accept_decrypted_pn(&mut self, pn: u64) -> bool {
@@ -280,7 +312,6 @@ impl RxState {
         if pn > self.largest_rx_pn {
             self.largest_rx_pn = pn;
         }
-        self.rx_since_last_ack += 1;
         true
     }
 
@@ -339,6 +370,23 @@ impl KeyUpdateState {
     /// Returns `true` if keys are exhausted and the connection must be closed.
     pub fn is_key_exhausted(&self) -> bool {
         self.key_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Lock the next_keys deque (for SharedConnectionState key rotation).
+    pub fn next_keys(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>, std::sync::PoisonError<std::sync::MutexGuard<'_, VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>>> {
+        self.next_keys.lock()
+    }
+
+    /// Mark keys as exhausted.
+    pub fn set_key_exhausted(&self) {
+        self.key_exhausted.store(true, Ordering::Relaxed);
+    }
+
+    /// Reset the packets-since-key-update counter.
+    pub fn reset_packets_since_update(&self) {
+        self.packets_since_key_update.store(0, Ordering::Relaxed);
     }
 
     /// Check if key update should be initiated (called by I/O thread before PN assignment).
@@ -434,8 +482,7 @@ impl LocalConnectionState {
             largest_acked,
             largest_rx_pn,
             received,
-            rx_since_last_ack: _,
-            ack_interval,
+            last_acked_pn: _,
         } = self;
 
         let tx = Arc::new(TxState {
@@ -453,8 +500,7 @@ impl LocalConnectionState {
             rx_header_key: Arc::new(rx_header_key),
             received,
             largest_rx_pn,
-            rx_since_last_ack: 0,
-            ack_interval,
+            last_acked_pn: 0,
             peer_key_phase,
             pending_rx_key,
             local_cid,

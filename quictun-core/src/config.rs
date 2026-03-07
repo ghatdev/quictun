@@ -232,6 +232,9 @@ pub struct EngineConfig {
     /// Use per-batch crypto pipeline (requires threads >= 2).
     #[serde(default)]
     pub pipeline: bool,
+    /// Use container pipeline with parallel decrypt (requires threads >= 2).
+    #[serde(default)]
+    pub container: bool,
 }
 
 impl Default for EngineConfig {
@@ -261,6 +264,7 @@ impl Default for EngineConfig {
             channel_capacity: 4096,
             poll_events: 64,
             pipeline: false,
+            container: false,
         }
     }
 }

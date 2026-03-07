@@ -19,5 +19,7 @@ hex = { workspace = true }
 ipnet = { workspace = true }
 tun-rs = { workspace = true }
 crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
 rustc-hash = { workspace = true }
 smallvec = { workspace = true }

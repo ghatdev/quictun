@@ -244,6 +244,7 @@ pub struct NetConfig {
     pub channel_capacity: usize,
     pub poll_events: usize,
     pub pipeline: bool,
+    pub container: bool,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -267,7 +268,9 @@ struct ConnEntry {
 ///
 /// Routes to single-thread or multi-thread path based on `config.threads`.
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
-    if config.threads > 1 && config.pipeline {
+    if config.threads > 1 && config.container {
+        crate::container::run_container(local_addr, setup, config)
+    } else if config.threads > 1 && config.pipeline {
         crate::pipeline::run_pipeline(local_addr, setup, config)
     } else if config.threads > 1 {
         run_multi(local_addr, setup, config)

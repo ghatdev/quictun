@@ -12,6 +12,7 @@ pub mod bitmap;
 pub mod frame;
 pub mod local;
 pub mod packet;
+pub mod shared;
 pub mod split;
 
 use std::collections::VecDeque;
@@ -28,13 +29,6 @@ use frame::AckFrame;
 /// Maximum ACK ranges to include in a single packet.
 const MAX_ACK_RANGES: usize = 8;
 
-/// Send an ACK every N received packets.
-///
-/// Higher values reduce CPU overhead from ACK-only packet encryption and
-/// sending, which is critical at high packet rates (>100K pps). Too low
-/// (e.g., 2) causes the receiver to spend most CPU encrypting ACK-onlys,
-/// starving the data receive path and causing UDP buffer overflow.
-const DEFAULT_ACK_INTERVAL: u32 = 64;
 
 /// Trigger key update after this many packets (well below AES-GCM 2^23 limit).
 const KEY_UPDATE_THRESHOLD: u64 = 7_000_000;

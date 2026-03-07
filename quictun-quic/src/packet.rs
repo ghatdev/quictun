@@ -88,20 +88,15 @@ pub fn decode_pn(truncated_pn: u64, pn_nbits: usize, largest_pn: u64) -> u64 {
     }
 }
 
-/// Encode a full PN to truncated form (RFC 9000 §17.1).
+/// Encode a full PN to truncated form.
 ///
-/// Returns `(truncated_pn, pn_len)` where `pn_len` is 1-4.
-pub fn encode_pn(full_pn: u64, largest_acked: u64) -> (u64, usize) {
-    let num_unacked = full_pn.saturating_sub(largest_acked);
-    if num_unacked < (1 << 7) {
-        (full_pn & 0xFF, 1)
-    } else if num_unacked < (1 << 15) {
-        (full_pn & 0xFFFF, 2)
-    } else if num_unacked < (1 << 23) {
-        (full_pn & 0xFF_FFFF, 3)
-    } else {
-        (full_pn & 0xFFFF_FFFF, 4)
-    }
+/// Always uses 4-byte encoding for stateless decode — receiver only needs
+/// an atomic `largest_rx_pn` read (no ACK dependency). The 32-bit window
+/// (2^31 = 2B packets) is more than sufficient.
+///
+/// `largest_acked` is accepted for API compatibility but ignored.
+pub fn encode_pn(full_pn: u64, _largest_acked: u64) -> (u64, usize) {
+    (full_pn & 0xFFFF_FFFF, 4)
 }
 
 /// Build a 1-RTT short header into `buf`.
@@ -152,7 +147,7 @@ mod tests {
 
     #[test]
     fn pn_encode_decode_roundtrip() {
-        // Test various PN values with different largest_acked
+        // Test various PN values — all use 4-byte encoding now.
         let cases = [
             (0u64, 0u64),
             (1, 0),
@@ -164,6 +159,7 @@ mod tests {
         ];
         for (full_pn, largest_acked) in cases {
             let (truncated, pn_len) = encode_pn(full_pn, largest_acked);
+            assert_eq!(pn_len, 4, "encode_pn must always return 4-byte PN");
             let decoded = decode_pn(truncated, pn_len * 8, largest_acked);
             assert_eq!(
                 decoded, full_pn,
