@@ -3,3 +3,5 @@
 .obsidian/
 target/
 references/
+log
+tunnel-multi.toml
