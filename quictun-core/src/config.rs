@@ -219,6 +219,9 @@ pub struct EngineConfig {
     /// Packets between ACK generation.
     #[serde(default = "default_ack_interval")]
     pub ack_interval: u32,
+    /// Standalone ACK timer interval in milliseconds.
+    #[serde(default = "default_ack_timer_ms")]
+    pub ack_timer_ms: u32,
     /// TUN write backpressure buffer (packets).
     #[serde(default = "default_tun_write_buf")]
     pub tun_write_buf: usize,
@@ -254,6 +257,7 @@ impl Default for EngineConfig {
             batch_size: 64,
             gso_max_segments: 44,
             ack_interval: 64,
+            ack_timer_ms: 20,
             tun_write_buf: 256,
             channel_capacity: 4096,
             poll_events: 64,
@@ -329,6 +333,10 @@ fn default_gso_max_segments() -> usize {
 
 fn default_ack_interval() -> u32 {
     64
+}
+
+fn default_ack_timer_ms() -> u32 {
+    20
 }
 
 fn default_tun_write_buf() -> usize {

@@ -866,7 +866,7 @@ fn encrypt_and_send(
 
     if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
         if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
-            match entry.conn.encrypt_datagram(inner_pkt, None, &mut buf[net::HEADER_SIZE..]) {
+            match entry.conn.encrypt_datagram(inner_pkt, &mut buf[net::HEADER_SIZE..]) {
                 Ok(result) => {
                     let remote_ip = match entry.remote_addr.ip() {
                         std::net::IpAddr::V4(ip) => ip,

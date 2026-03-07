@@ -49,36 +49,36 @@ unsafe impl Sync for SealKeys<'_> {}
 /// All methods take `&mut self`. No locks, no atomics, no Arc.
 pub struct LocalConnectionState {
     // Keys — plain, no locks.
-    rx_packet_key: Box<dyn PacketKey>,
-    tx_packet_key: Box<dyn PacketKey>,
-    rx_header_key: Box<dyn HeaderKey>,
-    tx_header_key: Box<dyn HeaderKey>,
-    tag_len: usize,
+    pub(crate) rx_packet_key: Box<dyn PacketKey>,
+    pub(crate) tx_packet_key: Box<dyn PacketKey>,
+    pub(crate) rx_header_key: Box<dyn HeaderKey>,
+    pub(crate) tx_header_key: Box<dyn HeaderKey>,
+    pub(crate) tag_len: usize,
 
     // Key update — plain structs.
-    next_keys: VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>,
-    pending_rx_key: Option<Box<dyn PacketKey>>,
-    key_phase: bool,
-    peer_key_phase: bool,
-    packets_since_key_update: u64,
+    pub(crate) next_keys: VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>,
+    pub(crate) pending_rx_key: Option<Box<dyn PacketKey>>,
+    pub(crate) key_phase: bool,
+    pub(crate) peer_key_phase: bool,
+    pub(crate) packets_since_key_update: u64,
 
     // Identity.
-    local_cid: ConnectionId,
-    remote_cid: ConnectionId,
-    local_cid_len: usize,
+    pub(crate) local_cid: ConnectionId,
+    pub(crate) remote_cid: ConnectionId,
+    pub(crate) local_cid_len: usize,
 
     // Key exhaustion flag.
-    key_exhausted: bool,
+    pub(crate) key_exhausted: bool,
 
     // TX state.
-    pn_counter: u64,
-    largest_acked: u64,
+    pub(crate) pn_counter: u64,
+    pub(crate) largest_acked: u64,
 
     // RX state.
-    largest_rx_pn: u64,
-    received: Bitmap,
-    rx_since_last_ack: u32,
-    ack_interval: u32,
+    pub(crate) largest_rx_pn: u64,
+    pub(crate) received: Bitmap,
+    pub(crate) rx_since_last_ack: u32,
+    pub(crate) ack_interval: u32,
 }
 
 impl LocalConnectionState {
@@ -214,7 +214,6 @@ impl LocalConnectionState {
     pub fn encrypt_datagram(
         &mut self,
         payload: &[u8],
-        ack_ranges: Option<&[Range<u64>]>,
         buf: &mut [u8],
     ) -> Result<EncryptResult, ParseError> {
         self.packets_since_key_update += 1;
@@ -227,7 +226,37 @@ impl LocalConnectionState {
 
         encrypt_packet(
             payload,
-            ack_ranges,
+            &self.remote_cid,
+            pn,
+            self.largest_acked,
+            self.key_phase,
+            &*self.tx_packet_key,
+            &*self.tx_header_key,
+            self.tag_len,
+            buf,
+        )
+    }
+
+    /// Encrypt a standalone ACK packet.
+    ///
+    /// Generates ACK ranges from the received bitmap and encrypts an ACK-only
+    /// 1-RTT packet. Used by the timer-driven ACK path.
+    pub fn encrypt_ack(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<EncryptResult, ParseError> {
+        let ack_ranges = self.generate_ack_ranges();
+
+        self.packets_since_key_update += 1;
+        if self.packets_since_key_update == KEY_UPDATE_THRESHOLD {
+            self.initiate_key_update();
+        }
+
+        let pn = self.pn_counter;
+        self.pn_counter += 1;
+
+        crate::encrypt_ack_packet(
+            &ack_ranges,
             &self.remote_cid,
             pn,
             self.largest_acked,
@@ -341,15 +370,8 @@ impl LocalConnectionState {
     ///
     /// Handles the key update boundary: if the batch would cross the 7M threshold,
     /// it truncates at the boundary. The caller should re-call for the remainder.
-    ///
-    /// Also generates ACK ranges if needed (attached to the first packet only).
-    pub fn prepare_batch(&mut self, count: usize) -> (SmallVec<[PreparedPacket; 64]>, Option<SmallVec<[Range<u64>; 8]>>) {
+    pub fn prepare_batch(&mut self, count: usize) -> SmallVec<[PreparedPacket; 64]> {
         let mut prepared = SmallVec::with_capacity(count);
-        let ack_ranges = if self.rx_since_last_ack >= self.ack_interval {
-            Some(self.generate_ack_ranges())
-        } else {
-            None
-        };
 
         for _ in 0..count {
             // Check key update threshold before assigning PN.
@@ -374,7 +396,7 @@ impl LocalConnectionState {
             });
         }
 
-        (prepared, ack_ranges)
+        prepared
     }
 
     /// Return immutable references to the current TX keys for parallel encryption.
@@ -426,7 +448,7 @@ impl LocalConnectionState {
 /// Scans 64 bits at a time instead of bit-by-bit. For nearly-contiguous bitmaps
 /// (common in VPN tunnels with in-order delivery), most words are 0xFFFF...
 /// and are skipped in one comparison.
-fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec<[Range<u64>; 8]> {
+pub(crate) fn generate_ack_ranges_from_bitmap(bitmap: &Bitmap, largest_pn: u64) -> SmallVec<[Range<u64>; 8]> {
     let mut ranges: SmallVec<[Range<u64>; 8]> = SmallVec::new();
     let base = bitmap.base();
     if largest_pn < base {

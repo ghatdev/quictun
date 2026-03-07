@@ -9,3 +9,7 @@ quinn-proto = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }

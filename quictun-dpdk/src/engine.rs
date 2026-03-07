@@ -503,7 +503,6 @@ pub fn run(
                         if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
                             match entry.conn.encrypt_datagram(
                                 ip_payload,
-                                None,
                                 &mut buf[net::HEADER_SIZE..],
                             ) {
                                 Ok(result) => {
@@ -1752,7 +1751,6 @@ pub fn run_worker(
                 if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
                     match entry.conn.encrypt_datagram(
                         ip_payload,
-                        None,
                         &mut buf[net::HEADER_SIZE..],
                     ) {
                         Ok(result) => {

@@ -240,6 +240,7 @@ pub struct NetConfig {
     pub batch_size: usize,
     pub gso_max_segments: usize,
     pub ack_interval: u32,
+    pub ack_timer_ms: u32,
     pub tun_write_buf_capacity: usize,
     pub channel_capacity: usize,
     pub poll_events: usize,
@@ -406,9 +407,13 @@ fn run_single(
     #[cfg(target_os = "linux")]
     let mut gro_tx_pool = GroTxPool::new();
 
+    // ACK timer state.
+    let ack_timer_interval = Duration::from_millis(config.ack_timer_ms as u64);
+    let mut next_ack_deadline = Instant::now() + ack_timer_interval;
+
     // 7. Main poll loop.
     loop {
-        let timeout = compute_timeout(&connections, &mut multi_state, config.idle_timeout);
+        let timeout = compute_timeout(&connections, &mut multi_state, config.idle_timeout, next_ack_deadline);
 
         poll.poll(&mut events, Some(timeout))?;
 
@@ -527,6 +532,12 @@ fn run_single(
             config.idle_timeout,
             &mut encrypt_buf,
         )?;
+
+        // ── Standalone ACK timer ──────────────────────────────────────
+        if Instant::now() >= next_ack_deadline {
+            send_acks(&udp_socket, &mut connections, &mut encrypt_buf);
+            next_ack_deadline = Instant::now() + ack_timer_interval;
+        }
 
         // ── Drive handshakes ────────────────────────────────────────────
         drive_handshakes(
@@ -669,6 +680,7 @@ fn compute_timeout(
     connections: &FxHashMap<u64, ConnEntry>,
     multi_state: &mut MultiQuicState,
     idle_timeout: Duration,
+    next_ack_deadline: Instant,
 ) -> Duration {
     let mut min_timeout = Duration::from_secs(5);
 
@@ -687,8 +699,32 @@ fn compute_timeout(
         }
     }
 
+    // ACK timer.
+    let ack_remaining = next_ack_deadline.saturating_duration_since(Instant::now());
+    min_timeout = min_timeout.min(ack_remaining);
+
     // Ensure at least 1ms to avoid busy spin on zero timeout.
     min_timeout.max(Duration::from_millis(1))
+}
+
+/// Send standalone ACK packets for all connections that need them.
+fn send_acks(
+    udp: &std::net::UdpSocket,
+    connections: &mut FxHashMap<u64, ConnEntry>,
+    encrypt_buf: &mut [u8],
+) {
+    for entry in connections.values_mut() {
+        if entry.conn.needs_ack() {
+            match entry.conn.encrypt_ack(encrypt_buf) {
+                Ok(result) => {
+                    let _ = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr);
+                }
+                Err(e) => {
+                    warn!(error = %e, "ACK encrypt failed");
+                }
+            }
+        }
+    }
 }
 
 // ── Drain transmits from MultiQuicState ──────────────────────────────────
@@ -1011,14 +1047,8 @@ fn handle_tun_rx_linux(
                 current_cid = Some(cid);
                 current_remote = Some(entry.remote_addr);
 
-                let ack_ranges = if entry.conn.needs_ack() {
-                    Some(entry.conn.generate_ack_ranges())
-                } else {
-                    None
-                };
                 match entry.conn.encrypt_datagram(
                     &packet[..n],
-                    ack_ranges.as_deref(),
                     &mut gso_buf[gso_pos..],
                 ) {
                     Ok(result) => {
@@ -1156,14 +1186,9 @@ fn handle_tun_rx(
                     None => continue,
                 };
 
-                let ack_ranges = if entry.conn.needs_ack() {
-                    Some(entry.conn.generate_ack_ranges())
-                } else {
-                    None
-                };
                 match entry
                     .conn
-                    .encrypt_datagram(&packet[..n], ack_ranges.as_deref(), encrypt_buf)
+                    .encrypt_datagram(&packet[..n], encrypt_buf)
                 {
                     Ok(result) => {
                         udp.send_to(&encrypt_buf[..result.len], entry.remote_addr)?;
@@ -1212,13 +1237,7 @@ fn handle_timeouts(
     // Send keepalives.
     for entry in connections.values_mut() {
         if entry.last_tx.elapsed() >= entry.keepalive_interval {
-            let ack_ranges = entry.conn.generate_ack_ranges();
-            let ack_ref = if !ack_ranges.is_empty() {
-                Some(ack_ranges.as_slice())
-            } else {
-                None
-            };
-            match entry.conn.encrypt_datagram(&[], ack_ref, encrypt_buf) {
+            match entry.conn.encrypt_datagram(&[], encrypt_buf) {
                 Ok(result) => {
                     udp.send_to(&encrypt_buf[..result.len], entry.remote_addr)?;
                     entry.last_tx = Instant::now();
@@ -1441,8 +1460,8 @@ fn flush_offload_batch(
         .map(|&i| &split_bufs[i][..split_sizes[i]])
         .collect();
 
-    // Assign PNs and generate ACK.
-    let (prepared, ack_ranges) = entry.conn.prepare_batch(count);
+    // Assign PNs.
+    let prepared = entry.conn.prepare_batch(count);
     let actual_count = prepared.len(); // may be truncated at key update boundary
 
     // Sequential encrypt contiguously into gso_buf.
@@ -1452,14 +1471,8 @@ fn flush_offload_batch(
     let mut gso_count = 0usize;
 
     for i in 0..actual_count {
-        let ack = if i == 0 {
-            ack_ranges.as_ref().map(|r| r.as_slice())
-        } else {
-            None
-        };
         match encrypt_packet(
             payloads[i],
-            ack,
             keys.remote_cid,
             prepared[i].pn,
             prepared[i].largest_acked,
@@ -1478,7 +1491,7 @@ fn flush_offload_batch(
                     gso_pos += result.len;
                     gso_count += 1;
                 } else {
-                    // Odd-sized (first packet with ACK): flush accumulated, start new batch.
+                    // Odd-sized packet: flush accumulated, start new batch.
                     if gso_count > 0 {
                         flush_gso_sync(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr)?;
                     }
@@ -1612,6 +1625,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
             let idle_timeout = config.idle_timeout;
             let cid_len = config.cid_len;
             let worker_offload = config.offload;
+            let worker_ack_timer_ms = config.ack_timer_ms;
 
             let handle = s.spawn(move || {
                 run_worker(
@@ -1624,6 +1638,7 @@ fn run_multi(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) ->
                     removal,
                     shutdown_flag,
                     worker_offload,
+                    worker_ack_timer_ms,
                 )
             });
             worker_handles.push(handle);
@@ -2187,6 +2202,7 @@ fn run_worker(
     removal_tx: crossbeam_channel::Sender<RemovedConnection>,
     shutdown: Arc<AtomicBool>,
     #[allow(unused_variables)] offload: bool,
+    ack_timer_ms: u32,
 ) -> Result<()> {
     info!(worker = worker_id, "worker started");
 
@@ -2226,6 +2242,10 @@ fn run_worker(
 
     // Adaptive sleep: start at 1μs, backoff to 100μs when idle.
     let mut idle_iters = 0u32;
+
+    // ACK timer state.
+    let ack_timer_interval = Duration::from_millis(ack_timer_ms as u64);
+    let mut next_ack_deadline = Instant::now() + ack_timer_interval;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -2430,14 +2450,8 @@ fn run_worker(
 
                         worker_gso_remote = Some(entry.remote_addr);
 
-                        let ack_ranges = if entry.conn.needs_ack() {
-                            Some(entry.conn.generate_ack_ranges())
-                        } else {
-                            None
-                        };
                         match entry.conn.encrypt_datagram(
                             &pkt.data,
-                            ack_ranges.as_deref(),
                             &mut worker_gso_buf[worker_gso_pos..],
                         ) {
                             Ok(result) => {
@@ -2523,14 +2537,8 @@ fn run_worker(
                             None => continue,
                         };
 
-                        let ack_ranges = if entry.conn.needs_ack() {
-                            Some(entry.conn.generate_ack_ranges())
-                        } else {
-                            None
-                        };
                         match entry.conn.encrypt_datagram(
                             &pkt.data,
-                            ack_ranges.as_deref(),
                             &mut encrypt_buf,
                         ) {
                             Ok(result) => {
@@ -2549,6 +2557,18 @@ fn run_worker(
             }
         }
 
+        // ── Standalone ACK timer ───────────────────────────────────
+        if Instant::now() >= next_ack_deadline {
+            for entry in connections.values_mut() {
+                if entry.conn.needs_ack() {
+                    if let Ok(result) = entry.conn.encrypt_ack(&mut encrypt_buf) {
+                        let _ = udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
+                    }
+                }
+            }
+            next_ack_deadline = Instant::now() + ack_timer_interval;
+        }
+
         // ── Keepalives and idle timeouts ─────────────────────────────
         let mut expired = Vec::new();
         for (&cid, entry) in connections.iter_mut() {
@@ -2557,13 +2577,7 @@ fn run_worker(
                 continue;
             }
             if entry.last_tx.elapsed() >= entry.keepalive_interval {
-                let ack_ranges = entry.conn.generate_ack_ranges();
-                let ack_ref = if !ack_ranges.is_empty() {
-                    Some(ack_ranges.as_slice())
-                } else {
-                    None
-                };
-                match entry.conn.encrypt_datagram(&[], ack_ref, &mut encrypt_buf) {
+                match entry.conn.encrypt_datagram(&[], &mut encrypt_buf) {
                     Ok(result) => {
                         let _ = udp_socket.send_to(&encrypt_buf[..result.len], entry.remote_addr);
                         entry.last_tx = Instant::now();

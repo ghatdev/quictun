@@ -12,6 +12,7 @@ pub mod bitmap;
 pub mod frame;
 pub mod local;
 pub mod packet;
+pub mod split;
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -173,14 +174,13 @@ pub fn decrypt_payload_in_place(
     parse_frames_in_place(decrypted, payload_offset, hdr.pn)
 }
 
-/// Build and encrypt a complete 1-RTT QUIC packet.
+/// Build and encrypt a complete 1-RTT QUIC packet containing a DATAGRAM frame.
 ///
-/// Writes the short header, frames (ACK + DATAGRAM), AEAD tag, and header
+/// Writes the short header, DATAGRAM frame, AEAD tag, and header
 /// protection into `buf`. Returns bytes written and the PN used.
 #[allow(clippy::too_many_arguments)]
 pub fn encrypt_packet(
     payload: &[u8],
-    ack_ranges: Option<&[Range<u64>]>,
     remote_cid: &ConnectionId,
     pn: u64,
     largest_acked: u64,
@@ -201,24 +201,72 @@ pub fn encrypt_packet(
 
     let mut frame_pos = header_len;
 
-    if let Some(ranges) = ack_ranges
-        && !ranges.is_empty()
-    {
-        let ack_len = frame::build_ack(ranges, 0, &mut buf[frame_pos..]);
-        frame_pos += ack_len;
-    }
-
     if !payload.is_empty() {
         let dg_len = frame::build_datagram_no_len(payload, &mut buf[frame_pos..]);
         frame_pos += dg_len;
-    } else if frame_pos == header_len {
+    } else {
         buf[frame_pos] = 0x01; // PING
         frame_pos += 1;
     }
 
+    seal_packet(remote_cid, pn, header_len, frame_pos, tx_packet_key, tx_header_key, tag_len, buf)
+}
+
+/// Build and encrypt a 1-RTT QUIC packet containing only an ACK frame.
+///
+/// Used for standalone timer-driven ACKs, decoupled from the data path.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_ack_packet(
+    ack_ranges: &[Range<u64>],
+    remote_cid: &ConnectionId,
+    pn: u64,
+    largest_acked: u64,
+    key_phase: bool,
+    tx_packet_key: &dyn PacketKey,
+    tx_header_key: &dyn HeaderKey,
+    tag_len: usize,
+    buf: &mut [u8],
+) -> Result<EncryptResult, ParseError> {
+    let (header_len, _pn_len) = packet::build_short_header(
+        remote_cid,
+        pn,
+        largest_acked,
+        key_phase,
+        false, // spin bit
+        buf,
+    );
+
+    let mut frame_pos = header_len;
+
+    if !ack_ranges.is_empty() {
+        let ack_len = frame::build_ack(ack_ranges, 0, &mut buf[frame_pos..]);
+        frame_pos += ack_len;
+    }
+
+    // ACK-only packet needs at least a PING if no ACK ranges provided.
+    if frame_pos == header_len {
+        buf[frame_pos] = 0x01; // PING
+        frame_pos += 1;
+    }
+
+    seal_packet(remote_cid, pn, header_len, frame_pos, tx_packet_key, tx_header_key, tag_len, buf)
+}
+
+/// Shared AEAD seal + header protection for encrypt_packet/encrypt_ack_packet.
+fn seal_packet(
+    remote_cid: &ConnectionId,
+    pn: u64,
+    header_len: usize,
+    frame_pos: usize,
+    tx_packet_key: &dyn PacketKey,
+    tx_header_key: &dyn HeaderKey,
+    tag_len: usize,
+    buf: &mut [u8],
+) -> Result<EncryptResult, ParseError> {
     // Ensure minimum packet size for header protection sample.
     let pn_offset = 1 + remote_cid.len();
     let min_total = pn_offset + 4 + tx_header_key.sample_size();
+    let mut frame_pos = frame_pos;
     let total_with_tag = frame_pos + tag_len;
     if total_with_tag < min_total {
         let pad_needed = min_total - total_with_tag;

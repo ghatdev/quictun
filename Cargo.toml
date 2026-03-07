@@ -76,6 +76,7 @@ crossbeam-channel = "0.5"
 # quictun-quic
 quictun-quic = { path = "quictun-quic" }
 smallvec = { version = "1", features = ["const_generics"] }
+arc-swap = "1"
 rustc-hash = "2"
 
 [patch.crates-io]

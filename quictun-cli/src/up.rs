@@ -134,6 +134,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         batch_size: config.engine.batch_size,
         gso_max_segments: config.engine.gso_max_segments,
         ack_interval: config.engine.ack_interval,
+        ack_timer_ms: config.engine.ack_timer_ms,
         tun_write_buf_capacity: config.engine.tun_write_buf,
         channel_capacity: config.engine.channel_capacity,
         poll_events: config.engine.poll_events,
