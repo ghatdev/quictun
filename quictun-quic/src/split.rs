@@ -101,6 +101,12 @@ impl TxState {
         &**self.tx_header_key
     }
 
+    /// Arc clone of the TX header key (for sharing with crypto workers).
+    #[inline]
+    pub fn header_key_arc(&self) -> Arc<Box<dyn HeaderKey>> {
+        Arc::clone(&self.tx_header_key)
+    }
+
     /// Encrypt a datagram payload using shared state. No `&mut self` needed.
     pub fn encrypt_datagram(
         &self,

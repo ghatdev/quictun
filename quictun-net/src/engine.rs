@@ -32,10 +32,10 @@ use quictun_tun::TunOptions;
 use smallvec::SmallVec;
 
 /// Maximum QUIC packet size.
-const MAX_PACKET: usize = 2048;
+pub(crate) const MAX_PACKET: usize = 2048;
 
 /// Handshake response buffer size.
-const HANDSHAKE_BUF_SIZE: usize = 2048;
+pub(crate) const HANDSHAKE_BUF_SIZE: usize = 2048;
 
 /// Maximum packets to buffer when TUN write returns WouldBlock.
 const TUN_WRITE_BUF_CAPACITY: usize = 256;
@@ -207,9 +207,9 @@ impl TunWriteBuffer {
 }
 
 // mio tokens
-const TOKEN_UDP: Token = Token(0);
-const TOKEN_TUN: Token = Token(1);
-const TOKEN_SIGNAL: Token = Token(2);
+pub(crate) const TOKEN_UDP: Token = Token(0);
+pub(crate) const TOKEN_TUN: Token = Token(1);
+pub(crate) const TOKEN_SIGNAL: Token = Token(2);
 
 /// Endpoint setup: connector or listener.
 pub enum EndpointSetup {
@@ -244,6 +244,7 @@ pub struct NetConfig {
     pub tun_write_buf_capacity: usize,
     pub channel_capacity: usize,
     pub poll_events: usize,
+    pub pipeline: bool,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -267,7 +268,9 @@ struct ConnEntry {
 ///
 /// Routes to single-thread or multi-thread path based on `config.threads`.
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
-    if config.threads > 1 {
+    if config.threads > 1 && config.pipeline {
+        crate::pipeline::run_pipeline(local_addr, setup, config)
+    } else if config.threads > 1 {
         run_multi(local_addr, setup, config)
     } else {
         run_single(local_addr, setup, config)
@@ -567,7 +570,7 @@ fn run_single(
 
 // ── UDP socket creation ──────────────────────────────────────────────────
 
-fn create_udp_socket(
+pub(crate) fn create_udp_socket(
     addr: SocketAddr,
     recv_buf: usize,
     send_buf: usize,
@@ -613,7 +616,7 @@ fn create_udp_socket(
     Ok(sock.into())
 }
 
-fn set_nonblocking(fd: i32) -> Result<()> {
+pub(crate) fn set_nonblocking(fd: i32) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error()).context("fcntl F_GETFL");
@@ -627,7 +630,7 @@ fn set_nonblocking(fd: i32) -> Result<()> {
 
 // ── Signal pipe ──────────────────────────────────────────────────────────
 
-fn create_signal_pipe() -> Result<(i32, i32)> {
+pub(crate) fn create_signal_pipe() -> Result<(i32, i32)> {
     let mut fds = [0i32; 2];
     let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if ret < 0 {
@@ -647,7 +650,7 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     }
 }
 
-fn install_signal_handler(write_fd: i32) -> Result<()> {
+pub(crate) fn install_signal_handler(write_fd: i32) -> Result<()> {
     SIGNAL_WRITE_FD.store(write_fd, Ordering::Release);
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -664,7 +667,7 @@ fn install_signal_handler(write_fd: i32) -> Result<()> {
     Ok(())
 }
 
-fn drain_signal_pipe(read_fd: i32) {
+pub(crate) fn drain_signal_pipe(read_fd: i32) {
     let mut buf = [0u8; 64];
     loop {
         let ret = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -729,7 +732,7 @@ fn send_acks(
 
 // ── Drain transmits from MultiQuicState ──────────────────────────────────
 
-fn drain_transmits(udp: &std::net::UdpSocket, state: &mut MultiQuicState) -> Result<()> {
+pub(crate) fn drain_transmits(udp: &std::net::UdpSocket, state: &mut MultiQuicState) -> Result<()> {
     let now = Instant::now();
     let mut buf = Vec::with_capacity(HANDSHAKE_BUF_SIZE);
 
@@ -1110,7 +1113,7 @@ fn handle_tun_rx_linux(
 }
 
 #[cfg(target_os = "linux")]
-fn flush_gso_sync(
+pub(crate) fn flush_gso_sync(
     udp: &std::net::UdpSocket,
     gso_buf: &[u8],
     gso_pos: usize,
@@ -1341,7 +1344,7 @@ fn drive_handshakes(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-fn send_responses(
+pub(crate) fn send_responses(
     udp: &std::net::UdpSocket,
     responses: &[Vec<u8>],
     addr: SocketAddr,

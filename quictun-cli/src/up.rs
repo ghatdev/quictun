@@ -138,6 +138,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         tun_write_buf_capacity: config.engine.tun_write_buf,
         channel_capacity: config.engine.channel_capacity,
         poll_events: config.engine.poll_events,
+        pipeline: config.engine.pipeline,
     };
 
     // Resolve cipher suites.
