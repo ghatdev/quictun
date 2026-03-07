@@ -465,9 +465,9 @@ fn pipeline_io_loop(
         let ack_rem = next_ack_deadline.saturating_duration_since(Instant::now());
         timeout = timeout.min(ack_rem).max(Duration::from_millis(1));
 
-        // If batches are in flight, use a short timeout so we poll completions quickly.
+        // If batches are in flight, busy-poll to minimize completion latency.
         if *in_flight_batches > 0 {
-            timeout = timeout.min(Duration::from_micros(100));
+            timeout = Duration::ZERO;
         }
 
         poll.poll(events, Some(timeout))?;
@@ -545,6 +545,19 @@ fn pipeline_io_loop(
             }
         }
 
+        // ── Drain completions again (process results from batches submitted above) ──
+        drain_completions(
+            udp,
+            tun,
+            connections,
+            done_rx,
+            tun_write_pending,
+            in_flight_batches,
+            #[cfg(target_os = "linux")]
+            config.offload,
+        )?;
+        drain_tun_write_buf(tun, tun_write_pending);
+
         // ── TUN RX → encrypt batches ─────────────────────────────────
         if tun_readable {
             #[cfg(target_os = "linux")]
@@ -581,6 +594,18 @@ fn pipeline_io_loop(
                 )?;
             }
         }
+
+        // ── Drain completions once more (encrypt batches from TUN RX) ──
+        drain_completions(
+            udp,
+            tun,
+            connections,
+            done_rx,
+            tun_write_pending,
+            in_flight_batches,
+            #[cfg(target_os = "linux")]
+            config.offload,
+        )?;
 
         // ── Timeouts + keepalives ────────────────────────────────────
         pipeline_timeouts(udp, connections, ip_to_cid, multi_state, config.idle_timeout, encrypt_buf)?;
@@ -657,9 +682,10 @@ fn handle_encrypt_completion(
         return Ok(());
     }
 
-    // Send encrypted packets via GSO (same-size grouping).
+    // Send encrypted packets via GSO (same-size grouping, chunked to max segments).
     #[cfg(target_os = "linux")]
     {
+        let max_segs = quictun_core::batch_io::GSO_MAX_SEGMENTS;
         let mut pos = 0usize;
         let mut seg_start = 0usize;
         let mut seg_size = 0usize;
@@ -670,10 +696,10 @@ fn handle_encrypt_completion(
             if seg_count == 0 {
                 seg_size = len;
                 seg_count = 1;
-            } else if len == seg_size {
+            } else if len == seg_size && seg_count < max_segs {
                 seg_count += 1;
             } else {
-                // Flush current GSO run.
+                // Flush current GSO run (hit max segments or size change).
                 flush_gso_sync(
                     udp,
                     &batch.gso_buf[seg_start..],
@@ -986,6 +1012,7 @@ fn submit_decrypt_batch(
         None => return,
     };
 
+    let packets_count = packets.len();
     let batch = Box::new(DecryptBatch {
         packets,
         rx_header_key: entry.rx.header_key(),
@@ -999,6 +1026,9 @@ fn submit_decrypt_batch(
 
     if job_tx.try_send(CryptoJob::Decrypt(batch)).is_ok() {
         *in_flight += 1;
+        debug!(cid = %hex::encode(cid_key.to_ne_bytes()), packets = packets_count, "queued decrypt batch");
+    } else {
+        debug!("decrypt batch dropped (channel full)");
     }
 }
 
@@ -1145,6 +1175,9 @@ fn submit_encrypt_batch(
 
     if job_tx.try_send(CryptoJob::Encrypt(batch)).is_ok() {
         *in_flight += 1;
+        debug!(cid = %hex::encode(cid_key.to_ne_bytes()), count, pn_start, "queued encrypt batch");
+    } else {
+        debug!("encrypt batch dropped (channel full)");
     }
 }
 
