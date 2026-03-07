@@ -190,6 +190,9 @@ pub fn run_router(
                             // Decrypt and collect datagram byte ranges.
                             // We release the mutable borrow of `connections` before
                             // calling handle_decrypted_packet (which needs &mut connections).
+                            let src_mac = udp.src_mac;
+                            let src_ip = udp.src_ip;
+                            let src_port = udp.src_port;
                             let decrypt_result = {
                                 let Some(entry) = connections.get_mut(&cid_key) else {
                                     decrypt_fail += 1;
@@ -199,6 +202,10 @@ pub fn run_router(
                                     &mut data[payload_offset..payload_offset + payload_len],
                                 ) {
                                     Ok(decrypted) => {
+                                        // Update peer address on every authenticated packet.
+                                        entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
+                                        entry.remote_mac = src_mac;
+
                                         if let Some(ref ack) = decrypted.ack {
                                             entry.conn.process_ack(ack);
                                         }
@@ -705,10 +712,7 @@ fn handle_decrypted_packet(
             };
 
             // Build forwarded Ethernet frame: Eth + modified IP packet.
-            let dst_mac = arp_table.lookup(dst_ip).or_else(|| {
-                // Default gateway MAC — use remote_mac as gateway.
-                identity.remote_mac
-            });
+            let dst_mac = arp_table.lookup(dst_ip);
             let Some(dst_mac) = dst_mac else {
                 *mac_fail_count += 1;
                 return;
@@ -870,7 +874,7 @@ fn encrypt_and_send(
                 Ok(result) => {
                     let remote_ip = match entry.remote_addr.ip() {
                         std::net::IpAddr::V4(ip) => ip,
-                        _ => identity.remote_ip,
+                        _ => Ipv4Addr::UNSPECIFIED,
                     };
                     *ip_id = ip_id.wrapping_add(1);
                     let actual_len = net::build_udp_packet_inplace(
@@ -979,10 +983,7 @@ fn drain_handshake_transmits(
             std::net::IpAddr::V4(ip) => ip,
             _ => continue,
         };
-        let dst_mac = arp_table
-            .lookup(remote_ip)
-            .or(identity.remote_mac)
-            .unwrap_or([0xff; 6]);
+        let dst_mac = arp_table.lookup(remote_ip).unwrap_or([0xff; 6]);
 
         let frame_len = net::HEADER_SIZE + payload.len();
         if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
@@ -1591,6 +1592,9 @@ pub fn run_router_worker(
                             &data[payload_offset + 1..payload_offset + 1 + CID_LEN],
                         );
 
+                        let src_mac = udp.src_mac;
+                        let src_ip = udp.src_ip;
+                        let src_port = udp.src_port;
                         let decrypt_result = {
                             let Some(entry) = connections.get_mut(&cid_key) else {
                                 decrypt_fail += 1;
@@ -1600,6 +1604,10 @@ pub fn run_router_worker(
                                 &mut data[payload_offset..payload_offset + payload_len],
                             ) {
                                 Ok(decrypted) => {
+                                    // Update peer address on every authenticated packet.
+                                    entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
+                                    entry.remote_mac = src_mac;
+
                                     if let Some(ref ack) = decrypted.ack {
                                         entry.conn.process_ack(ack);
                                     }
@@ -1752,9 +1760,7 @@ pub fn run_router_worker(
                                             continue;
                                         };
 
-                                        let dst_mac = arp_table.lookup(dst_ip).or_else(|| {
-                                            identity.remote_mac
-                                        });
+                                        let dst_mac = arp_table.lookup(dst_ip);
                                         let Some(dst_mac) = dst_mac else {
                                             mac_fail += 1;
                                             continue;

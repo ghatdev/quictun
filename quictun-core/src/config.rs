@@ -199,9 +199,7 @@ pub struct EngineConfig {
     #[serde(default = "default_dpdk_cores")]
     pub dpdk_cores: usize,
     pub dpdk_local_ip: Option<String>,
-    pub dpdk_remote_ip: Option<String>,
     pub dpdk_local_port: Option<u16>,
-    pub dpdk_gateway_mac: Option<String>,
     #[serde(default = "default_dpdk_eal_args")]
     pub dpdk_eal_args: String,
     #[serde(default)]
@@ -250,9 +248,7 @@ impl Default for EngineConfig {
             offload: false,
             dpdk_cores: 1,
             dpdk_local_ip: None,
-            dpdk_remote_ip: None,
             dpdk_local_port: None,
-            dpdk_gateway_mac: None,
             dpdk_eal_args: "-l;0;-n;4".to_owned(),
             dpdk_port: 0,
             no_udp_checksum: false,
@@ -512,11 +508,6 @@ impl Config {
             if self.engine.dpdk_local_ip.is_none() {
                 return Err(ConfigError::Invalid(
                     "DPDK backends require dpdk_local_ip in [engine]".into(),
-                ));
-            }
-            if self.engine.dpdk_remote_ip.is_none() {
-                return Err(ConfigError::Invalid(
-                    "DPDK backends require dpdk_remote_ip in [engine]".into(),
                 ));
             }
         }
@@ -865,7 +856,6 @@ address = "10.0.0.2/24"
 [engine]
 backend = "dpdk-virtio"
 dpdk_local_ip = "10.23.30.100"
-dpdk_remote_ip = "10.23.30.46"
 
 [peer]
 public_key = "dGVzdA=="
@@ -886,7 +876,6 @@ address = "10.0.0.2/24"
 [engine]
 backend = "dpdk-router"
 dpdk_local_ip = "10.23.30.100"
-dpdk_remote_ip = "10.23.30.46"
 
 [peer]
 public_key = "dGVzdA=="
@@ -1041,8 +1030,6 @@ listen_port = 443
 backend = "dpdk-router"
 dpdk_cores = 4
 dpdk_local_ip = "10.23.30.100"
-dpdk_remote_ip = "10.23.30.46"
-dpdk_gateway_mac = "1e:0b:8b:e2:ef:50"
 
 [routing]
 nat = true

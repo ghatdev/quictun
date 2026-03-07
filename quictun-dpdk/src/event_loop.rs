@@ -50,12 +50,10 @@ pub struct DpdkConfig {
     pub port_id: u16,
     /// IP address assigned to this DPDK port.
     pub local_ip: Ipv4Addr,
-    /// Peer's IP address on the DPDK network.
-    pub remote_ip: Ipv4Addr,
+    /// Peer's IP address (derived from endpoint for connector, learned for listener).
+    pub remote_ip: Option<Ipv4Addr>,
     /// Override local UDP port (otherwise use listen_port from config).
     pub local_port: Option<u16>,
-    /// Static peer MAC address (skip ARP if provided).
-    pub gateway_mac: Option<[u8; 6]>,
     /// Tunnel IP for the inner interface (e.g., 10.0.0.1).
     pub tunnel_ip: Ipv4Addr,
     /// Tunnel subnet prefix length (e.g., 24).
@@ -164,24 +162,13 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         None if local_addr.port() != 0 => local_addr.port(),
         None => 40000, // Default ephemeral port for connector
     };
-    let remote_port = match &setup {
-        EndpointSetup::Connector { remote_addr, .. } => remote_addr.port(),
-        EndpointSetup::Listener { .. } => 0, // learned from first packet
-    };
-
-    let mut identity = NetIdentity {
+    let identity = NetIdentity {
         local_mac,
-        remote_mac: dpdk_config.gateway_mac,
         local_ip: dpdk_config.local_ip,
-        remote_ip: dpdk_config.remote_ip,
         local_port,
-        remote_port,
     };
 
     let mut arp_table = ArpTable::new();
-    if let Some(mac) = dpdk_config.gateway_mac {
-        arp_table.insert(dpdk_config.remote_ip, mac);
-    }
 
     // ── 4. Build QUIC state ──────────────────────────────────────
 
@@ -211,8 +198,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         local_mac = %format_mac(&local_mac),
         local_ip = %dpdk_config.local_ip,
         local_port,
-        remote_ip = %dpdk_config.remote_ip,
-        remote_port,
+        remote_ip = ?dpdk_config.remote_ip,
         "DPDK network identity"
     );
 
@@ -221,23 +207,25 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
     // The connector needs the peer's MAC to send the initial QUIC handshake.
     // The listener learns the peer MAC from the first incoming packet.
 
-    if is_connector && identity.remote_mac.is_none() {
-        tracing::info!(target_ip = %dpdk_config.remote_ip, "resolving peer MAC via ARP");
-        resolve_arp(
-            dpdk_config.port_id,
-            mempool,
-            &identity,
-            &mut arp_table,
-            dpdk_config.remote_ip,
-        )?;
-        identity.remote_mac = arp_table.lookup(dpdk_config.remote_ip);
-        if let Some(mac) = identity.remote_mac {
-            tracing::info!(mac = %format_mac(&mac), "ARP resolved peer MAC");
+    if is_connector {
+        if let Some(remote_ip) = dpdk_config.remote_ip {
+            if arp_table.lookup(remote_ip).is_none() {
+                tracing::info!(target_ip = %remote_ip, "resolving peer MAC via ARP");
+                resolve_arp(
+                    dpdk_config.port_id,
+                    mempool,
+                    &identity,
+                    &mut arp_table,
+                    remote_ip,
+                )?;
+                if let Some(mac) = arp_table.lookup(remote_ip) {
+                    tracing::info!(mac = %format_mac(&mac), "ARP resolved peer MAC");
+                } else {
+                    bail!("ARP resolution failed: no reply from {}", remote_ip);
+                }
+            }
         } else {
-            bail!(
-                "ARP resolution failed: no reply from {}",
-                dpdk_config.remote_ip
-            );
+            bail!("connector requires remote_ip (derived from endpoint) for initial ARP");
         }
     }
 

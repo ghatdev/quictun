@@ -5,11 +5,14 @@
 //! per connection — no Mutex/atomics in the data plane.
 
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use quictun_quic::cid_to_u64;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crossbeam_channel::{Receiver, Sender};
 use quictun_quic::local::LocalConnectionState;
@@ -17,15 +20,14 @@ use quictun_quic::local::LocalConnectionState;
 /// Channel capacity (matches DPDK ring size).
 const CHANNEL_CAPACITY: usize = 4096;
 
-/// An outer (UDP) packet dispatched from dispatcher to worker.
-pub struct OuterPacket {
-    pub data: Vec<u8>,
-    pub from: SocketAddr,
+/// A batch of outer (UDP) packets dispatched from dispatcher to worker.
+pub struct OuterBatch {
+    pub packets: SmallVec<[(Vec<u8>, SocketAddr); 32]>,
 }
 
-/// An inner (TUN) packet dispatched from dispatcher to worker.
-pub struct InnerPacket {
-    pub data: Vec<u8>,
+/// A batch of inner (TUN) packets dispatched from dispatcher to worker.
+pub struct InnerBatch {
+    pub packets: SmallVec<[Vec<u8>; 32]>,
 }
 
 /// Dispatcher → worker control message.
@@ -51,11 +53,14 @@ pub struct RemovedConnection {
 
 /// Per-worker channel bundle.
 pub struct WorkerChannels {
-    pub outer_tx: Sender<OuterPacket>,
-    pub outer_rx: Receiver<OuterPacket>,
-    pub inner_tx: Sender<InnerPacket>,
-    pub inner_rx: Receiver<InnerPacket>,
+    pub outer_tx: Sender<OuterBatch>,
+    pub outer_rx: Receiver<OuterBatch>,
+    pub inner_tx: Sender<InnerBatch>,
+    pub inner_rx: Receiver<InnerBatch>,
     pub control: Mutex<Vec<ControlMessage>>,
+    /// eventfd for waking the worker when batches are queued.
+    #[cfg(target_os = "linux")]
+    pub wake_fd: RawFd,
 }
 
 impl Default for WorkerChannels {
@@ -72,12 +77,38 @@ impl WorkerChannels {
     pub fn with_capacity(capacity: usize) -> Self {
         let (outer_tx, outer_rx) = crossbeam_channel::bounded(capacity);
         let (inner_tx, inner_rx) = crossbeam_channel::bounded(capacity);
+        #[cfg(target_os = "linux")]
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
         Self {
             outer_tx,
             outer_rx,
             inner_tx,
             inner_rx,
             control: Mutex::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            wake_fd,
+        }
+    }
+
+    /// Signal the worker that new data is available.
+    #[cfg(target_os = "linux")]
+    pub fn wake(&self) {
+        let val: u64 = 1;
+        unsafe {
+            libc::write(
+                self.wake_fd,
+                &val as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WorkerChannels {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.wake_fd);
         }
     }
 }

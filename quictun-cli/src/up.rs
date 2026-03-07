@@ -258,21 +258,18 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
         .parse()
         .context("invalid dpdk_local_ip")?;
 
-    let dpdk_remote_ip: std::net::Ipv4Addr = config
-        .engine
-        .dpdk_remote_ip
-        .as_ref()
-        .context("dpdk_remote_ip is required for DPDK backends")?
-        .parse()
-        .context("invalid dpdk_remote_ip")?;
-
-    let gateway_mac = config
-        .engine
-        .dpdk_gateway_mac
-        .as_ref()
-        .map(|s| parse_mac(s))
-        .transpose()
-        .context("invalid dpdk_gateway_mac (expected xx:xx:xx:xx:xx:xx)")?;
+    // Derive remote IP from peer endpoint (connector) or None (listener learns from packets).
+    let dpdk_remote_ip: Option<std::net::Ipv4Addr> = if mode == Mode::Connector {
+        let endpoint = peers[0]
+            .endpoint
+            .context("connector requires peer endpoint")?;
+        match endpoint.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            _ => anyhow::bail!("DPDK requires IPv4 endpoint"),
+        }
+    } else {
+        None
+    };
 
     let eal_args: Vec<String> = config
         .engine
@@ -294,7 +291,6 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
         address = %addr,
         mtu = config.mtu(),
         dpdk_local_ip = %dpdk_local_ip,
-        dpdk_remote_ip = %dpdk_remote_ip,
         dpdk_port = config.engine.dpdk_port,
         dpdk_mode,
         cc = %cc,
@@ -335,7 +331,9 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
                 config.interface.zero_rtt,
             )?;
             let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
-            let dpdk_remote_addr = SocketAddr::new(dpdk_remote_ip.into(), remote_addr.port());
+            let dpdk_remote_ip_v4 =
+                dpdk_remote_ip.context("connector must have a remote IP")?;
+            let dpdk_remote_addr = SocketAddr::new(dpdk_remote_ip_v4.into(), remote_addr.port());
             quictun_dpdk::event_loop::EndpointSetup::Connector {
                 remote_addr: dpdk_remote_addr,
                 client_config: cc,
@@ -390,7 +388,6 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
         local_ip: dpdk_local_ip,
         remote_ip: dpdk_remote_ip,
         local_port: config.engine.dpdk_local_port,
-        gateway_mac,
         tunnel_ip,
         tunnel_prefix,
         tunnel_mtu,
@@ -407,17 +404,3 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
     quictun_dpdk::event_loop::run(local_addr, setup, dpdk_config)
 }
 
-/// Parse a MAC address string like "bc:24:11:ab:cd:ef" into [u8; 6].
-#[cfg(target_os = "linux")]
-fn parse_mac(s: &str) -> Result<[u8; 6]> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 6 {
-        anyhow::bail!("MAC must have 6 octets separated by ':'");
-    }
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] =
-            u8::from_str_radix(part, 16).with_context(|| format!("invalid MAC octet: {part}"))?;
-    }
-    Ok(mac)
-}

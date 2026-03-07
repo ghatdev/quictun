@@ -114,15 +114,12 @@ pub(crate) fn resolve_completed_handshake(
     let tunnel_ip = identified.tunnel_ip;
     let allowed_ips = identified.allowed_ips.clone();
 
-    // Resolve remote MAC from ARP table or use learned identity MAC.
+    // Resolve remote MAC from ARP table.
     let remote_ip = match hs.remote_addr.ip() {
         std::net::IpAddr::V4(ip) => ip,
-        _ => identity.remote_ip,
+        _ => Ipv4Addr::UNSPECIFIED,
     };
-    let remote_mac = arp_table
-        .lookup(remote_ip)
-        .or(identity.remote_mac)
-        .unwrap_or([0xff; 6]);
+    let remote_mac = arp_table.lookup(remote_ip).unwrap_or([0xff; 6]);
 
     let cid_bytes = conn_state.local_cid().to_vec();
     let cid = cid_to_u64(&cid_bytes);
@@ -248,6 +245,7 @@ pub fn run(
                 ShortHeader {
                     src_mac: [u8; 6],
                     src_ip: Ipv4Addr,
+                    src_port: u16,
                     payload_offset: usize,
                     payload_len: usize,
                 },
@@ -283,6 +281,7 @@ pub fn run(
                                 RxAction::ShortHeader {
                                     src_mac: udp.src_mac,
                                     src_ip: udp.src_ip,
+                                    src_port: udp.src_port,
                                     payload_offset,
                                     payload_len,
                                 }
@@ -309,6 +308,7 @@ pub fn run(
                 RxAction::ShortHeader {
                     src_mac,
                     src_ip,
+                    src_port,
                     payload_offset,
                     payload_len,
                 } => {
@@ -330,6 +330,11 @@ pub fn run(
                         &mut data[payload_offset..payload_offset + payload_len],
                     ) {
                         Ok(decrypted) => {
+                            // Update peer address on every authenticated packet
+                            // (supports QUIC connection migration / roaming).
+                            entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
+                            entry.remote_mac = src_mac;
+
                             if let Some(ref ack) = decrypted.ack {
                                 entry.conn.process_ack(ack);
                             }
@@ -508,7 +513,7 @@ pub fn run(
                                 Ok(result) => {
                                     let remote_ip = match entry.remote_addr.ip() {
                                         std::net::IpAddr::V4(ip) => ip,
-                                        _ => identity.remote_ip,
+                                        _ => Ipv4Addr::UNSPECIFIED,
                                     };
                                     ip_id = ip_id.wrapping_add(1);
                                     let actual_len = net::build_udp_packet_inplace(
@@ -747,10 +752,8 @@ fn drain_and_send(
         return Ok(());
     };
 
-    let dst_mac = identity
-        .remote_mac
-        .or_else(|| arp_table.lookup(identity.remote_ip))
-        .unwrap_or([0xff; 6]); // broadcast if unknown (shouldn't happen after ARP)
+    // Default MAC for handshake transmits — resolved per-transmit below via ARP.
+    let dst_mac = [0xff; 6];
 
     let mut tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::new();
 
@@ -765,7 +768,7 @@ fn drain_and_send(
         // Determine destination from transmit (uses state remote_addr by default).
         let dst_ip = match transmit.destination {
             SocketAddr::V4(v4) => *v4.ip(),
-            _ => identity.remote_ip,
+            _ => Ipv4Addr::UNSPECIFIED,
         };
         let dst_port = transmit.destination.port();
         let actual_dst_mac = arp_table.lookup(dst_ip).unwrap_or(dst_mac);
@@ -889,7 +892,6 @@ pub fn run_handshake_only(
     let mut ip_id: u16 = 0;
     let mut rx_buf = BytesMut::with_capacity(2048);
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
-    let mut peer_learned = identity.remote_port != 0;
     let mut tx_pkts: u64 = 0;
 
     // If connector, drain initial handshake transmits.
@@ -930,20 +932,7 @@ pub fn run_handshake_only(
                         continue;
                     }
                     arp_table.learn(udp.src_ip, udp.src_mac);
-                    if identity.remote_mac.is_none() {
-                        identity.remote_mac = Some(udp.src_mac);
-                        tracing::info!(
-                            mac = %format_mac(&udp.src_mac),
-                            ip = %udp.src_ip,
-                            "learned peer MAC"
-                        );
-                    }
-                    if !peer_learned {
-                        state.remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
-                        identity.remote_port = udp.src_port;
-                        peer_learned = true;
-                        tracing::info!(remote = %state.remote_addr, "learned peer address");
-                    }
+                    state.remote_addr = SocketAddr::new(udp.src_ip.into(), udp.src_port);
 
                     if udp.payload.is_empty() {
                         continue;
@@ -966,18 +955,17 @@ pub fn run_handshake_only(
                             let responses =
                                 shared::handle_datagram_event(state, event, &mut response_buf);
                             for buf in responses {
-                                let dst_mac = identity
-                                    .remote_mac
-                                    .or_else(|| arp_table.lookup(identity.remote_ip))
-                                    .unwrap_or([0xff; 6]);
+                                let dst_mac = arp_table
+                                    .lookup(udp.src_ip)
+                                    .unwrap_or(udp.src_mac);
                                 ip_id = ip_id.wrapping_add(1);
                                 let frame_len = net::build_udp_packet(
                                     &identity.local_mac,
                                     &dst_mac,
                                     identity.local_ip,
-                                    identity.remote_ip,
+                                    udp.src_ip,
                                     identity.local_port,
-                                    identity.remote_port,
+                                    udp.src_port,
                                     &buf,
                                     &mut pkt_buf,
                                     0,
@@ -991,14 +979,6 @@ pub fn run_handshake_only(
                 }
                 Some(ParsedPacket::Arp(arp)) => {
                     arp_table.learn(arp.sender_ip, arp.sender_mac);
-                    if identity.remote_mac.is_none() && arp.sender_ip == identity.remote_ip {
-                        identity.remote_mac = Some(arp.sender_mac);
-                        tracing::info!(
-                            mac = %format_mac(&arp.sender_mac),
-                            ip = %arp.sender_ip,
-                            "learned peer MAC via ARP"
-                        );
-                    }
                     if arp.is_request && arp.target_ip == identity.local_ip {
                         let reply =
                             net::build_arp_reply(&arp, identity.local_mac, identity.local_ip);
@@ -1189,11 +1169,7 @@ pub fn run_dispatcher(
                         continue;
                     }
 
-                    // Learn MAC/port.
                     arp_table.learn(udp.src_ip, udp.src_mac);
-                    if identity.remote_mac.is_none() {
-                        identity.remote_mac = Some(udp.src_mac);
-                    }
 
                     let first_byte = udp.payload[0];
                     if first_byte & 0x80 == 0 {
@@ -1230,10 +1206,9 @@ pub fn run_dispatcher(
                         );
 
                         for buf in responses {
-                            let dst_mac = identity
-                                .remote_mac
-                                .or_else(|| arp_table.lookup(identity.remote_ip))
-                                .unwrap_or([0xff; 6]);
+                            let dst_mac = arp_table
+                                .lookup(udp.src_ip)
+                                .unwrap_or(udp.src_mac);
                             ip_id = ip_id.wrapping_add(1);
                             let frame_len = net::build_udp_packet(
                                 &identity.local_mac,
@@ -1485,13 +1460,10 @@ fn drain_handshake_transmits(
         // Use transmit.destination for per-connection addressing (multi-client safe).
         let dst_ip = match transmit.destination {
             SocketAddr::V4(v4) => *v4.ip(),
-            _ => identity.remote_ip,
+            _ => Ipv4Addr::UNSPECIFIED,
         };
         let dst_port = transmit.destination.port();
-        let dst_mac = arp_table
-            .lookup(dst_ip)
-            .or(identity.remote_mac)
-            .unwrap_or([0xff; 6]);
+        let dst_mac = arp_table.lookup(dst_ip).unwrap_or([0xff; 6]);
 
         let seg_size = transmit.segment_size.unwrap_or(data.len());
 
@@ -1649,6 +1621,9 @@ pub fn run_worker(
             if udp.payload.is_empty() || udp.payload[0] & 0x80 != 0 {
                 continue;
             }
+            let src_mac = udp.src_mac;
+            let src_ip = udp.src_ip;
+            let src_port = udp.src_port;
 
             let payload_offset =
                 unsafe { udp.payload.as_ptr().offset_from(data.as_ptr()) as usize };
@@ -1671,6 +1646,10 @@ pub fn run_worker(
                 .decrypt_packet_in_place(&mut data[payload_offset..payload_offset + payload_len])
             {
                 Ok(decrypted) => {
+                    // Update peer address on every authenticated packet.
+                    entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
+                    entry.remote_mac = src_mac;
+
                     if let Some(ref ack) = decrypted.ack {
                         entry.conn.process_ack(ack);
                     }
@@ -1754,12 +1733,16 @@ pub fn run_worker(
                         &mut buf[net::HEADER_SIZE..],
                     ) {
                         Ok(result) => {
+                            let remote_ip = match entry.remote_addr.ip() {
+                                std::net::IpAddr::V4(ip) => ip,
+                                _ => Ipv4Addr::UNSPECIFIED,
+                            };
                             ip_id = ip_id.wrapping_add(1);
                             let actual_len = net::build_udp_packet_inplace(
                                 &identity.local_mac,
                                 &entry.remote_mac,
                                 identity.local_ip,
-                                identity.remote_ip,
+                                remote_ip,
                                 identity.local_port,
                                 entry.remote_addr.port(),
                                 result.len,

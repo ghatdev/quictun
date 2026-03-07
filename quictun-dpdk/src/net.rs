@@ -47,14 +47,14 @@ pub enum ChecksumMode {
 // ── Identity & ARP table ──────────────────────────────────────────
 
 /// Network identity for this DPDK port.
+///
+/// Only contains local identity. Remote addresses are resolved via ARP table
+/// and tracked per-connection in `ConnectionEntry`.
 #[derive(Clone)]
 pub struct NetIdentity {
     pub local_mac: [u8; 6],
-    pub remote_mac: Option<[u8; 6]>,
     pub local_ip: Ipv4Addr,
-    pub remote_ip: Ipv4Addr,
     pub local_port: u16,
-    pub remote_port: u16,
 }
 
 /// ARP stale threshold in seconds. Entries older than this are considered stale.
