@@ -368,6 +368,8 @@ fn run_single(
     #[cfg(target_os = "linux")]
     let mut recv_addrs =
         vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); batch_size];
+    #[cfg(target_os = "linux")]
+    let mut recv_work = quictun_core::batch_io::RecvMmsgWork::new(batch_size);
 
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -453,6 +455,7 @@ fn run_single(
                     &mut recv_bufs,
                     &mut recv_lens,
                     &mut recv_addrs,
+                    &mut recv_work,
                     &mut scratch,
                     &mut response_buf,
                     offload_enabled,
@@ -719,6 +722,7 @@ fn handle_udp_rx_linux(
     recv_bufs: &mut [Vec<u8>],
     recv_lens: &mut [usize],
     recv_addrs: &mut [SocketAddr],
+    recv_work: &mut quictun_core::batch_io::RecvMmsgWork,
     scratch: &mut BytesMut,
     response_buf: &mut Vec<u8>,
     offload: bool,
@@ -735,6 +739,7 @@ fn handle_udp_rx_linux(
             recv_lens,
             recv_addrs,
             max_batch,
+            recv_work,
         ) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -1718,6 +1723,8 @@ fn run_dispatcher(
     #[cfg(target_os = "linux")]
     let mut recv_addrs =
         vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0); dispatch_batch_size];
+    #[cfg(target_os = "linux")]
+    let mut recv_work = quictun_core::batch_io::RecvMmsgWork::new(dispatch_batch_size);
 
     // Non-Linux: per-packet buffer.
     #[cfg(not(target_os = "linux"))]
@@ -1797,6 +1804,7 @@ fn run_dispatcher(
                     &mut recv_bufs,
                     &mut recv_lens,
                     &mut recv_addrs,
+                    &mut recv_work,
                     &mut response_buf,
                 )?;
             }
@@ -1898,6 +1906,7 @@ fn dispatch_udp_rx_linux(
     recv_bufs: &mut [Vec<u8>],
     recv_lens: &mut [usize],
     recv_addrs: &mut [SocketAddr],
+    recv_work: &mut quictun_core::batch_io::RecvMmsgWork,
     response_buf: &mut Vec<u8>,
 ) -> Result<()> {
     loop {
@@ -1908,6 +1917,7 @@ fn dispatch_udp_rx_linux(
             recv_lens,
             recv_addrs,
             max_batch,
+            recv_work,
         ) {
             Ok(0) => return Ok(()),
             Ok(n) => n,

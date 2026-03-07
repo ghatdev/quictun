@@ -7,7 +7,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
-/// Maximum batch size for sendmmsg/recvmmsg.
+/// Default batch size for sendmmsg/recvmmsg.
 pub const BATCH_SIZE: usize = 64;
 
 /// Maximum segments per UDP GSO sendmsg (kernel ~64KB limit per sendmsg).
@@ -16,6 +16,24 @@ pub const GSO_MAX_SEGMENTS: usize = 44;
 
 /// GSO buffer size: enough for max segments.
 pub const GSO_BUF_SIZE: usize = GSO_MAX_SEGMENTS * 2048;
+
+/// Pre-allocated workspace for recvmmsg syscalls.
+/// Avoids heap allocation per call in the hot path.
+pub struct RecvMmsgWork {
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    sockaddrs: Vec<libc::sockaddr_in>,
+}
+
+impl RecvMmsgWork {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            iovecs: vec![unsafe { std::mem::zeroed() }; capacity],
+            msgs: vec![unsafe { std::mem::zeroed() }; capacity],
+            sockaddrs: vec![unsafe { std::mem::zeroed() }; capacity],
+        }
+    }
+}
 
 /// Build a sockaddr_in from a SocketAddr::V4.
 fn build_sockaddr_v4(remote_addr: SocketAddr) -> io::Result<(libc::sockaddr_in, libc::socklen_t)> {
@@ -96,35 +114,35 @@ pub fn recvmmsg_batch(
     lens: &mut [usize],
     addrs: &mut [SocketAddr],
     max_count: usize,
+    work: &mut RecvMmsgWork,
 ) -> io::Result<usize> {
     let count = max_count
         .min(bufs.len())
         .min(lens.len())
         .min(addrs.len())
-        .min(BATCH_SIZE);
+        .min(work.iovecs.len());
     if count == 0 {
         return Ok(0);
     }
 
-    let mut iovecs: [libc::iovec; BATCH_SIZE] = unsafe { std::mem::zeroed() };
-    let mut msgs: [libc::mmsghdr; BATCH_SIZE] = unsafe { std::mem::zeroed() };
-    let mut sockaddrs: [libc::sockaddr_in; BATCH_SIZE] = unsafe { std::mem::zeroed() };
-
     for i in 0..count {
-        iovecs[i] = libc::iovec {
+        work.iovecs[i] = libc::iovec {
             iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
             iov_len: bufs[i].len(),
         };
-        msgs[i].msg_hdr.msg_iov = &mut iovecs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-        msgs[i].msg_hdr.msg_name = &mut sockaddrs[i] as *mut _ as *mut libc::c_void;
-        msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        work.msgs[i] = unsafe { std::mem::zeroed() };
+        work.msgs[i].msg_hdr.msg_iov = &mut work.iovecs[i];
+        work.msgs[i].msg_hdr.msg_iovlen = 1;
+        work.sockaddrs[i] = unsafe { std::mem::zeroed() };
+        work.msgs[i].msg_hdr.msg_name = &mut work.sockaddrs[i] as *mut _ as *mut libc::c_void;
+        work.msgs[i].msg_hdr.msg_namelen =
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     }
 
     let ret = unsafe {
         libc::recvmmsg(
             fd.as_raw_fd(),
-            msgs.as_mut_ptr(),
+            work.msgs.as_mut_ptr(),
             count as libc::c_uint,
             libc::MSG_DONTWAIT,
             std::ptr::null_mut(),
@@ -136,8 +154,8 @@ pub fn recvmmsg_batch(
     } else {
         let n = ret as usize;
         for i in 0..n {
-            lens[i] = msgs[i].msg_len as usize;
-            let sa = &sockaddrs[i];
+            lens[i] = work.msgs[i].msg_len as usize;
+            let sa = &work.sockaddrs[i];
             let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
             let port = u16::from_be(sa.sin_port);
             addrs[i] = SocketAddr::new(ip.into(), port);
