@@ -94,6 +94,7 @@ pub struct DecryptedInPlace {
 }
 
 /// Result of encrypting a datagram into a 1-RTT packet.
+#[derive(Clone, Copy)]
 pub struct EncryptResult {
     /// Bytes written to the output buffer.
     pub len: usize,

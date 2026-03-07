@@ -270,7 +270,7 @@ pub fn run_router(
                                 &mut response_buf,
                             );
 
-                            for (len, buf) in responses {
+                            for buf in responses {
                                 let dst_mac = arp_table
                                     .lookup(udp.src_ip)
                                     .unwrap_or([0xff; 6]);
@@ -282,7 +282,7 @@ pub fn run_router(
                                     udp.src_ip,
                                     identity.local_port,
                                     udp.src_port,
-                                    &buf[..len],
+                                    &buf,
                                     &mut pkt_buf,
                                     0,
                                     ip_id,
@@ -1126,7 +1126,7 @@ pub fn run_router_dispatcher(
                                 &mut response_buf,
                             );
 
-                            for (len, buf) in responses {
+                            for buf in responses {
                                 let dst_mac = arp_table
                                     .lookup(udp.src_ip)
                                     .unwrap_or([0xff; 6]);
@@ -1138,7 +1138,7 @@ pub fn run_router_dispatcher(
                                     udp.src_ip,
                                     identity.local_port,
                                     udp.src_port,
-                                    &buf[..len],
+                                    &buf,
                                     &mut pkt_buf,
                                     0,
                                     ip_id,

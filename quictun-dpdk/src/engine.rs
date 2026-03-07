@@ -380,7 +380,7 @@ pub fn run(
                     );
 
                     // Send responses back to the sender.
-                    for (len, buf) in responses {
+                    for buf in responses {
                         let dst_mac = arp_table.lookup(src_ip).unwrap_or([0xff; 6]);
                         ip_id = ip_id.wrapping_add(1);
                         let frame_len = net::build_udp_packet(
@@ -390,7 +390,7 @@ pub fn run(
                             src_ip,
                             identity.local_port,
                             src_port,
-                            &buf[..len],
+                            &buf,
                             &mut pkt_buf,
                             0,
                             ip_id,
@@ -966,7 +966,7 @@ pub fn run_handshake_only(
                         ) {
                             let responses =
                                 shared::handle_datagram_event(state, event, &mut response_buf);
-                            for (len, buf) in responses {
+                            for buf in responses {
                                 let dst_mac = identity
                                     .remote_mac
                                     .or_else(|| arp_table.lookup(identity.remote_ip))
@@ -979,7 +979,7 @@ pub fn run_handshake_only(
                                     identity.remote_ip,
                                     identity.local_port,
                                     identity.remote_port,
-                                    &buf[..len],
+                                    &buf,
                                     &mut pkt_buf,
                                     0,
                                     ip_id,
@@ -1230,7 +1230,7 @@ pub fn run_dispatcher(
                             &mut response_buf,
                         );
 
-                        for (len, buf) in responses {
+                        for buf in responses {
                             let dst_mac = identity
                                 .remote_mac
                                 .or_else(|| arp_table.lookup(identity.remote_ip))
@@ -1243,7 +1243,7 @@ pub fn run_dispatcher(
                                 udp.src_ip,
                                 identity.local_port,
                                 udp.src_port,
-                                &buf[..len],
+                                &buf,
                                 &mut pkt_buf,
                                 0,
                                 ip_id,

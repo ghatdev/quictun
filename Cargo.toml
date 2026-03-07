@@ -72,7 +72,6 @@ tun-rs = { version = "2", features = ["async"] }
 
 libc = "0.2"
 crossbeam-channel = "0.5"
-rayon = "1.10"
 
 # quictun-quic
 quictun-quic = { path = "quictun-quic" }

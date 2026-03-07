@@ -105,7 +105,7 @@ impl MultiQuicState {
         ecn: Option<quinn_proto::EcnCodepoint>,
         data: bytes::BytesMut,
         response_buf: &mut Vec<u8>,
-    ) -> Vec<(usize, [u8; BUF_SIZE])> {
+    ) -> Vec<Vec<u8>> {
         let mut response_transmits = Vec::new();
 
         let Some(event) = self
@@ -143,18 +143,14 @@ impl MultiQuicState {
                         warn!(error = ?e.cause, "failed to accept connection");
                         if let Some(transmit) = e.response {
                             let len = transmit.size;
-                            let mut buf = [0u8; BUF_SIZE];
-                            buf[..len].copy_from_slice(&response_buf[..len]);
-                            response_transmits.push((len, buf));
+                            response_transmits.push(response_buf[..len].to_vec());
                         }
                     }
                 }
             }
             DatagramEvent::Response(transmit) => {
                 let len = transmit.size;
-                let mut buf = [0u8; BUF_SIZE];
-                buf[..len].copy_from_slice(&response_buf[..len]);
-                response_transmits.push((len, buf));
+                response_transmits.push(response_buf[..len].to_vec());
             }
         }
 

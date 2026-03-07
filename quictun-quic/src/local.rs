@@ -31,7 +31,7 @@ pub struct PreparedPacket {
 /// Immutable key snapshot for parallel sealing.
 ///
 /// Holds references to the TX keys. `PacketKey` and `HeaderKey` are `Send + Sync`,
-/// so this can be shared across rayon threads.
+/// so this can be shared across threads for parallel encrypt.
 pub struct SealKeys<'a> {
     pub remote_cid: &'a ConnectionId,
     pub tx_packet_key: &'a dyn PacketKey,

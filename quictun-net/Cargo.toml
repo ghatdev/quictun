@@ -20,5 +20,4 @@ ipnet = { workspace = true }
 tun-rs = { workspace = true }
 crossbeam-channel = { workspace = true }
 rustc-hash = { workspace = true }
-rayon = { workspace = true }
 smallvec = { workspace = true }
