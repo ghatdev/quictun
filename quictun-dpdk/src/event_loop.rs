@@ -162,7 +162,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         None if local_addr.port() != 0 => local_addr.port(),
         None => 40000, // Default ephemeral port for connector
     };
-    let identity = NetIdentity {
+    let mut identity = NetIdentity {
         local_mac,
         local_ip: dpdk_config.local_ip,
         local_port,
@@ -261,7 +261,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 0, // queue_id
                 mempool,
                 &mut multi_state,
-                &mut identity,
+                &identity,
                 &mut arp_table,
                 shutdown.clone(),
                 dpdk_config.adaptive_poll,
@@ -396,7 +396,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 &mut multi_state,
                 &mut dispatch_table,
                 &worker_rings,
-                &mut identity,
+                &identity,
                 &mut arp_table,
                 &shutdown,
                 adaptive_poll,
@@ -533,7 +533,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             0, // queue_id
             mempool,
             &mut multi_state,
-            &mut identity,
+            &identity,
             &mut arp_table,
             inner,
             shutdown.clone(),
@@ -641,7 +641,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 &mut multi_state,
                 &mut dispatch_table,
                 &worker_rings,
-                &mut identity,
+                &identity,
                 &mut arp_table,
                 &inner,
                 &dpdk_config.peers,
