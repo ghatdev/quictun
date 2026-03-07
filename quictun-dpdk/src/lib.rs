@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)] // DPDK FFI is pervasively unsafe
 #[allow(dead_code)] // Used from net.rs on Linux; appears unused on macOS (net.rs is cfg-gated).
 mod checksum;
 #[cfg(target_os = "linux")]
