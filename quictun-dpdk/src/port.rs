@@ -261,7 +261,7 @@ pub fn configure_port_dispatcher(
     }
     let dev_info = unsafe { dev_info.assume_init() };
 
-    // No RSS — 1 RX queue, N TX queues. Enable TX checksum offloads if supported.
+    // 1 RX queue (core 0 only), N TX queues (one per core).
     let mut port_conf = ffi::rte_eth_conf::default();
     if (dev_info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0 {
         port_conf.txmode.offloads |= ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM;

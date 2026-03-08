@@ -104,9 +104,8 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             eal_args.push(format!("--vdev=net_tap{i},iface={iface}"));
         }
     } else if dpdk_config.mode == "virtio" {
-        if n_cores > 1 {
-            bail!("multi-core (--dpdk-cores > 1) is not yet supported with virtio-user mode");
-        }
+        // Virtio-user: single vdev regardless of n_cores.
+        // Pipeline mode uses only 1 inner port (core 0 handles inner I/O).
         let iface = dpdk_config.tunnel_iface.clone();
         // Packed virtqueue (virtio 1.1) + in-order + non-mergeable + vectorized:
         // enables the AVX-512 packed vectorized RX/TX path in the virtio PMD.
@@ -130,13 +129,11 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         ffi::MEMPOOL_CACHE_SIZE,
     )?;
 
-    let (local_mac, hw_udp_cksum, hw_ip_cksum) = if n_cores > 1 && !dpdk_config.router {
-        // Multi-queue RSS for non-router modes (tap/virtio).
-        // Router mode uses dispatcher pattern: single RX queue, reconfigured later.
-        port::configure_port_multiqueue(dpdk_config.port_id, n_cores as u16, mempool)?
-    } else {
-        port::configure_port(dpdk_config.port_id, mempool)?
-    };
+    // Configure outer port with single TX queue. Virtio NICs silently drop
+    // packets on TX queues > 0, so all TX goes through queue 0 on core 0.
+    // Pipeline workers return encrypted packets via outer_tx rings instead.
+    let (local_mac, hw_udp_cksum, hw_ip_cksum) =
+        port::configure_port(dpdk_config.port_id, mempool)?;
 
     // Determine checksum mode: CLI flag > HW offload > software.
     let checksum_mode = if dpdk_config.no_udp_checksum {
@@ -288,13 +285,13 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             .ok_or_else(|| anyhow::anyhow!("multi-core router requires listener mode"))?;
         let mut multi_state = MultiQuicState::new(multi_server_config);
 
-        // Reconfigure outer port: 1 RX queue, n_cores TX queues.
-        // Workers TX directly to outer NIC via per-worker TX queue.
+        // TODO: Router pipeline also needs outer_tx ring approach for virtio NICs.
+        // Currently uses per-worker TX queues which fail on virtio. For now,
+        // reconfigure the port with N TX queues (works on non-virtio NICs).
         port::stop_port(dpdk_config.port_id);
         let (new_mac, hw_udp, hw_ip) =
             port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
         identity.local_mac = new_mac;
-
         let checksum_mode = if dpdk_config.no_udp_checksum {
             ChecksumMode::None
         } else if hw_udp && hw_ip {
@@ -420,12 +417,14 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         return result;
     }
 
-    let mut inner_ports: Vec<InnerPort> = Vec::with_capacity(n_cores);
+    // TAP creates N vdevs (one per core); virtio creates 1 (pipeline uses single inner port).
+    let n_inner_vdevs = if dpdk_config.mode == "virtio" { 1 } else { n_cores };
+    let mut inner_ports: Vec<InnerPort> = Vec::with_capacity(n_inner_vdevs);
 
     // All modes now use --vdev in EAL args. Inner port(s) are the last N ports.
     // SAFETY: EAL is initialized; returns the count of available DPDK ports.
     let total_ports = unsafe { ffi::rte_eth_dev_count_avail() } as u16;
-    let expected = 1 + n_cores as u16; // outer + N inner ports
+    let expected = 1 + n_inner_vdevs as u16; // outer + inner vdev(s)
     if total_ports < expected {
         bail!(
             "inner vdev not found: only {total_ports} port(s) available (expected ≥ {expected})"
@@ -439,12 +438,12 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         // Fabricate a locally-administered peer MAC for ARP replies.
         let peer_mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
-        for i in 0..n_cores {
-            let inner_port_id = (total_ports - n_cores as u16) + i as u16;
+        for i in 0..n_inner_vdevs {
+            let inner_port_id = (total_ports - n_inner_vdevs as u16) + i as u16;
             let (inner_mac, _inner_hw_udp, _inner_hw_ip) =
                 port::configure_port(inner_port_id, mempool)?;
 
-            let iface = if n_cores == 1 {
+            let iface = if n_inner_vdevs == 1 {
                 dpdk_config.tunnel_iface.clone()
             } else {
                 format!("{}{i}", dpdk_config.tunnel_iface)
@@ -462,7 +461,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
             // Each inner port gets its own tunnel IP for multi-core.
             // Core 0 gets the base IP; additional cores get base+i.
-            let tunnel_ip = if n_cores == 1 {
+            let tunnel_ip = if n_inner_vdevs == 1 {
                 dpdk_config.tunnel_ip
             } else {
                 let octets = dpdk_config.tunnel_ip.octets();
@@ -489,7 +488,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             });
         }
 
-        tracing::info!(n_cores, mode = %dpdk_config.mode, "inner interface ready");
+        tracing::info!(n_cores, n_inner_vdevs, mode = %dpdk_config.mode, "inner interface ready");
     }
 
     // ── 7. Set up SIGINT handler ─────────────────────────────────
@@ -541,22 +540,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         // Core 0 = I/O, Workers 1..N = crypto (round-robin, any-connection).
         let n_workers = n_cores - 1;
 
-        // Configure outer port: 1 RX queue, n_cores TX queues.
-        // Close and reconfigure for dispatcher mode (same port config).
-        port::close_port(dpdk_config.port_id);
-        let (new_mac, hw_udp, hw_ip) =
-            port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
-        identity.local_mac = new_mac;
-
-        let checksum_mode = if dpdk_config.no_udp_checksum {
-            ChecksumMode::None
-        } else if hw_udp && hw_ip {
-            ChecksumMode::HardwareFull
-        } else if hw_udp {
-            ChecksumMode::HardwareUdpOnly
-        } else {
-            ChecksumMode::Software
-        };
+        // Outer port already configured with n_cores TX queues at startup.
 
         // Build multi-client QUIC state (listener only for multi-core).
         let multi_server_config = server_config_clone
@@ -591,8 +575,6 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 handles.push(s.spawn(move || -> Result<()> {
                     let mempool = mempool.as_ptr();
                     let core_idx = idx + 1; // core 0 is I/O
-                    let tx_queue = core_idx as u16;
-
                     // Pin thread to CPU.
                     #[cfg(target_os = "linux")]
                     {
@@ -613,8 +595,6 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                     }
 
                     engine::run_pipeline_worker(
-                        outer_port_id,
-                        tx_queue,
                         mempool,
                         rings,
                         inner_eth_hdr,

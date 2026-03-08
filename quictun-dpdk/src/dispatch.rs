@@ -188,11 +188,16 @@ pub struct ConnectionEntry {
 /// - `decrypt_rx`: core 0 → worker (outer QUIC packets for decrypt)
 /// - `encrypt_rx`: core 0 → worker (inner IP packets for encrypt)
 /// - `inner_tx`: worker → core 0 (decrypted datagrams for TAP TX)
+/// - `outer_tx`: worker → core 0 (encrypted outer packets for NIC TX)
 /// - `control`: rare messages (new connection broadcasts)
+///
+/// Workers cannot TX directly on the outer NIC because virtio NICs only
+/// support TX on queue 0 (packets on queue > 0 are silently dropped).
 pub struct PipelineRings {
     pub decrypt_rx: SpscRing,
     pub encrypt_rx: SpscRing,
     pub inner_tx: SpscRing,
+    pub outer_tx: SpscRing,
     pub control: Mutex<Vec<PipelineControlMessage>>,
 }
 
@@ -203,6 +208,7 @@ impl PipelineRings {
             decrypt_rx: SpscRing::new(&format!("pl_dec_rx_{idx}"), RING_CAPACITY, 0)?,
             encrypt_rx: SpscRing::new(&format!("pl_enc_rx_{idx}"), RING_CAPACITY, 0)?,
             inner_tx: SpscRing::new(&format!("pl_inner_tx_{idx}"), RING_CAPACITY, 0)?,
+            outer_tx: SpscRing::new(&format!("pl_outer_tx_{idx}"), RING_CAPACITY, 0)?,
             control: Mutex::new(Vec::new()),
         })
     }

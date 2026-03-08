@@ -1886,6 +1886,8 @@ pub fn run_pipeline_io(
     // Stats.
     let mut rx_pkts: u64 = 0;
     let mut tx_pkts: u64 = 0;
+    let mut inner_rx_pkts: u64 = 0;
+    let mut inner_tx_pkts: u64 = 0;
     let mut dispatch_drop: u64 = 0;
     let mut last_stats = Instant::now();
 
@@ -1898,8 +1900,9 @@ pub fn run_pipeline_io(
     let mut delay_us: u32 = MIN_DELAY_US;
     let mut now = Instant::now();
 
-    // Reusable mbuf array for collecting inner TX from workers.
+    // Reusable mbuf arrays for collecting TX from workers.
     let mut inner_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
+    let mut outer_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
 
     tracing::info!(n_workers, "pipeline I/O started on core 0");
 
@@ -1929,6 +1932,11 @@ pub fn run_pipeline_io(
                     }
 
                     arp_table.learn(udp.src_ip, udp.src_mac);
+
+                    // Filter: only process packets destined for our IP:port.
+                    if udp.dst_ip != identity.local_ip || udp.dst_port != identity.local_port {
+                        continue;
+                    }
 
                     let first_byte = udp.payload[0];
                     if first_byte & 0x80 == 0 {
@@ -1998,6 +2006,7 @@ pub fn run_pipeline_io(
         let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
         let nb_inner = port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, INNER_BURST_SIZE);
+        inner_rx_pkts += nb_inner as u64;
 
         for i in 0..nb_inner as usize {
             let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
@@ -2059,8 +2068,28 @@ pub fn run_pipeline_io(
                     &mut inner_tx_collect[..nb as usize],
                     nb as u16,
                 );
+                inner_tx_pkts += sent as u64;
                 for j in sent as usize..nb as usize {
                     unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_collect[j]) };
+                }
+            }
+        }
+
+        // ── 3b. Drain worker outer_tx rings → outer port TX ──
+
+        for worker in workers {
+            let nb = worker.outer_tx.dequeue_burst(&mut outer_tx_collect);
+            if nb > 0 {
+                had_work = true;
+                let sent = port::tx_burst(
+                    outer_port_id,
+                    0,
+                    &mut outer_tx_collect[..nb as usize],
+                    nb as u16,
+                );
+                tx_pkts += sent as u64;
+                for j in sent as usize..nb as usize {
+                    unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_collect[j]) };
                 }
             }
         }
@@ -2278,6 +2307,8 @@ pub fn run_pipeline_io(
             tracing::info!(
                 rx_pkts,
                 tx_pkts,
+                inner_rx_pkts,
+                inner_tx_pkts,
                 dispatch_drop,
                 connections = connections.len(),
                 handshakes = multi_state.handshakes.len(),
@@ -2313,8 +2344,6 @@ pub fn run_pipeline_io(
 ///   to outer NIC on the worker's own TX queue.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pipeline_worker(
-    outer_port_id: u16,
-    tx_queue_id: u16,
     mempool: *mut ffi::rte_mempool,
     rings: &PipelineRings,
     inner_eth_hdr: &InnerEthHeader,
@@ -2348,7 +2377,7 @@ pub fn run_pipeline_worker(
     let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
     let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
 
-    tracing::info!(core = core_id, tx_queue = tx_queue_id, "pipeline worker started");
+    tracing::info!(core = core_id, "pipeline worker started");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -2560,11 +2589,10 @@ pub fn run_pipeline_worker(
             had_work = true;
         }
 
-        // TX directly to outer port on this worker's queue.
+        // Enqueue encrypted packets to outer_tx ring for core 0 to TX.
         if !outer_tx_mbufs.is_empty() {
-            let nb_tx = outer_tx_mbufs.len() as u16;
-            let sent = port::tx_burst(outer_port_id, tx_queue_id, &mut outer_tx_mbufs, nb_tx);
-            for j in sent as usize..outer_tx_mbufs.len() {
+            let enqueued = rings.outer_tx.enqueue_burst(&outer_tx_mbufs);
+            for j in enqueued as usize..outer_tx_mbufs.len() {
                 unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_mbufs[j]) };
             }
         }
