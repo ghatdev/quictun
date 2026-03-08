@@ -461,40 +461,60 @@ fn pipeline_io_loop(
     ack_timer_interval: Duration,
     in_flight_batches: &mut usize,
 ) -> Result<RunResult> {
+    // Track idle iterations for falling back to epoll when no data flows.
+    let mut idle_iters: u32 = 0;
+    const BUSY_POLL_THRESHOLD: u32 = 64;
+
     loop {
-        // Compute timeout.
-        let mut timeout = Duration::from_secs(5);
-        for entry in connections.values() {
-            let ka_rem = entry.keepalive_interval.saturating_sub(entry.last_tx.elapsed());
-            let idle_rem = config.idle_timeout.saturating_sub(entry.last_rx.elapsed());
-            timeout = timeout.min(ka_rem).min(idle_rem);
-        }
-        for hs in multi_state.handshakes.values_mut() {
-            if let Some(deadline) = hs.connection.poll_timeout() {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                timeout = timeout.min(remaining);
-            }
-        }
-        let ack_rem = next_ack_deadline.saturating_duration_since(Instant::now());
-        timeout = timeout.min(ack_rem).max(Duration::from_millis(1));
-
-        // If batches are in flight, busy-poll to minimize completion latency.
-        if *in_flight_batches > 0 {
-            timeout = Duration::ZERO;
-        }
-
-        poll.poll(events, Some(timeout))?;
-
         let mut signal_received = false;
-        let mut udp_readable = false;
-        let mut tun_readable = false;
+        let mut udp_readable;
+        let mut tun_readable;
 
-        for event in events.iter() {
-            match event.token() {
-                TOKEN_SIGNAL => signal_received = true,
-                TOKEN_UDP => udp_readable = true,
-                TOKEN_TUN => tun_readable = true,
-                _ => {}
+        // Hot path: skip epoll when data is actively flowing.
+        // All fds are non-blocking, so we just try I/O directly.
+        // Only fall back to epoll after BUSY_POLL_THRESHOLD idle iterations.
+        if *in_flight_batches > 0 || idle_iters < BUSY_POLL_THRESHOLD {
+            // Busy-poll: assume both readable, let WouldBlock handle it.
+            udp_readable = true;
+            tun_readable = true;
+            // Check signal pipe periodically (every 256 iterations).
+            if idle_iters & 0xFF == 0xFF {
+                let mut sig_byte = [0u8; 1];
+                let ret = unsafe {
+                    libc::read(sig_read_fd, sig_byte.as_mut_ptr() as *mut libc::c_void, 1)
+                };
+                if ret > 0 {
+                    signal_received = true;
+                }
+            }
+        } else {
+            // Cold path: no data flowing, use epoll to block until event.
+            let mut timeout = Duration::from_secs(5);
+            for entry in connections.values() {
+                let ka_rem = entry.keepalive_interval.saturating_sub(entry.last_tx.elapsed());
+                let idle_rem = config.idle_timeout.saturating_sub(entry.last_rx.elapsed());
+                timeout = timeout.min(ka_rem).min(idle_rem);
+            }
+            for hs in multi_state.handshakes.values_mut() {
+                if let Some(deadline) = hs.connection.poll_timeout() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    timeout = timeout.min(remaining);
+                }
+            }
+            let ack_rem = next_ack_deadline.saturating_duration_since(Instant::now());
+            timeout = timeout.min(ack_rem).max(Duration::from_millis(1));
+
+            poll.poll(events, Some(timeout))?;
+
+            udp_readable = false;
+            tun_readable = false;
+            for event in events.iter() {
+                match event.token() {
+                    TOKEN_SIGNAL => signal_received = true,
+                    TOKEN_UDP => udp_readable = true,
+                    TOKEN_TUN => tun_readable = true,
+                    _ => {}
+                }
             }
         }
 
@@ -650,6 +670,13 @@ fn pipeline_io_loop(
         {
             info!("all connections lost, returning ConnectionLost for reconnect");
             return Ok(RunResult::ConnectionLost);
+        }
+
+        // Track idle iterations for busy-poll → epoll fallback.
+        if *in_flight_batches > 0 {
+            idle_iters = 0;
+        } else {
+            idle_iters = idle_iters.saturating_add(1);
         }
     }
 }
