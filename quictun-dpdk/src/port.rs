@@ -309,10 +309,13 @@ pub fn configure_port_dispatcher(
         }
     }
 
-    // Enable promiscuous mode.
+    // Enable promiscuous mode (non-fatal: virtio-user doesn't support it).
     let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
     if ret != 0 {
-        bail!("rte_eth_promiscuous_enable failed: {}", dpdk_strerror(-ret));
+        tracing::warn!(
+            port = port_id,
+            "rte_eth_promiscuous_enable not supported (ok for inner ports)"
+        );
     }
 
     // Start the port.

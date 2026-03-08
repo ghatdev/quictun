@@ -422,12 +422,73 @@ pub fn run_router(
             }
         }
 
-        // ── Poll for completed handshakes → register connections ──
-        let drive_result = multi_state.poll_handshakes();
+        // ── Poll for completed handshakes (skip when no handshakes in progress) ──
+        if !multi_state.handshakes.is_empty() {
+            let drive_result = multi_state.poll_handshakes();
 
-        for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                // Drain final handshake transmits.
+            for ch in drive_result.completed {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                    // Drain final handshake transmits.
+                    drain_handshake_transmits(
+                        &mut hs.connection,
+                        now,
+                        outer_port_id,
+                        queue_id,
+                        mempool,
+                        identity,
+                        arp_table,
+                        &mut transmit_buf,
+                        &mut tx_pkts,
+                        &mut ip_id,
+                        checksum_mode,
+                    );
+
+                    let Some(resolved) = resolve_completed_handshake(
+                        &hs,
+                        conn_state,
+                        peers,
+                        identity,
+                        arp_table,
+                    ) else {
+                        continue;
+                    };
+
+                    tracing::info!(
+                        cid = hex::encode(&resolved.cid_bytes),
+                        tunnel_ip = %resolved.tunnel_ip,
+                        remote = %resolved.remote_addr,
+                        "router: connection established"
+                    );
+
+                    // Update routing table with actual CID.
+                    // Rebuild with real CID keys for all known peers.
+                    routing_table = RoutingTable::new(tunnel_ip, enable_nat);
+                    for p in peers {
+                        let key = if p.tunnel_ip == resolved.tunnel_ip {
+                            resolved.cid
+                        } else if let Some(&cid) = ip_to_cid.get(&p.tunnel_ip) {
+                            cid
+                        } else {
+                            u32::from(p.tunnel_ip) as u64
+                        };
+                        routing_table.add_peer_routes(key, &p.allowed_ips);
+                    }
+
+                    ip_to_cid.insert(resolved.tunnel_ip, resolved.cid);
+                    connections.insert(
+                        resolved.cid,
+                        ConnectionEntry {
+                            conn: resolved.conn,
+                            tunnel_ip: resolved.tunnel_ip,
+                            remote_addr: resolved.remote_addr,
+                            remote_mac: resolved.remote_mac,
+                        },
+                    );
+                }
+            }
+
+            // Drain handshake transmits for in-progress connections.
+            for hs in multi_state.handshakes.values_mut() {
                 drain_handshake_transmits(
                     &mut hs.connection,
                     now,
@@ -441,66 +502,7 @@ pub fn run_router(
                     &mut ip_id,
                     checksum_mode,
                 );
-
-                let Some(resolved) = resolve_completed_handshake(
-                    &hs,
-                    conn_state,
-                    peers,
-                    identity,
-                    arp_table,
-                ) else {
-                    continue;
-                };
-
-                tracing::info!(
-                    cid = hex::encode(&resolved.cid_bytes),
-                    tunnel_ip = %resolved.tunnel_ip,
-                    remote = %resolved.remote_addr,
-                    "router: connection established"
-                );
-
-                // Update routing table with actual CID.
-                // Rebuild with real CID keys for all known peers.
-                routing_table = RoutingTable::new(tunnel_ip, enable_nat);
-                for p in peers {
-                    let key = if p.tunnel_ip == resolved.tunnel_ip {
-                        resolved.cid
-                    } else if let Some(&cid) = ip_to_cid.get(&p.tunnel_ip) {
-                        cid
-                    } else {
-                        u32::from(p.tunnel_ip) as u64
-                    };
-                    routing_table.add_peer_routes(key, &p.allowed_ips);
-                }
-
-                ip_to_cid.insert(resolved.tunnel_ip, resolved.cid);
-                connections.insert(
-                    resolved.cid,
-                    ConnectionEntry {
-                        conn: resolved.conn,
-                        tunnel_ip: resolved.tunnel_ip,
-                        remote_addr: resolved.remote_addr,
-                        remote_mac: resolved.remote_mac,
-                    },
-                );
             }
-        }
-
-        // Drain handshake transmits for in-progress connections.
-        for hs in multi_state.handshakes.values_mut() {
-            drain_handshake_transmits(
-                &mut hs.connection,
-                now,
-                outer_port_id,
-                queue_id,
-                mempool,
-                identity,
-                arp_table,
-                &mut transmit_buf,
-                &mut tx_pkts,
-                &mut ip_id,
-                checksum_mode,
-            );
         }
 
         // ── Batch TX ──
@@ -1079,7 +1081,9 @@ pub fn run_router_dispatcher(
             break;
         }
 
-        now = Instant::now();
+        if !multi_state.handshakes.is_empty() {
+            now = Instant::now();
+        }
         let mut had_work = false;
 
         // ── NIC RX burst → classify and dispatch ──
@@ -1231,24 +1235,78 @@ pub fn run_router_dispatcher(
             had_work = true;
         }
 
-        // ── Drive handshakes ──
+        // Refresh `now` only when there was actual work.
+        if multi_state.handshakes.is_empty() && had_work {
+            now = Instant::now();
+        }
 
-        let drive_result = multi_state.poll_handshakes();
+        // ── Drive handshakes (skip when no handshakes in progress) ──
 
-        for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                let Some(resolved) =
-                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
-                else {
-                    continue;
-                };
+        if !multi_state.handshakes.is_empty() {
+            let drive_result = multi_state.poll_handshakes();
 
-                // Assign to least-loaded worker.
-                let worker_id = dispatch_table.least_loaded_worker();
-                dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
-                dispatch_table.add_route(resolved.tunnel_ip, worker_id);
+            for ch in drive_result.completed {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                    let Some(resolved) =
+                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                    else {
+                        continue;
+                    };
 
-                // Drain final handshake transmits.
+                    // Assign to least-loaded worker.
+                    let worker_id = dispatch_table.least_loaded_worker();
+                    dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
+                    dispatch_table.add_route(resolved.tunnel_ip, worker_id);
+
+                    // Drain final handshake transmits.
+                    drain_handshake_transmits(
+                        &mut hs.connection,
+                        now,
+                        outer_port_id,
+                        0,
+                        mempool,
+                        identity,
+                        arp_table,
+                        &mut transmit_buf,
+                        &mut tx_pkts,
+                        &mut ip_id,
+                        checksum_mode,
+                    );
+
+                    // Send AddRouterConnection to the assigned worker.
+                    if let Ok(mut ctrl) = workers[worker_id].control.lock() {
+                        ctrl.push(ControlMessage::AddRouterConnection {
+                            conn: resolved.conn,
+                            tunnel_ip: resolved.tunnel_ip,
+                            remote_addr: resolved.remote_addr,
+                            remote_mac: resolved.remote_mac,
+                            allowed_ips: resolved.allowed_ips.clone(),
+                        });
+                    }
+
+                    // Broadcast PeerAssignment to ALL workers.
+                    for w in workers {
+                        if let Ok(mut ctrl) = w.control.lock() {
+                            ctrl.push(ControlMessage::PeerAssignment {
+                                peer_cid: resolved.cid,
+                                tunnel_ip: resolved.tunnel_ip,
+                                worker_id,
+                                allowed_ips: resolved.allowed_ips.clone(),
+                            });
+                        }
+                    }
+
+                    tracing::info!(
+                        tunnel_ip = %resolved.tunnel_ip,
+                        worker = worker_id,
+                        cid = %hex::encode(&resolved.cid_bytes),
+                        "router: connection assigned to worker"
+                    );
+                }
+            }
+
+            // Drain handshake transmits for in-progress connections.
+            for hs in multi_state.handshakes.values_mut() {
                 drain_handshake_transmits(
                     &mut hs.connection,
                     now,
@@ -1262,61 +1320,14 @@ pub fn run_router_dispatcher(
                     &mut ip_id,
                     checksum_mode,
                 );
-
-                // Send AddRouterConnection to the assigned worker.
-                if let Ok(mut ctrl) = workers[worker_id].control.lock() {
-                    ctrl.push(ControlMessage::AddRouterConnection {
-                        conn: resolved.conn,
-                        tunnel_ip: resolved.tunnel_ip,
-                        remote_addr: resolved.remote_addr,
-                        remote_mac: resolved.remote_mac,
-                        allowed_ips: resolved.allowed_ips.clone(),
-                    });
-                }
-
-                // Broadcast PeerAssignment to ALL workers.
-                for w in workers {
-                    if let Ok(mut ctrl) = w.control.lock() {
-                        ctrl.push(ControlMessage::PeerAssignment {
-                            peer_cid: resolved.cid,
-                            tunnel_ip: resolved.tunnel_ip,
-                            worker_id,
-                            allowed_ips: resolved.allowed_ips.clone(),
-                        });
-                    }
-                }
-
-                tracing::info!(
-                    tunnel_ip = %resolved.tunnel_ip,
-                    worker = worker_id,
-                    cid = %hex::encode(&resolved.cid_bytes),
-                    "router: connection assigned to worker"
-                );
             }
-        }
 
-        // Drain handshake transmits for in-progress connections.
-        for hs in multi_state.handshakes.values_mut() {
-            drain_handshake_transmits(
-                &mut hs.connection,
-                now,
-                outer_port_id,
-                0,
-                mempool,
-                identity,
-                arp_table,
-                &mut transmit_buf,
-                &mut tx_pkts,
-                &mut ip_id,
-                checksum_mode,
-            );
-        }
-
-        // Handle timeouts.
-        for hs in multi_state.handshakes.values_mut() {
-            if let Some(t) = hs.connection.poll_timeout() {
-                if now >= t {
-                    hs.connection.handle_timeout(now);
+            // Handle timeouts.
+            for hs in multi_state.handshakes.values_mut() {
+                if let Some(t) = hs.connection.poll_timeout() {
+                    if now >= t {
+                        hs.connection.handle_timeout(now);
+                    }
                 }
             }
         }
@@ -2165,7 +2176,11 @@ pub fn run_router_pipeline_io(
             break;
         }
 
-        now = Instant::now();
+        // During handshake, quinn-proto needs accurate time every iteration.
+        // After all handshakes complete, skip clock_gettime (saves ~4% CPU).
+        if !multi_state.handshakes.is_empty() {
+            now = Instant::now();
+        }
         let mut had_work = false;
 
         // ── 1. NIC RX burst → classify and dispatch ──
@@ -2310,18 +2325,77 @@ pub fn run_router_pipeline_io(
             had_work = true;
         }
 
-        // ── 2. Drive handshakes ──
+        // Refresh `now` only when there was actual work (skip clock_gettime on idle polls).
+        if multi_state.handshakes.is_empty() && had_work {
+            now = Instant::now();
+        }
 
-        let drive_result = multi_state.poll_handshakes();
+        // ── 2. Drive handshakes (skip entirely when no handshakes in progress) ──
 
-        for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                let Some(resolved) =
-                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
-                else {
-                    continue;
-                };
+        if !multi_state.handshakes.is_empty() {
+            let drive_result = multi_state.poll_handshakes();
 
+            for ch in drive_result.completed {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                    let Some(resolved) =
+                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                    else {
+                        continue;
+                    };
+
+                    drain_handshake_transmits(
+                        &mut hs.connection,
+                        now,
+                        outer_port_id,
+                        0,
+                        mempool,
+                        identity,
+                        arp_table,
+                        &mut transmit_buf,
+                        &mut tx_pkts,
+                        &mut ip_id,
+                        checksum_mode,
+                    );
+
+                    // Convert to SharedConnectionState for pipeline workers.
+                    let shared = Arc::new(resolved.conn.into_shared());
+                    let cid = resolved.cid;
+
+                    // Broadcast to ALL workers.
+                    for worker in workers.iter() {
+                        if let Ok(mut ctrl) = worker.control.lock() {
+                            ctrl.push(RouterPipelineControlMessage::AddConnection {
+                                conn: Arc::clone(&shared),
+                                tunnel_ip: resolved.tunnel_ip,
+                                remote_addr: resolved.remote_addr,
+                                remote_mac: resolved.remote_mac,
+                                cid,
+                                allowed_ips: resolved.allowed_ips.clone(),
+                            });
+                        }
+                    }
+
+                    // Track on core 0 for ACK/keepalive/key rotation.
+                    connections.push(RouterPipelineIoConnection {
+                        conn: shared,
+                        tunnel_ip: resolved.tunnel_ip,
+                        remote_addr: resolved.remote_addr,
+                        remote_mac: resolved.remote_mac,
+                        cid,
+                    });
+
+                    tracing::info!(
+                        tunnel_ip = %resolved.tunnel_ip,
+                        remote = %resolved.remote_addr,
+                        cid = %hex::encode(&resolved.cid_bytes),
+                        n_workers,
+                        "router pipeline: connection broadcast to all workers"
+                    );
+                }
+            }
+
+            // Drain handshake transmits for in-progress connections.
+            for hs in multi_state.handshakes.values_mut() {
                 drain_handshake_transmits(
                     &mut hs.connection,
                     now,
@@ -2335,66 +2409,14 @@ pub fn run_router_pipeline_io(
                     &mut ip_id,
                     checksum_mode,
                 );
-
-                // Convert to SharedConnectionState for pipeline workers.
-                let shared = Arc::new(resolved.conn.into_shared());
-                let cid = resolved.cid;
-
-                // Broadcast to ALL workers.
-                for worker in workers.iter() {
-                    if let Ok(mut ctrl) = worker.control.lock() {
-                        ctrl.push(RouterPipelineControlMessage::AddConnection {
-                            conn: Arc::clone(&shared),
-                            tunnel_ip: resolved.tunnel_ip,
-                            remote_addr: resolved.remote_addr,
-                            remote_mac: resolved.remote_mac,
-                            cid,
-                            allowed_ips: resolved.allowed_ips.clone(),
-                        });
-                    }
-                }
-
-                // Track on core 0 for ACK/keepalive/key rotation.
-                connections.push(RouterPipelineIoConnection {
-                    conn: shared,
-                    tunnel_ip: resolved.tunnel_ip,
-                    remote_addr: resolved.remote_addr,
-                    remote_mac: resolved.remote_mac,
-                    cid,
-                });
-
-                tracing::info!(
-                    tunnel_ip = %resolved.tunnel_ip,
-                    remote = %resolved.remote_addr,
-                    cid = %hex::encode(&resolved.cid_bytes),
-                    n_workers,
-                    "router pipeline: connection broadcast to all workers"
-                );
             }
-        }
 
-        // Drain handshake transmits for in-progress connections.
-        for hs in multi_state.handshakes.values_mut() {
-            drain_handshake_transmits(
-                &mut hs.connection,
-                now,
-                outer_port_id,
-                0,
-                mempool,
-                identity,
-                arp_table,
-                &mut transmit_buf,
-                &mut tx_pkts,
-                &mut ip_id,
-                checksum_mode,
-            );
-        }
-
-        // Handle handshake timeouts.
-        for hs in multi_state.handshakes.values_mut() {
-            if let Some(t) = hs.connection.poll_timeout() {
-                if now >= t {
-                    hs.connection.handle_timeout(now);
+            // Handle handshake timeouts.
+            for hs in multi_state.handshakes.values_mut() {
+                if let Some(t) = hs.connection.poll_timeout() {
+                    if now >= t {
+                        hs.connection.handle_timeout(now);
+                    }
                 }
             }
         }

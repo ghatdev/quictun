@@ -1149,7 +1149,9 @@ pub fn run_dispatcher(
             break;
         }
 
-        now = Instant::now();
+        if !multi_state.handshakes.is_empty() {
+            now = Instant::now();
+        }
         let mut had_work = false;
 
         // ── 1. Outer RX burst → dispatch by CID or feed handshake ──
@@ -1322,24 +1324,65 @@ pub fn run_dispatcher(
             }
         }
 
-        // ── 4. Drive handshakes ──
+        // Refresh `now` only when there was actual work (skip clock_gettime on idle polls).
+        if multi_state.handshakes.is_empty() && had_work {
+            now = Instant::now();
+        }
 
-        let drive_result = multi_state.poll_handshakes();
+        // ── 4. Drive handshakes (skip entirely when no handshakes in progress) ──
 
-        for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                let Some(resolved) =
-                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
-                else {
-                    continue;
-                };
+        if !multi_state.handshakes.is_empty() {
+            let drive_result = multi_state.poll_handshakes();
 
-                // Assign to least-loaded worker.
-                let worker_id = dispatch_table.least_loaded_worker();
-                dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
-                dispatch_table.add_route(resolved.tunnel_ip, worker_id);
+            for ch in drive_result.completed {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                    let Some(resolved) =
+                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                    else {
+                        continue;
+                    };
 
-                // Drain final handshake transmits.
+                    // Assign to least-loaded worker.
+                    let worker_id = dispatch_table.least_loaded_worker();
+                    dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
+                    dispatch_table.add_route(resolved.tunnel_ip, worker_id);
+
+                    // Drain final handshake transmits.
+                    drain_handshake_transmits(
+                        &mut hs.connection,
+                        now,
+                        outer_port_id,
+                        0,
+                        mempool,
+                        identity,
+                        arp_table,
+                        &mut transmit_buf,
+                        &mut tx_pkts,
+                        &mut ip_id,
+                        checksum_mode,
+                    );
+
+                    // Send control message to worker.
+                    if let Ok(mut ctrl) = workers[worker_id].control.lock() {
+                        ctrl.push(ControlMessage::AddConnection {
+                            conn: resolved.conn,
+                            tunnel_ip: resolved.tunnel_ip,
+                            remote_addr: resolved.remote_addr,
+                            remote_mac: resolved.remote_mac,
+                        });
+                    }
+
+                    tracing::info!(
+                        tunnel_ip = %resolved.tunnel_ip,
+                        worker = worker_id,
+                        cid = %hex::encode(&resolved.cid_bytes),
+                        "connection assigned to worker"
+                    );
+                }
+            }
+
+            // Drain handshake transmits for in-progress connections.
+            for hs in multi_state.handshakes.values_mut() {
                 drain_handshake_transmits(
                     &mut hs.connection,
                     now,
@@ -1353,49 +1396,15 @@ pub fn run_dispatcher(
                     &mut ip_id,
                     checksum_mode,
                 );
-
-                // Send control message to worker.
-                if let Ok(mut ctrl) = workers[worker_id].control.lock() {
-                    ctrl.push(ControlMessage::AddConnection {
-                        conn: resolved.conn,
-                        tunnel_ip: resolved.tunnel_ip,
-                        remote_addr: resolved.remote_addr,
-                        remote_mac: resolved.remote_mac,
-                    });
-                }
-
-                tracing::info!(
-                    tunnel_ip = %resolved.tunnel_ip,
-                    worker = worker_id,
-                    cid = %hex::encode(&resolved.cid_bytes),
-                    "connection assigned to worker"
-                );
             }
-        }
 
-        // Drain handshake transmits for in-progress connections.
-        for hs in multi_state.handshakes.values_mut() {
-            drain_handshake_transmits(
-                &mut hs.connection,
-                now,
-                outer_port_id,
-                0,
-                mempool,
-                identity,
-                arp_table,
-                &mut transmit_buf,
-                &mut tx_pkts,
-                &mut ip_id,
-                checksum_mode,
-            );
-        }
-
-        // Handle timeouts.
-        for hs in multi_state.handshakes.values_mut() {
-            let timeout = hs.connection.poll_timeout();
-            if let Some(t) = timeout {
-                if now >= t {
-                    hs.connection.handle_timeout(now);
+            // Handle timeouts.
+            for hs in multi_state.handshakes.values_mut() {
+                let timeout = hs.connection.poll_timeout();
+                if let Some(t) = timeout {
+                    if now >= t {
+                        hs.connection.handle_timeout(now);
+                    }
                 }
             }
         }
@@ -1887,7 +1896,7 @@ pub fn run_pipeline_io(
     let mut rx_pkts: u64 = 0;
     let mut tx_pkts: u64 = 0;
     let mut inner_rx_pkts: u64 = 0;
-    let mut inner_tx_pkts: u64 = 0;
+    let mut inner_dispatch: u64 = 0;
     let mut dispatch_drop: u64 = 0;
     let mut last_stats = Instant::now();
 
@@ -1900,11 +1909,7 @@ pub fn run_pipeline_io(
     let mut delay_us: u32 = MIN_DELAY_US;
     let mut now = Instant::now();
 
-    // Reusable mbuf arrays for collecting TX from workers.
-    let mut inner_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
-    let mut outer_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
-
-    tracing::info!(n_workers, "pipeline I/O started on core 0");
+    tracing::info!(n_workers, "pipeline I/O started on core 0 (workers TX directly)");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -1912,7 +1917,11 @@ pub fn run_pipeline_io(
             break;
         }
 
-        now = Instant::now();
+        // During handshake, quinn-proto needs accurate time every iteration.
+        // After all handshakes complete, skip clock_gettime (saves ~4% CPU).
+        if !multi_state.handshakes.is_empty() {
+            now = Instant::now();
+        }
         let mut had_work = false;
 
         // ── 1. Outer RX burst → classify → round-robin to workers or handshake ──
@@ -2022,7 +2031,9 @@ pub fn run_pipeline_io(
                     let worker_id = rr_encrypt % n_workers;
                     rr_encrypt = rr_encrypt.wrapping_add(1);
                     let raw = mbuf.into_raw();
-                    if !workers[worker_id].encrypt_rx.enqueue(raw) {
+                    if workers[worker_id].encrypt_rx.enqueue(raw) {
+                        inner_dispatch += 1;
+                    } else {
                         unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                         dispatch_drop += 1;
                     }
@@ -2056,57 +2067,78 @@ pub fn run_pipeline_io(
             had_work = true;
         }
 
-        // ── 3. Drain worker inner_tx rings → inner port TX ──
+        // Workers TX directly on their own queues — no drain needed on core 0.
 
-        for worker in workers {
-            let nb = worker.inner_tx.dequeue_burst(&mut inner_tx_collect);
-            if nb > 0 {
-                had_work = true;
-                let sent = port::tx_burst(
-                    inner.port_id,
-                    0,
-                    &mut inner_tx_collect[..nb as usize],
-                    nb as u16,
-                );
-                inner_tx_pkts += sent as u64;
-                for j in sent as usize..nb as usize {
-                    unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_collect[j]) };
-                }
-            }
+        // Refresh `now` only when there was actual work (skip clock_gettime on idle polls).
+        if multi_state.handshakes.is_empty() && had_work {
+            now = Instant::now();
         }
 
-        // ── 3b. Drain worker outer_tx rings → outer port TX ──
+        // ── 4. Drive handshakes (skip entirely when no handshakes in progress) ──
 
-        for worker in workers {
-            let nb = worker.outer_tx.dequeue_burst(&mut outer_tx_collect);
-            if nb > 0 {
-                had_work = true;
-                let sent = port::tx_burst(
-                    outer_port_id,
-                    0,
-                    &mut outer_tx_collect[..nb as usize],
-                    nb as u16,
-                );
-                tx_pkts += sent as u64;
-                for j in sent as usize..nb as usize {
-                    unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_collect[j]) };
+        if !multi_state.handshakes.is_empty() {
+            let drive_result = multi_state.poll_handshakes();
+
+            for ch in drive_result.completed {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+                    let Some(resolved) =
+                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                    else {
+                        continue;
+                    };
+
+                    // Drain final handshake transmits.
+                    drain_handshake_transmits(
+                        &mut hs.connection,
+                        now,
+                        outer_port_id,
+                        0,
+                        mempool,
+                        identity,
+                        arp_table,
+                        &mut transmit_buf,
+                        &mut tx_pkts,
+                        &mut ip_id,
+                        checksum_mode,
+                    );
+
+                    // Convert to SharedConnectionState for pipeline workers.
+                    let shared = Arc::new(resolved.conn.into_shared());
+
+                    // Broadcast to ALL workers.
+                    for worker in workers.iter() {
+                        if let Ok(mut ctrl) = worker.control.lock() {
+                            ctrl.push(PipelineControlMessage::AddConnection {
+                                conn: Arc::clone(&shared),
+                                tunnel_ip: resolved.tunnel_ip,
+                                remote_addr: resolved.remote_addr,
+                                remote_mac: resolved.remote_mac,
+                                cid: resolved.cid,
+                            });
+                        }
+                    }
+
+                    // Track on core 0 for ACK/keepalive/key rotation.
+                    connections.push(PipelineIoConnection {
+                        conn: shared,
+                        tunnel_ip: resolved.tunnel_ip,
+                        remote_addr: resolved.remote_addr,
+                        remote_mac: resolved.remote_mac,
+                        cid: resolved.cid,
+                    });
+
+                    tracing::info!(
+                        tunnel_ip = %resolved.tunnel_ip,
+                        remote = %resolved.remote_addr,
+                        cid = %hex::encode(&resolved.cid_bytes),
+                        n_workers,
+                        "pipeline: connection broadcast to all workers"
+                    );
                 }
             }
-        }
 
-        // ── 4. Drive handshakes ──
-
-        let drive_result = multi_state.poll_handshakes();
-
-        for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                let Some(resolved) =
-                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
-                else {
-                    continue;
-                };
-
-                // Drain final handshake transmits.
+            // Drain handshake transmits for in-progress connections.
+            for hs in multi_state.handshakes.values_mut() {
                 drain_handshake_transmits(
                     &mut hs.connection,
                     now,
@@ -2120,64 +2152,14 @@ pub fn run_pipeline_io(
                     &mut ip_id,
                     checksum_mode,
                 );
-
-                // Convert to SharedConnectionState for pipeline workers.
-                let shared = Arc::new(resolved.conn.into_shared());
-
-                // Broadcast to ALL workers.
-                for worker in workers.iter() {
-                    if let Ok(mut ctrl) = worker.control.lock() {
-                        ctrl.push(PipelineControlMessage::AddConnection {
-                            conn: Arc::clone(&shared),
-                            tunnel_ip: resolved.tunnel_ip,
-                            remote_addr: resolved.remote_addr,
-                            remote_mac: resolved.remote_mac,
-                            cid: resolved.cid,
-                        });
-                    }
-                }
-
-                // Track on core 0 for ACK/keepalive/key rotation.
-                connections.push(PipelineIoConnection {
-                    conn: shared,
-                    tunnel_ip: resolved.tunnel_ip,
-                    remote_addr: resolved.remote_addr,
-                    remote_mac: resolved.remote_mac,
-                    cid: resolved.cid,
-                });
-
-                tracing::info!(
-                    tunnel_ip = %resolved.tunnel_ip,
-                    remote = %resolved.remote_addr,
-                    cid = %hex::encode(&resolved.cid_bytes),
-                    n_workers,
-                    "pipeline: connection broadcast to all workers"
-                );
             }
-        }
 
-        // Drain handshake transmits for in-progress connections.
-        for hs in multi_state.handshakes.values_mut() {
-            drain_handshake_transmits(
-                &mut hs.connection,
-                now,
-                outer_port_id,
-                0,
-                mempool,
-                identity,
-                arp_table,
-                &mut transmit_buf,
-                &mut tx_pkts,
-                &mut ip_id,
-                checksum_mode,
-            );
-        }
-
-        // Handle handshake timeouts.
-        for hs in multi_state.handshakes.values_mut() {
-            if let Some(t) = hs.connection.poll_timeout() {
-                if now >= t {
-                    hs.connection.handle_timeout(now);
+            // Handle handshake timeouts.
+            for hs in multi_state.handshakes.values_mut() {
+                if let Some(t) = hs.connection.poll_timeout() {
+                    if now >= t {
+                        hs.connection.handle_timeout(now);
+                    }
                 }
             }
         }
@@ -2308,7 +2290,7 @@ pub fn run_pipeline_io(
                 rx_pkts,
                 tx_pkts,
                 inner_rx_pkts,
-                inner_tx_pkts,
+                inner_dispatch,
                 dispatch_drop,
                 connections = connections.len(),
                 handshakes = multi_state.handshakes.len(),
@@ -2339,11 +2321,15 @@ pub fn run_pipeline_io(
 ///
 /// Workers share `Arc<SharedConnectionState>` for all connections.
 /// - `decrypt_rx`: dequeue outer QUIC packets, decrypt in-place, build inner
-///   frames, enqueue to `inner_tx` for core 0 to send to TAP.
+///   frames, TX directly to inner port on the worker's own TX queue.
 /// - `encrypt_rx`: dequeue inner IP packets, encrypt via TxState, TX directly
 ///   to outer NIC on the worker's own TX queue.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pipeline_worker(
+    outer_port_id: u16,
+    inner_port_id: u16,
+    outer_tx_queue: u16,
+    inner_tx_queue: u16,
     mempool: *mut ffi::rte_mempool,
     rings: &PipelineRings,
     inner_eth_hdr: &InnerEthHeader,
@@ -2495,10 +2481,11 @@ pub fn run_pipeline_worker(
             had_work = true;
         }
 
-        // Enqueue inner TX mbufs back to core 0 via ring.
+        // TX inner frames directly to inner port on this worker's queue.
         if !inner_tx_mbufs.is_empty() {
-            let enqueued = rings.inner_tx.enqueue_burst(&inner_tx_mbufs);
-            for j in enqueued as usize..inner_tx_mbufs.len() {
+            let nb_tx = inner_tx_mbufs.len() as u16;
+            let sent = port::tx_burst(inner_port_id, inner_tx_queue, &mut inner_tx_mbufs, nb_tx);
+            for j in sent as usize..inner_tx_mbufs.len() {
                 unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_mbufs[j]) };
             }
         }
@@ -2589,10 +2576,11 @@ pub fn run_pipeline_worker(
             had_work = true;
         }
 
-        // Enqueue encrypted packets to outer_tx ring for core 0 to TX.
+        // TX encrypted packets directly to outer port on this worker's queue.
         if !outer_tx_mbufs.is_empty() {
-            let enqueued = rings.outer_tx.enqueue_burst(&outer_tx_mbufs);
-            for j in enqueued as usize..outer_tx_mbufs.len() {
+            let nb_tx = outer_tx_mbufs.len() as u16;
+            let sent = port::tx_burst(outer_port_id, outer_tx_queue, &mut outer_tx_mbufs, nb_tx);
+            for j in sent as usize..outer_tx_mbufs.len() {
                 unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_mbufs[j]) };
             }
         }
