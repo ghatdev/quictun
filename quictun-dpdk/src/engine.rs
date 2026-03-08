@@ -189,6 +189,10 @@ pub fn run(
     let mut delay_us: u32 = MIN_DELAY_US;
     let mut now = Instant::now();
 
+    // Rate-limited stats timer: only call Instant::now() every 32768 busy iterations.
+    // clock_gettime + duration_since was ~12% CPU at 13 Gbps for a 2-second stats timer.
+    let mut stats_poll_counter: u32 = 0;
+
     // Pre-allocated mbuf vectors for batched TX (reused across loop iterations).
     let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
     let mut outer_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
@@ -326,36 +330,65 @@ pub fn run(
                         continue;
                     };
 
-                    match entry.conn.decrypt_packet_in_place(
-                        &mut data[payload_offset..payload_offset + payload_len],
-                    ) {
-                        Ok(decrypted) => {
-                            // Update peer address on every authenticated packet
-                            // (supports QUIC connection migration / roaming).
-                            entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                            entry.remote_mac = src_mac;
+                    // Decrypt and extract datagram info while data borrow is active.
+                    let decrypt_result = {
+                        match entry.conn.decrypt_packet_in_place(
+                            &mut data[payload_offset..payload_offset + payload_len],
+                        ) {
+                            Ok(decrypted) => {
+                                entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
+                                entry.remote_mac = src_mac;
 
-                            if let Some(ref ack) = decrypted.ack {
-                                entry.conn.process_ack(ack);
-                            }
-                            for range in &decrypted.datagrams {
-                                let abs_start = payload_offset + range.start;
-                                let abs_end = payload_offset + range.end;
-                                let datagram_len = abs_end - abs_start;
-                                let frame_len = ETH_HLEN + datagram_len;
-                                if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
-                                    if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
-                                        buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
-                                        buf[ETH_HLEN..frame_len]
-                                            .copy_from_slice(&data[abs_start..abs_end]);
-                                        inner_tx_mbufs.push(out_mbuf.into_raw());
-                                        inner_tx += 1;
+                                if let Some(ref ack) = decrypted.ack {
+                                    entry.conn.process_ack(ack);
+                                }
+
+                                if decrypted.datagrams.len() == 1 {
+                                    // Single datagram: prepare for zero-copy.
+                                    let range = &decrypted.datagrams[0];
+                                    let abs_start = payload_offset + range.start;
+                                    let datagram_len = range.end - range.start;
+                                    Some((abs_start, datagram_len))
+                                } else {
+                                    // Multiple datagrams (rare): alloc+copy each.
+                                    for range in &decrypted.datagrams {
+                                        let abs_start = payload_offset + range.start;
+                                        let abs_end = payload_offset + range.end;
+                                        let datagram_len = abs_end - abs_start;
+                                        let frame_len = ETH_HLEN + datagram_len;
+                                        if let Ok(mut out_mbuf) = Mbuf::alloc(mempool) {
+                                            if let Ok(buf) = out_mbuf.alloc_space(frame_len as u16) {
+                                                buf[..ETH_HLEN].copy_from_slice(&inner.eth_hdr.bytes);
+                                                buf[ETH_HLEN..frame_len]
+                                                    .copy_from_slice(&data[abs_start..abs_end]);
+                                                inner_tx_mbufs.push(out_mbuf.into_raw());
+                                                inner_tx += 1;
+                                            }
+                                        }
                                     }
+                                    None
                                 }
                             }
+                            Err(_e) => {
+                                decrypt_fail += 1;
+                                None
+                            }
                         }
-                        Err(_e) => {
-                            decrypt_fail += 1;
+                    };
+                    // data borrow ends here — mbuf can be reused.
+
+                    if let Some((abs_start, datagram_len)) = decrypt_result {
+                        // Zero-copy: adjust original mbuf to inner frame layout.
+                        // Strip outer headers (ETH+IP+UDP+QUIC) before datagram,
+                        // keep room for 14-byte inner ETH header, trim AEAD tag.
+                        let adj_len = (abs_start - ETH_HLEN) as u16;
+                        let new_total = (ETH_HLEN + datagram_len) as u16;
+                        if mbuf.adj(adj_len).is_some() {
+                            mbuf.data_mut()[..ETH_HLEN]
+                                .copy_from_slice(&inner.eth_hdr.bytes);
+                            mbuf.truncate(new_total);
+                            inner_tx_mbufs.push(mbuf.into_raw());
+                            inner_tx += 1;
                         }
                     }
                 }
@@ -689,30 +722,33 @@ pub fn run(
             &mut tx_pkts,
         )?;
 
-        // ── Refresh `now` when traffic is present ─────────────────────
-        // During handshake: refreshed unconditionally at loop top (quinn-proto needs it).
-        // After handshake: skip clock_gettime on empty polls (saves ~4% CPU at 8 Gbps).
-        if multi_state.handshakes.is_empty() && (nb_rx > 0 || nb > 0) {
-            now = Instant::now();
-        }
-
-        // ── Periodic stats ───────────────────────────────────────────
-
-        if now.duration_since(last_stats).as_secs() >= 2 {
-            tracing::info!(
-                rx_pkts,
-                tx_pkts,
-                quic_rx,
-                inner_rx,
-                inner_tx,
-                inner_tx_drop,
-                outer_tx_drop,
-                decrypt_fail,
-                connections = connections.len(),
-                handshakes = multi_state.handshakes.len(),
-                "dpdk engine stats"
-            );
-            last_stats = now;
+        // ── Periodic stats (rate-limited clock) ─────────────────────
+        // During handshake: `now` refreshed at loop top (quinn-proto needs it every iteration).
+        // After handshake: only call Instant::now() every 32768 busy iterations to avoid
+        // wasting ~12% CPU on clock_gettime + duration_since for a 2-second timer.
+        if !multi_state.handshakes.is_empty() || (nb_rx > 0 || nb > 0) {
+            stats_poll_counter = stats_poll_counter.wrapping_add(1);
+            if !multi_state.handshakes.is_empty() || stats_poll_counter & 0x7FFF == 0 {
+                if multi_state.handshakes.is_empty() {
+                    now = Instant::now();
+                }
+                if now.duration_since(last_stats).as_secs() >= 2 {
+                    tracing::info!(
+                        rx_pkts,
+                        tx_pkts,
+                        quic_rx,
+                        inner_rx,
+                        inner_tx,
+                        inner_tx_drop,
+                        outer_tx_drop,
+                        decrypt_fail,
+                        connections = connections.len(),
+                        handshakes = multi_state.handshakes.len(),
+                        "dpdk engine stats"
+                    );
+                    last_stats = now;
+                }
+            }
         }
 
         // ── Adaptive polling: backoff on empty polls ──────────────────

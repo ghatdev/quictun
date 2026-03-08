@@ -124,6 +124,19 @@ impl Mbuf {
         unsafe { ffi::shim_rte_pktmbuf_data_len(self.raw) as usize }
     }
 
+    /// Remove `len` bytes from the beginning of the mbuf's data.
+    ///
+    /// Advances the data pointer forward and decreases data_len by `len`.
+    /// Returns the new data pointer, or `None` if `len > data_len`.
+    pub fn adj(&mut self, len: u16) -> Option<*mut u8> {
+        let ptr = unsafe { ffi::shim_rte_pktmbuf_adj(self.raw, len) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr as *mut u8)
+        }
+    }
+
     /// Truncate the mbuf's data to exactly `new_len` bytes.
     ///
     /// Trims bytes from the end. `new_len` must be ≤ current data_len.
