@@ -768,13 +768,11 @@ fn handle_decrypt_completion(
     };
 
     let mut close_received = false;
-    let mut rotation_committed = false;
+    let mut has_key_mismatch = false;
 
-    // Process results. We iterate by index to allow mutable access to batch.packets
-    // for KeyPhaseMismatch retry.
-    let result_count = batch.results.len();
-    for i in 0..result_count {
-        match &batch.results[i] {
+    // Pass 1: process Ok results (immutable batch access, no clones).
+    for (i, result) in batch.results.iter().enumerate() {
+        match result {
             DecryptOutcome::Ok {
                 pn,
                 key_phase,
@@ -782,36 +780,27 @@ fn handle_decrypt_completion(
                 ack,
                 close_received: pkt_close,
             } => {
-                let pn = *pn;
-                let key_phase = *key_phase;
-                let datagrams = datagrams.clone();
-                let ack_largest = ack.as_ref().map(|a| a.largest_acked);
-                let pkt_close = *pkt_close;
-
                 // Key phase check (sequential, on I/O thread).
-                // Skip if rotation was already committed in this batch.
-                if !rotation_committed {
-                    entry.rx.check_key_phase(key_phase, &entry.key_update, &entry.tx);
-                }
+                entry.rx.check_key_phase(*key_phase, &entry.key_update, &entry.tx);
 
                 // Replay check (sequential).
-                if !entry.rx.accept_decrypted_pn(pn) {
+                if !entry.rx.accept_decrypted_pn(*pn) {
                     continue; // Duplicate.
                 }
 
                 entry.last_rx = Instant::now();
 
                 // Process ACK.
-                if let Some(largest_acked) = ack_largest {
-                    entry.tx.update_largest_acked(largest_acked);
+                if let Some(ack_frame) = ack {
+                    entry.tx.update_largest_acked(ack_frame.largest_acked);
                 }
 
-                if pkt_close {
+                if *pkt_close {
                     close_received = true;
                 }
 
                 // Write datagrams to TUN.
-                for range in &datagrams {
+                for range in datagrams {
                     let datagram = &batch.packets[i][range.clone()];
                     if datagram.len() < 20 {
                         continue;
@@ -825,12 +814,22 @@ fn handle_decrypt_completion(
                     write_to_tun(tun, datagram, tun_write_pending, #[cfg(target_os = "linux")] offload);
                 }
             }
-            DecryptOutcome::KeyPhaseMismatch { hdr } => {
+            DecryptOutcome::KeyPhaseMismatch { .. } => {
+                has_key_mismatch = true;
+            }
+            DecryptOutcome::Failed => {}
+        }
+    }
+
+    // Pass 2: handle key phase mismatches (rare — once per 7M packets).
+    // Needs mutable batch.packets access for AEAD retry.
+    if has_key_mismatch {
+        for i in 0..batch.results.len() {
+            if let DecryptOutcome::KeyPhaseMismatch { hdr } = &batch.results[i] {
                 let hdr = *hdr;
 
                 // Commit key rotation on I/O thread (sequential, idempotent).
                 entry.rx.check_key_phase(hdr.key_phase, &entry.key_update, &entry.tx);
-                rotation_committed = true;
 
                 // Retry AEAD with rotated key.
                 let packet = &mut batch.packets[i];
@@ -869,9 +868,6 @@ fn handle_decrypt_completion(
                         debug!("key rotation: retry decrypt failed, dropping packet");
                     }
                 }
-            }
-            DecryptOutcome::Failed => {
-                // AEAD or header unprotect failed — silently drop.
             }
         }
     }
