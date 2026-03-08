@@ -421,7 +421,7 @@ pub fn run_router(
         let drive_result = multi_state.poll_handshakes();
 
         for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+            if let Some((mut hs, conn_state, local_cids)) = multi_state.extract_connection(ch) {
                 // Drain final handshake transmits.
                 drain_handshake_transmits(
                     &mut hs.connection,
@@ -440,6 +440,7 @@ pub fn run_router(
                 let Some(resolved) = resolve_completed_handshake(
                     &hs,
                     conn_state,
+                    &local_cids,
                     peers,
                     identity,
                     arp_table,
@@ -1231,17 +1232,19 @@ pub fn run_router_dispatcher(
         let drive_result = multi_state.poll_handshakes();
 
         for ch in drive_result.completed {
-            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
+            if let Some((mut hs, conn_state, local_cids)) = multi_state.extract_connection(ch) {
                 let Some(resolved) =
-                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
+                    resolve_completed_handshake(&hs, conn_state, &local_cids, peers, identity, arp_table)
                 else {
                     continue;
                 };
 
                 // Assign to least-loaded worker.
                 let worker_id = dispatch_table.least_loaded_worker();
-                // Register the quictun-quic CID (not the quinn-proto handshake CID).
-                dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
+                // Register ALL local CIDs in dispatch table.
+                for cid in &local_cids {
+                    dispatch_table.register_cid_raw(cid, worker_id);
+                }
                 dispatch_table.add_route(resolved.tunnel_ip, worker_id);
 
                 // Drain final handshake transmits.

@@ -2,19 +2,19 @@
 //!
 //! Architecture:
 //!   I/O thread (dispatcher):
-//!     - recvmmsg → round-robin dispatch raw packets to workers
-//!     - Drain encrypt results → GSO send
+//!     - recvmmsg → batch dispatch raw packets to workers
 //!     - Handshakes, ACK timer, keepalives, timeouts
 //!
 //!   N worker threads (each has own TUN queue):
-//!     - Receive raw packets → SharedConnectionState::decrypt_in_place → GRO → TUN write
-//!     - TUN read → TxState::encrypt_datagram → return encrypted to dispatcher for GSO
+//!     - Receive raw batch → SharedConnectionState::decrypt_in_place → GRO → TUN write
+//!     - TUN read → TxState::encrypt_datagram → UDP send directly
 //!
 //! Key differences from pipeline v1:
 //!   - Workers do full decrypt + replay + TUN write (not just AEAD)
 //!   - Multi-queue TUN: each worker writes to own queue
 //!   - SharedConnectionState: any worker can decrypt
 //!   - I/O thread freed from replay check + TUN write overhead
+//!   - Batched dispatch: one channel message per recvmmsg batch (not per packet)
 //!
 //! Selected via `pipeline = true` + `percore = true` + `threads >= 2` in `[engine]`.
 
@@ -30,7 +30,6 @@ use crossbeam_channel::{Receiver, Sender};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll};
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
 use quictun_core::peer::{self, PeerConfig};
@@ -43,24 +42,43 @@ use crate::engine::{
     TOKEN_UDP, create_signal_pipe, create_udp_socket, drain_signal_pipe, drain_transmits,
     install_signal_handler, send_responses, set_nonblocking,
 };
-#[cfg(target_os = "linux")]
-use crate::engine::flush_gso_sync;
 use quictun_tun::TunOptions;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-/// Raw packet dispatched from I/O thread to a worker.
-struct RawPacket {
-    data: Vec<u8>,
-    len: usize,
-    cid_key: u64,
+/// Batch of raw packets dispatched from I/O thread to a worker.
+///
+/// Uses a contiguous slab buffer instead of per-packet Vec allocation.
+/// Recycled via the batch pool channel for zero steady-state allocation.
+struct RawBatch {
+    /// Contiguous buffer holding all packet data.
+    slab: Vec<u8>,
+    /// (offset, length, cid_key) for each packet in the slab.
+    packets: Vec<(usize, usize, u64)>,
 }
 
-/// Encrypted packet returned from worker to I/O thread for GSO send.
-struct EncryptedPacket {
-    data: Vec<u8>,
-    len: usize,
-    remote_addr: SocketAddr,
+impl RawBatch {
+    fn with_capacity(max_packets: usize) -> Self {
+        Self {
+            slab: Vec::with_capacity(max_packets * MAX_PACKET),
+            packets: Vec::with_capacity(max_packets),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.slab.clear();
+        self.packets.clear();
+    }
+
+    fn push(&mut self, data: &[u8], cid_key: u64) {
+        let offset = self.slab.len();
+        self.slab.extend_from_slice(data);
+        self.packets.push((offset, data.len(), cid_key));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
 }
 
 /// Shared connection info passed to workers.
@@ -188,7 +206,7 @@ pub fn run_pipeline2(
         drain_transmits(&udp_socket, &mut multi_state)?;
 
         for ch in result.completed {
-            let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+            let Some((hs, conn_state, local_cids)) = multi_state.extract_connection(ch) else {
                 continue;
             };
             let matched_peer = if config.peers.len() == 1 {
@@ -208,13 +226,14 @@ pub fn run_pipeline2(
             let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
             let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
             let cid_key = cid_to_u64(&cid_bytes);
+            let _ = &local_cids; // All local CIDs available; primary used for connection table.
             let shared = Arc::new(conn_state.into_shared());
             let last_rx_epoch = Arc::new(AtomicU64::new(epoch_millis()));
 
             info!(
                 remote = %hs.remote_addr,
                 tunnel_ip = %tunnel_ip,
-                cid = %hex::encode(&cid_bytes),
+                local_cid = %hex::encode(&cid_bytes),
                 "connection established (pipeline v2)"
             );
 
@@ -263,42 +282,76 @@ pub fn run_pipeline2(
         .map(|(&k, v)| (k, Arc::clone(&v.last_rx_epoch)))
         .collect();
 
-    // 6. Create channels: dispatcher→workers (raw packets), workers→dispatcher (encrypted).
+    // 6. Create channels: dispatcher→workers (raw batches), workers→dispatcher (recycled batches).
     let channel_cap = config.channel_capacity;
-    let (raw_tx, raw_rx) = crossbeam_channel::bounded::<RawPacket>(channel_cap);
-    let (enc_tx, enc_rx) = crossbeam_channel::bounded::<EncryptedPacket>(channel_cap);
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<RawBatch>(channel_cap);
+    let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<RawBatch>(channel_cap);
+
+    // Pre-allocate batch pool.
+    let batch_size = config.batch_size;
+    for _ in 0..channel_cap {
+        let _ = recycle_tx.try_send(RawBatch::with_capacity(batch_size));
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // 7. Spawn workers + run dispatcher.
     let offload = config.offload;
-    let batch_size = config.batch_size;
     let gso_max_segments = config.gso_max_segments;
     let cid_len = config.cid_len;
+
+    // Pre-create TUN queues: worker 0 gets original fd, workers 1..N get clones.
+    let mut tun_queues: Vec<tun_rs::SyncDevice> = Vec::with_capacity(n_workers);
+    for i in 1..n_workers {
+        let q = tun.try_clone().unwrap_or_else(|e| {
+            panic!("TUN try_clone for worker {i} failed: {e}")
+        });
+        tun_queues.push(q);
+    }
 
     let result = std::thread::scope(|s| {
         let mut worker_handles = Vec::with_capacity(n_workers);
 
-        for i in 0..n_workers {
-            let raw_rx = raw_rx.clone();
-            let enc_tx = enc_tx.clone();
+        let udp_ref = &udp_socket;
+
+        // Worker 0 gets the original TUN fd.
+        {
+            let batch_rx = batch_rx.clone();
+            let recycle_tx = recycle_tx.clone();
             let shutdown_flag = Arc::clone(&shutdown);
             let conns = worker_conns.clone();
             let epochs = last_rx_epochs.clone();
-            let tun_queue = if n_workers > 1 {
-                tun.try_clone().expect("TUN try_clone failed")
-            } else {
-                // Single worker: reuse original TUN (no clone needed for single queue).
-                // Actually we need to clone for the worker thread. Let's always clone.
-                tun.try_clone().expect("TUN try_clone failed")
-            };
+            let handle = s.spawn(move || {
+                run_worker(
+                    0,
+                    batch_rx,
+                    recycle_tx,
+                    udp_ref,
+                    &tun,
+                    conns,
+                    epochs,
+                    offload,
+                    gso_max_segments,
+                    shutdown_flag,
+                )
+            });
+            worker_handles.push(handle);
+        }
 
+        // Workers 1..N get cloned queues.
+        for (i, tun_queue) in tun_queues.iter().enumerate() {
+            let batch_rx = batch_rx.clone();
+            let recycle_tx = recycle_tx.clone();
+            let shutdown_flag = Arc::clone(&shutdown);
+            let conns = worker_conns.clone();
+            let epochs = last_rx_epochs.clone();
             let handle = s.spawn(move || {
                 set_nonblocking(tun_queue.as_raw_fd()).expect("set TUN nonblocking");
                 run_worker(
-                    i,
-                    raw_rx,
-                    enc_tx,
+                    i + 1,
+                    batch_rx,
+                    recycle_tx,
+                    udp_ref,
                     tun_queue,
                     conns,
                     epochs,
@@ -309,8 +362,8 @@ pub fn run_pipeline2(
             });
             worker_handles.push(handle);
         }
-        drop(raw_rx);
-        drop(enc_tx);
+        drop(batch_rx);
+        drop(recycle_tx);
 
         // Dispatcher loop.
         let io_result = run_dispatcher(
@@ -319,15 +372,14 @@ pub fn run_pipeline2(
             sig_read_fd,
             &mut events,
             &mut connections,
-            &ip_to_cid,
             &config,
             is_connector,
-            &raw_tx,
-            &enc_rx,
+            &batch_tx,
+            &recycle_rx,
             cid_len,
         );
 
-        drop(raw_tx);
+        drop(batch_tx);
         shutdown.store(true, Ordering::Release);
 
         for handle in worker_handles {
@@ -349,11 +401,10 @@ fn run_dispatcher(
     sig_read_fd: i32,
     events: &mut Events,
     connections: &mut FxHashMap<u64, DispatchConnEntry>,
-    _ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
     config: &NetConfig,
     is_connector: bool,
-    raw_tx: &Sender<RawPacket>,
-    enc_rx: &Receiver<EncryptedPacket>,
+    batch_tx: &Sender<RawBatch>,
+    recycle_rx: &Receiver<RawBatch>,
     cid_len: usize,
 ) -> Result<RunResult> {
     let ack_timer_interval = Duration::from_millis(config.ack_timer_ms as u64);
@@ -373,20 +424,17 @@ fn run_dispatcher(
     let mut recv_work = quictun_core::batch_io::RecvMmsgWork::new(batch_size);
 
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
-    let mut had_connection = true; // We already have connection(s).
+    let had_connection = true; // We already have connection(s).
 
     loop {
-        // Compute timeout.
+        // Compute timeout. Use short timeout to keep dispatch responsive.
         let mut timeout = Duration::from_secs(5);
         for entry in connections.values() {
             let ka_rem = entry.keepalive_interval.saturating_sub(entry.last_tx.elapsed());
             timeout = timeout.min(ka_rem);
         }
         let ack_rem = next_ack_deadline.saturating_duration_since(Instant::now());
-        timeout = timeout.min(ack_rem).max(Duration::from_millis(1));
-
-        // Busy-poll: always check for encrypted results.
-        timeout = Duration::ZERO;
+        timeout = timeout.min(ack_rem).min(Duration::from_millis(1));
 
         match poll.poll(events, Some(timeout)) {
             Ok(()) => {}
@@ -416,10 +464,7 @@ fn run_dispatcher(
             return Ok(RunResult::Shutdown);
         }
 
-        // ── Drain encrypted results from workers → GSO send ──────
-        drain_encrypted(udp, enc_rx)?;
-
-        // ── UDP RX → dispatch to workers ─────────────────────────
+        // ── UDP RX → batch dispatch to workers ─────────────────────
         if udp_readable {
             #[cfg(target_os = "linux")]
             dispatch_udp_rx_linux(
@@ -431,12 +476,10 @@ fn run_dispatcher(
                 &mut recv_addrs,
                 &mut recv_work,
                 &mut response_buf,
-                raw_tx,
+                batch_tx,
+                recycle_rx,
             )?;
         }
-
-        // ── Drain encrypted again ────────────────────────────────
-        drain_encrypted(udp, enc_rx)?;
 
         // ── ACK timer ────────────────────────────────────────────
         if Instant::now() >= next_ack_deadline {
@@ -474,7 +517,7 @@ fn run_dispatcher(
     }
 }
 
-// ── Dispatch UDP RX ─────────────────────────────────────────────────────
+// ── Dispatch UDP RX (batched) ───────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
@@ -486,9 +529,16 @@ fn dispatch_udp_rx_linux(
     recv_lens: &mut [usize],
     recv_addrs: &mut [SocketAddr],
     recv_work: &mut quictun_core::batch_io::RecvMmsgWork,
-    response_buf: &mut Vec<u8>,
-    raw_tx: &Sender<RawPacket>,
+    _response_buf: &mut Vec<u8>,
+    batch_tx: &Sender<RawBatch>,
+    recycle_rx: &Receiver<RawBatch>,
 ) -> Result<()> {
+    // Get a batch from pool, or create new if pool empty.
+    let mut batch = recycle_rx
+        .try_recv()
+        .unwrap_or_else(|_| RawBatch::with_capacity(recv_bufs.len()));
+    batch.reset();
+
     loop {
         let max_batch = recv_bufs.len();
         let n_msgs = match quictun_core::batch_io::recvmmsg_batch(
@@ -499,9 +549,9 @@ fn dispatch_udp_rx_linux(
             max_batch,
             recv_work,
         ) {
-            Ok(0) => return Ok(()),
+            Ok(0) => break,
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e).context("recvmmsg failed"),
         };
 
@@ -511,7 +561,7 @@ fn dispatch_udp_rx_linux(
                 continue;
             }
 
-            // Skip handshake packets — already handled.
+            // Skip handshake packets.
             if recv_bufs[i][0] & 0x80 != 0 {
                 continue;
             }
@@ -525,31 +575,20 @@ fn dispatch_udp_rx_linux(
                 continue;
             }
 
-            // Send raw packet to worker (round-robin via crossbeam bounded channel).
-            let mut pkt_buf = vec![0u8; n];
-            pkt_buf.copy_from_slice(&recv_bufs[i][..n]);
-            let _ = raw_tx.try_send(RawPacket {
-                data: pkt_buf,
-                len: n,
-                cid_key,
-            });
+            batch.push(&recv_bufs[i][..n], cid_key);
         }
 
         if n_msgs < max_batch {
-            return Ok(());
+            break;
         }
     }
-}
 
-// ── Drain encrypted results → UDP send ──────────────────────────────────
-
-fn drain_encrypted(
-    udp: &std::net::UdpSocket,
-    enc_rx: &Receiver<EncryptedPacket>,
-) -> Result<()> {
-    while let Ok(pkt) = enc_rx.try_recv() {
-        let _ = udp.send_to(&pkt.data[..pkt.len], pkt.remote_addr);
+    if !batch.is_empty() {
+        // Non-blocking send; if channel full, drop the batch (backpressure).
+        let _ = batch_tx.try_send(batch);
     }
+    // Empty batch is dropped — next call will get one from pool or allocate.
+
     Ok(())
 }
 
@@ -558,9 +597,10 @@ fn drain_encrypted(
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     id: usize,
-    raw_rx: Receiver<RawPacket>,
-    enc_tx: Sender<EncryptedPacket>,
-    tun: tun_rs::SyncDevice,
+    batch_rx: Receiver<RawBatch>,
+    recycle_tx: Sender<RawBatch>,
+    udp: &std::net::UdpSocket,
+    tun: &tun_rs::SyncDevice,
     conns: Vec<Arc<SharedConn>>,
     last_rx_epochs: FxHashMap<u64, Arc<AtomicU64>>,
     offload: bool,
@@ -586,13 +626,6 @@ fn run_worker(
     } else {
         None
     };
-
-    // mio poll for TUN readability.
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(64);
-    let tun_raw_fd = tun.as_raw_fd();
-    poll.registry()
-        .register(&mut SourceFd(&tun_raw_fd), TOKEN_TUN, Interest::READABLE)?;
 
     // GRO TX pool for decrypt → TUN write.
     #[cfg(target_os = "linux")]
@@ -632,58 +665,64 @@ fn run_worker(
             break;
         }
 
-        // Non-blocking drain of raw packets from dispatcher.
-        let mut got_packets = false;
-        for _ in 0..256 {
-            match raw_rx.try_recv() {
-                Ok(mut pkt) => {
-                    got_packets = true;
-                    let conn = if let Some(sc) = single_conn.as_ref() {
-                        sc
-                    } else if let Some(c) = conn_map.get(&pkt.cid_key) {
-                        c
-                    } else {
-                        continue;
-                    };
+        // Try to receive a batch (non-blocking first).
+        let batch = match batch_rx.try_recv() {
+            Ok(b) => Some(b),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        };
 
-                    match conn.shared.decrypt_in_place(&mut pkt.data[..pkt.len]) {
-                        Ok(result) => {
-                            if let Some(epoch_ref) = last_rx_epochs.get(&pkt.cid_key) {
-                                epoch_ref.store(epoch_millis(), Ordering::Relaxed);
+        let got_batch = batch.is_some();
+
+        // Process batch if we got one.
+        if let Some(mut batch) = batch {
+            for &(offset, len, cid_key) in &batch.packets {
+                let conn = if let Some(sc) = single_conn.as_ref() {
+                    sc
+                } else if let Some(c) = conn_map.get(&cid_key) {
+                    c
+                } else {
+                    continue;
+                };
+
+                let pkt = &mut batch.slab[offset..offset + len];
+                match conn.shared.decrypt_in_place(pkt) {
+                    Ok(result) => {
+                        if let Some(epoch_ref) = last_rx_epochs.get(&cid_key) {
+                            epoch_ref.store(epoch_millis(), Ordering::Relaxed);
+                        }
+                        decrypt_count += 1;
+
+                        if decrypt_count & 0xFFFF == 0 {
+                            conn.shared.maybe_initiate_key_update(decrypt_count);
+                            decrypt_count = 0;
+                        }
+
+                        for datagram in &result.datagrams {
+                            let data = &pkt[datagram.start..datagram.end];
+                            if data.len() < 20 {
+                                continue;
                             }
-                            decrypt_count += 1;
-
-                            if decrypt_count & 0xFFFF == 0 {
-                                conn.shared.maybe_initiate_key_update(decrypt_count);
-                                decrypt_count = 0;
+                            let src_ip =
+                                Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+                            if !peer::is_allowed_source(&conn.allowed_ips, src_ip) {
+                                continue;
                             }
-
-                            for datagram in &result.datagrams {
-                                let data = &pkt.data[datagram.start..datagram.end];
-                                if data.len() < 20 {
-                                    continue;
-                                }
-                                let src_ip =
-                                    Ipv4Addr::new(data[12], data[13], data[14], data[15]);
-                                if !peer::is_allowed_source(&conn.allowed_ips, src_ip) {
-                                    continue;
-                                }
-                                if offload {
-                                    #[cfg(target_os = "linux")]
-                                    gro_tx_pool.push_datagram(data);
-                                } else {
-                                    let _ = tun.send(data);
-                                }
+                            if offload {
+                                #[cfg(target_os = "linux")]
+                                gro_tx_pool.push_datagram(data);
+                            } else {
+                                let _ = tun.send(data);
                             }
                         }
-                        Err(_) => {}
                     }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    return Ok(());
+                    Err(_) => {}
                 }
             }
+
+            // Recycle the batch back to the pool.
+            batch.reset();
+            let _ = recycle_tx.try_send(batch);
         }
 
         // Flush GRO to TUN.
@@ -695,48 +734,105 @@ fn run_worker(
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => {
-                        debug!(error = %e, "TUN send_multiple failed");
+                        debug!(worker = id, error = %e, "TUN send_multiple failed");
                     }
                 }
                 gro_tx_pool.reset();
             }
         }
 
-        // TUN RX (encrypt path) — poll with zero timeout to check readability.
-        match poll.poll(&mut events, Some(if got_packets { Duration::ZERO } else { Duration::from_millis(1) })) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("worker poll failed"),
+        // TUN RX (encrypt path) — non-blocking read, no mio poll needed.
+        #[cfg(target_os = "linux")]
+        if offload {
+            worker_tun_rx_offload(
+                tun,
+                &ip_map,
+                single_conn.as_ref(),
+                udp,
+                &mut tun_original_buf,
+                &mut tun_split_bufs,
+                &mut tun_split_sizes,
+                &mut encrypt_buf,
+            )?;
+        } else {
+            worker_tun_rx_simple(
+                tun,
+                &ip_map,
+                single_conn.as_ref(),
+                udp,
+                &mut encrypt_buf,
+            )?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            worker_tun_rx_simple(
+                tun,
+                &ip_map,
+                single_conn.as_ref(),
+                udp,
+                &mut encrypt_buf,
+            )?;
         }
 
-        let mut tun_readable = false;
-        for event in events.iter() {
-            if event.token() == TOKEN_TUN {
-                tun_readable = true;
-            }
-        }
+        // If no work happened, block-wait briefly on batch channel to avoid busy spin.
+        if !got_batch {
+            match batch_rx.recv_timeout(Duration::from_micros(100)) {
+                Ok(mut batch) => {
+                    // Process this batch inline.
+                    for &(offset, len, cid_key) in &batch.packets {
+                        let conn = if let Some(sc) = single_conn.as_ref() {
+                            sc
+                        } else if let Some(c) = conn_map.get(&cid_key) {
+                            c
+                        } else {
+                            continue;
+                        };
 
-        if tun_readable {
-            #[cfg(target_os = "linux")]
-            if offload {
-                worker_tun_rx_offload(
-                    &tun,
-                    &ip_map,
-                    single_conn.as_ref(),
-                    &enc_tx,
-                    &mut tun_original_buf,
-                    &mut tun_split_bufs,
-                    &mut tun_split_sizes,
-                    &mut encrypt_buf,
-                )?;
-            } else {
-                worker_tun_rx_simple(
-                    &tun,
-                    &ip_map,
-                    single_conn.as_ref(),
-                    &enc_tx,
-                    &mut encrypt_buf,
-                )?;
+                        let pkt = &mut batch.slab[offset..offset + len];
+                        match conn.shared.decrypt_in_place(pkt) {
+                            Ok(result) => {
+                                if let Some(epoch_ref) = last_rx_epochs.get(&cid_key) {
+                                    epoch_ref.store(epoch_millis(), Ordering::Relaxed);
+                                }
+                                decrypt_count += 1;
+                                if decrypt_count & 0xFFFF == 0 {
+                                    conn.shared.maybe_initiate_key_update(decrypt_count);
+                                    decrypt_count = 0;
+                                }
+                                for datagram in &result.datagrams {
+                                    let data = &pkt[datagram.start..datagram.end];
+                                    if data.len() < 20 {
+                                        continue;
+                                    }
+                                    let src_ip = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+                                    if !peer::is_allowed_source(&conn.allowed_ips, src_ip) {
+                                        continue;
+                                    }
+                                    if offload {
+                                        #[cfg(target_os = "linux")]
+                                        gro_tx_pool.push_datagram(data);
+                                    } else {
+                                        let _ = tun.send(data);
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    batch.reset();
+                    let _ = recycle_tx.try_send(batch);
+
+                    // Flush GRO.
+                    #[cfg(target_os = "linux")]
+                    if offload && !gro_tx_pool.is_empty() {
+                        if let Some(gro) = &mut gro_table {
+                            let _ = tun.send_multiple(gro, gro_tx_pool.as_mut_slice(), quictun_tun::VIRTIO_NET_HDR_LEN);
+                            gro_tx_pool.reset();
+                        }
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -753,7 +849,7 @@ fn worker_tun_rx_offload(
     tun: &tun_rs::SyncDevice,
     ip_map: &FxHashMap<Ipv4Addr, Arc<SharedConn>>,
     single_conn: Option<&Arc<SharedConn>>,
-    enc_tx: &Sender<EncryptedPacket>,
+    udp: &std::net::UdpSocket,
     original_buf: &mut [u8],
     split_bufs: &mut [Vec<u8>],
     split_sizes: &mut [usize],
@@ -784,13 +880,7 @@ fn worker_tun_rx_offload(
 
             match conn.shared.tx.encrypt_datagram(packet, encrypt_buf) {
                 Ok(result) => {
-                    let mut data = vec![0u8; result.len];
-                    data.copy_from_slice(&encrypt_buf[..result.len]);
-                    let _ = enc_tx.try_send(EncryptedPacket {
-                        data,
-                        len: result.len,
-                        remote_addr: conn.remote_addr,
-                    });
+                    let _ = udp.send_to(&encrypt_buf[..result.len], conn.remote_addr);
                 }
                 Err(_) => {}
             }
@@ -800,12 +890,11 @@ fn worker_tun_rx_offload(
 }
 
 /// Simple TUN RX without offload.
-#[cfg(target_os = "linux")]
 fn worker_tun_rx_simple(
     tun: &tun_rs::SyncDevice,
     ip_map: &FxHashMap<Ipv4Addr, Arc<SharedConn>>,
     single_conn: Option<&Arc<SharedConn>>,
-    enc_tx: &Sender<EncryptedPacket>,
+    udp: &std::net::UdpSocket,
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
     let mut read_buf = vec![0u8; 2048];
@@ -825,13 +914,7 @@ fn worker_tun_rx_simple(
                 };
                 match conn.shared.tx.encrypt_datagram(&read_buf[..n], encrypt_buf) {
                     Ok(result) => {
-                        let mut data = vec![0u8; result.len];
-                        data.copy_from_slice(&encrypt_buf[..result.len]);
-                        let _ = enc_tx.try_send(EncryptedPacket {
-                            data,
-                            len: result.len,
-                            remote_addr: conn.remote_addr,
-                        });
+                        let _ = udp.send_to(&encrypt_buf[..result.len], conn.remote_addr);
                     }
                     Err(_) => {}
                 }

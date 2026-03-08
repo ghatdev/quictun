@@ -1297,7 +1297,7 @@ fn drive_handshakes(
 
     // Promote completed handshakes.
     for ch in result.completed {
-        let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+        let Some((hs, conn_state, local_cids)) = multi_state.extract_connection(ch) else {
             continue;
         };
 
@@ -1324,20 +1324,21 @@ fn drive_handshakes(
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
 
         let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
-        let cid_key = cid_to_u64(&cid_bytes);
+        let primary_cid_key = cid_to_u64(&cid_bytes);
         let now_inst = Instant::now();
 
         info!(
             remote = %hs.remote_addr,
             tunnel_ip = %tunnel_ip,
             cid = %hex::encode(&cid_bytes),
+            num_cids = local_cids.len(),
             active = connections.len() + 1,
             "connection established"
         );
 
-        ip_to_cid.insert(tunnel_ip, cid_key);
+        ip_to_cid.insert(tunnel_ip, primary_cid_key);
         connections.insert(
-            cid_key,
+            primary_cid_key,
             ConnEntry {
                 conn: conn_state,
                 tunnel_ip,
@@ -2204,7 +2205,7 @@ fn dispatch_drive_handshakes(
 
     let mut promoted = 0usize;
     for ch in result.completed {
-        let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+        let Some((hs, conn_state, local_cids)) = multi_state.extract_connection(ch) else {
             continue;
         };
 
@@ -2227,13 +2228,17 @@ fn dispatch_drive_handshakes(
 
         // Assign to least-loaded worker.
         let worker_id = dispatch_table.least_loaded_worker();
-        dispatch_table.register_cid(&cid_bytes, worker_id);
+        // Register ALL local CIDs in dispatch table.
+        for cid in &local_cids {
+            dispatch_table.register_cid(cid, worker_id);
+        }
         dispatch_table.add_route(tunnel_ip, worker_id);
 
         info!(
             remote = %hs.remote_addr,
             tunnel_ip = %tunnel_ip,
             cid = %hex::encode(&cid_bytes),
+            num_cids = local_cids.len(),
             worker = worker_id,
             "connection established, assigned to worker"
         );

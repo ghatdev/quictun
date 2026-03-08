@@ -1286,7 +1286,7 @@ fn pipeline_drive_handshakes(
     drain_transmits(udp, multi_state)?;
 
     for ch in result.completed {
-        let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+        let Some((hs, conn_state, local_cids)) = multi_state.extract_connection(ch) else {
             continue;
         };
 
@@ -1307,14 +1307,17 @@ fn pipeline_drive_handshakes(
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
         let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
         let cid_key = cid_to_u64(&cid_bytes);
+        let _ = &local_cids; // All local CIDs available; primary used for connection table.
         let now_inst = Instant::now();
 
         let split = conn_state.into_split();
 
+        let remote_cid_bytes: Vec<u8> = split.tx.remote_cid()[..].to_vec();
         info!(
             remote = %hs.remote_addr,
             tunnel_ip = %tunnel_ip,
-            cid = %hex::encode(&cid_bytes),
+            local_cid = %hex::encode(&cid_bytes),
+            remote_cid = %hex::encode(&remote_cid_bytes),
             "connection established (pipeline)"
         );
 
