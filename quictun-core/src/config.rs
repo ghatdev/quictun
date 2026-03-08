@@ -229,15 +229,6 @@ pub struct EngineConfig {
     /// mio Events capacity.
     #[serde(default = "default_poll_events")]
     pub poll_events: usize,
-    /// Use per-batch crypto pipeline (requires threads >= 2).
-    #[serde(default)]
-    pub pipeline: bool,
-    /// Use container pipeline with parallel decrypt (requires threads >= 2).
-    #[serde(default)]
-    pub container: bool,
-    /// Use per-core independent model (requires threads >= 2).
-    #[serde(default)]
-    pub percore: bool,
 }
 
 impl Default for EngineConfig {
@@ -266,9 +257,6 @@ impl Default for EngineConfig {
             tun_write_buf: 256,
             channel_capacity: 4096,
             poll_events: 64,
-            pipeline: false,
-            container: false,
-            percore: false,
         }
     }
 }
