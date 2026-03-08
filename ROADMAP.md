@@ -250,7 +250,7 @@ New `RTE_LCORE_VAR` API — per-core data organized spatially for cache efficien
 
 **Completed Feb 2026.** `--offload` flag enables TUN GSO/GRO via tun-rs `recv_multiple`/`send_multiple`.
 
-**Result:** 1.24 → 1.60 Gbps (+29%), retransmits 1456 → 16 (-99%). At parity with kernel WireGuard (1.62 Gbps) on virtio VMs. See [bench-003](docs/bench-003-tun-gso-gro-offload.md).
+**Result:** 1.24 → 1.60 Gbps (+29%), retransmits 1456 → 16 (-99%). At parity with kernel WireGuard (1.62 Gbps) on virtio VMs. See [benchmarks](docs/benchmarks.md).
 
 ### 2. Profile and Find Bottlenecks [Priority: Highest]
 
@@ -278,7 +278,7 @@ Before optimizing further, we need hard data on where CPU time goes.
 
 **Completed Feb 2026.** `--dpdk virtio` mode uses virtio-user + vhost-net as inner interface.
 
-**Result:** 2.22 Gbps — matches AF_XDP (2.25 Gbps), +14% over TAP PMD (1.94 Gbps). Works with system DPDK 23.11, no source build needed. See [bench-003](docs/bench-003-tun-gso-gro-offload.md).
+**Result:** 2.22 Gbps — matches AF_XDP (2.25 Gbps), +14% over TAP PMD (1.94 Gbps). Works with system DPDK 23.11, no source build needed. See [benchmarks](docs/benchmarks.md).
 
 **Remaining work:**
 - Multi-queue virtio-user (`queues=N`) — needs DPDK 25.11 source build and multi-queue HW
@@ -647,7 +647,7 @@ Hardware counters: IPC=1.77 (compute-bound), cache miss rate 0.59% (excellent), 
 | 10 | SORING multi-core pipeline | Low | Alternative to N-connections | High | Not started |
 
 **Key realizations (updated Mar 1)**:
-- **quictun-quic eliminated quinn-proto bottleneck** — custom 1-RTT data plane replaces quinn-proto after handshake. No state machine overhead (CC, ACK, loss detection) in data path. quinn-proto only used for handshake (cold path).
+- **quictun-proto eliminated quinn-proto bottleneck** — custom 1-RTT data plane replaces quinn-proto after handshake. No state machine overhead (CC, ACK, loss detection) in data path. quinn-proto only used for handshake (cold path).
 - **vhost-net is the new ceiling at 14.0 Gbps.** vhost kernel thread runs at 99.9% CPU. DPDK engine at 90% CPU. Multi-queue virtio-user (`queues=2+`) is the path to higher throughput.
 - **Cache thrashing was the "VM anomaly".** vhost thread landing on DPDK core caused 56% throughput drop (14.0 → 6.2 Gbps). Pinning vhost to separate cores solved it.
 - **Packed vectorized virtqueue is massive.** `packed_vq=1,in_order=1,mrg_rxbuf=0,vectorized=1` + AVX-512 SIMD enables batch descriptor processing. Combined with vhost pinning: 8.1 → 14.0 Gbps (+73%).
