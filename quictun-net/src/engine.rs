@@ -245,6 +245,7 @@ pub struct NetConfig {
     pub poll_events: usize,
     pub pipeline: bool,
     pub container: bool,
+    pub percore: bool,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -268,6 +269,14 @@ struct ConnEntry {
 ///
 /// Routes to single-thread or multi-thread path based on `config.threads`.
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
+    #[cfg(target_os = "linux")]
+    if config.threads > 1 && config.pipeline && config.percore {
+        return crate::pipeline2::run_pipeline2(local_addr, setup, config);
+    }
+    #[cfg(target_os = "linux")]
+    if config.threads > 1 && config.percore {
+        return crate::percore::run_percore(local_addr, setup, config);
+    }
     if config.threads > 1 && config.container {
         crate::container::run_container(local_addr, setup, config)
     } else if config.threads > 1 && config.pipeline {

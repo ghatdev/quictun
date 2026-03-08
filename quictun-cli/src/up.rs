@@ -140,6 +140,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         poll_events: config.engine.poll_events,
         pipeline: config.engine.pipeline,
         container: config.engine.container,
+        percore: config.engine.percore,
     };
 
     // Resolve cipher suites.

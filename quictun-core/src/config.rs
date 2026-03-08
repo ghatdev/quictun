@@ -235,6 +235,9 @@ pub struct EngineConfig {
     /// Use container pipeline with parallel decrypt (requires threads >= 2).
     #[serde(default)]
     pub container: bool,
+    /// Use per-core independent model (requires threads >= 2).
+    #[serde(default)]
+    pub percore: bool,
 }
 
 impl Default for EngineConfig {
@@ -265,6 +268,7 @@ impl Default for EngineConfig {
             poll_events: 64,
             pipeline: false,
             container: false,
+            percore: false,
         }
     }
 }
