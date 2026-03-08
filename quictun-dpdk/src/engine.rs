@@ -1896,7 +1896,7 @@ pub fn run_pipeline_io(
     let mut rx_pkts: u64 = 0;
     let mut tx_pkts: u64 = 0;
     let mut inner_rx_pkts: u64 = 0;
-    let mut inner_dispatch: u64 = 0;
+    let mut inner_tx_pkts: u64 = 0;
     let mut dispatch_drop: u64 = 0;
     let mut last_stats = Instant::now();
 
@@ -1909,7 +1909,11 @@ pub fn run_pipeline_io(
     let mut delay_us: u32 = MIN_DELAY_US;
     let mut now = Instant::now();
 
-    tracing::info!(n_workers, "pipeline I/O started on core 0 (workers TX directly)");
+    // Reusable mbuf arrays for collecting TX from workers.
+    let mut inner_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
+    let mut outer_tx_collect: [*mut ffi::rte_mbuf; BURST_SIZE] = [std::ptr::null_mut(); BURST_SIZE];
+
+    tracing::info!(n_workers, "pipeline I/O started on core 0");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -2031,9 +2035,7 @@ pub fn run_pipeline_io(
                     let worker_id = rr_encrypt % n_workers;
                     rr_encrypt = rr_encrypt.wrapping_add(1);
                     let raw = mbuf.into_raw();
-                    if workers[worker_id].encrypt_rx.enqueue(raw) {
-                        inner_dispatch += 1;
-                    } else {
+                    if !workers[worker_id].encrypt_rx.enqueue(raw) {
                         unsafe { ffi::shim_rte_pktmbuf_free(raw) };
                         dispatch_drop += 1;
                     }
@@ -2067,7 +2069,43 @@ pub fn run_pipeline_io(
             had_work = true;
         }
 
-        // Workers TX directly on their own queues — no drain needed on core 0.
+        // ── 3. Drain worker inner_tx rings → inner port TX ──
+
+        for worker in workers {
+            let nb = worker.inner_tx.dequeue_burst(&mut inner_tx_collect);
+            if nb > 0 {
+                had_work = true;
+                let sent = port::tx_burst(
+                    inner.port_id,
+                    0,
+                    &mut inner_tx_collect[..nb as usize],
+                    nb as u16,
+                );
+                inner_tx_pkts += sent as u64;
+                for j in sent as usize..nb as usize {
+                    unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_collect[j]) };
+                }
+            }
+        }
+
+        // ── 3b. Drain worker outer_tx rings → outer port TX ──
+
+        for worker in workers {
+            let nb = worker.outer_tx.dequeue_burst(&mut outer_tx_collect);
+            if nb > 0 {
+                had_work = true;
+                let sent = port::tx_burst(
+                    outer_port_id,
+                    0,
+                    &mut outer_tx_collect[..nb as usize],
+                    nb as u16,
+                );
+                tx_pkts += sent as u64;
+                for j in sent as usize..nb as usize {
+                    unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_collect[j]) };
+                }
+            }
+        }
 
         // Refresh `now` only when there was actual work (skip clock_gettime on idle polls).
         if multi_state.handshakes.is_empty() && had_work {
@@ -2290,7 +2328,7 @@ pub fn run_pipeline_io(
                 rx_pkts,
                 tx_pkts,
                 inner_rx_pkts,
-                inner_dispatch,
+                inner_tx_pkts,
                 dispatch_drop,
                 connections = connections.len(),
                 handshakes = multi_state.handshakes.len(),
@@ -2326,10 +2364,6 @@ pub fn run_pipeline_io(
 ///   to outer NIC on the worker's own TX queue.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pipeline_worker(
-    outer_port_id: u16,
-    inner_port_id: u16,
-    outer_tx_queue: u16,
-    inner_tx_queue: u16,
     mempool: *mut ffi::rte_mempool,
     rings: &PipelineRings,
     inner_eth_hdr: &InnerEthHeader,
@@ -2481,11 +2515,10 @@ pub fn run_pipeline_worker(
             had_work = true;
         }
 
-        // TX inner frames directly to inner port on this worker's queue.
+        // Enqueue inner TX mbufs to core 0 via ring (virtio-user only has 1 queue pair).
         if !inner_tx_mbufs.is_empty() {
-            let nb_tx = inner_tx_mbufs.len() as u16;
-            let sent = port::tx_burst(inner_port_id, inner_tx_queue, &mut inner_tx_mbufs, nb_tx);
-            for j in sent as usize..inner_tx_mbufs.len() {
+            let enqueued = rings.inner_tx.enqueue_burst(&inner_tx_mbufs);
+            for j in enqueued as usize..inner_tx_mbufs.len() {
                 unsafe { ffi::shim_rte_pktmbuf_free(inner_tx_mbufs[j]) };
             }
         }
@@ -2576,11 +2609,10 @@ pub fn run_pipeline_worker(
             had_work = true;
         }
 
-        // TX encrypted packets directly to outer port on this worker's queue.
+        // Enqueue encrypted packets to outer_tx ring for core 0 to TX.
         if !outer_tx_mbufs.is_empty() {
-            let nb_tx = outer_tx_mbufs.len() as u16;
-            let sent = port::tx_burst(outer_port_id, outer_tx_queue, &mut outer_tx_mbufs, nb_tx);
-            for j in sent as usize..outer_tx_mbufs.len() {
+            let enqueued = rings.outer_tx.enqueue_burst(&outer_tx_mbufs);
+            for j in enqueued as usize..outer_tx_mbufs.len() {
                 unsafe { ffi::shim_rte_pktmbuf_free(outer_tx_mbufs[j]) };
             }
         }
