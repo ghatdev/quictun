@@ -27,11 +27,11 @@ use tracing::{debug, info, warn};
 
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::MultiQuicState;
-use quictun_quic::frame::AckFrame;
-use quictun_quic::split::{KeyUpdateState, RxState, TxState};
-use quictun_quic::packet::ShortHeader;
-use quictun_quic::{decrypt_payload_in_place, encrypt_packet, unprotect_header};
-use quictun_quic::cid_to_u64;
+use quictun_proto::frame::AckFrame;
+use quictun_proto::split::{KeyUpdateState, RxState, TxState};
+use quictun_proto::packet::ShortHeader;
+use quictun_proto::{decrypt_payload_in_place, encrypt_packet, unprotect_header};
+use quictun_proto::cid_to_u64;
 use quinn_proto::crypto::{HeaderKey, PacketKey};
 
 use crate::engine::{
@@ -1432,7 +1432,7 @@ fn pipeline_send_acks(
             let ack_ranges = entry.rx.generate_ack_ranges();
             let pn = entry.tx.next_pn();
             let key_guard = entry.tx.load_packet_key();
-            match quictun_quic::encrypt_ack_packet(
+            match quictun_proto::encrypt_ack_packet(
                 &ack_ranges,
                 entry.tx.remote_cid(),
                 pn,

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use quictun_quic::local::LocalConnectionState;
+use quictun_proto::local::LocalConnectionState;
 use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use tracing::{info, warn};
 

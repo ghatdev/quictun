@@ -20,10 +20,10 @@ use tracing::{debug, info, warn};
 
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::MultiQuicState;
-use quictun_quic::cid_to_u64;
-use quictun_quic::local::LocalConnectionState;
+use quictun_proto::cid_to_u64;
+use quictun_proto::local::LocalConnectionState;
 #[cfg(target_os = "linux")]
-use quictun_quic::encrypt_packet;
+use quictun_proto::encrypt_packet;
 #[cfg(target_os = "linux")]
 use smallvec::SmallVec;
 use quictun_tun::TunOptions;

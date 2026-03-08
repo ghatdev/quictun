@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 quictun-core = { workspace = true }
 quictun-tun = { workspace = true }
-quictun-quic = { workspace = true }
+quictun-proto = { workspace = true }
 quinn-proto = { workspace = true }
 mio = { workspace = true }
 socket2 = { workspace = true }

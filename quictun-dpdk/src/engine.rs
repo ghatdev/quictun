@@ -14,13 +14,13 @@ use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{self, BUF_SIZE, DriveResult, MultiQuicState, QuicState};
 use quictun_core::peer::{self, PeerConfig};
-use quictun_quic::cid_to_u64;
-use quictun_quic::local::LocalConnectionState;
+use quictun_proto::cid_to_u64;
+use quictun_proto::local::LocalConnectionState;
 
 /// Maximum burst size for rx/tx.
 pub(crate) const BURST_SIZE: usize = 32;
 
-/// Smaller burst size for inner→outer pipeline in quictun-quic mode.
+/// Smaller burst size for inner→outer pipeline in quictun-proto mode.
 /// Pending mbuf retry + back-pressure handle TX ring overflow; safe to raise.
 const INNER_BURST_SIZE: u16 = 24;
 
@@ -466,7 +466,7 @@ pub fn run(
             let ethertype = u16::from_be_bytes([data[12], data[13]]);
             match ethertype {
                 0x0800 => {
-                    // IPv4: route by dest IP, encrypt via quictun-quic.
+                    // IPv4: route by dest IP, encrypt via quictun-proto.
                     if data.len() < ETH_HLEN + 20 {
                         continue;
                     }
@@ -542,7 +542,7 @@ pub fn run(
                                     outer_tx_mbufs.push(tx_mbuf.into_raw());
                                 }
                                 Err(e) => {
-                                    tracing::trace!(error = %e, "quictun-quic encrypt failed");
+                                    tracing::trace!(error = %e, "quictun-proto encrypt failed");
                                 }
                             }
                         }
@@ -593,7 +593,7 @@ pub fn run(
             }
         }
 
-        // Batch TX for quictun-quic encrypted packets.
+        // Batch TX for quictun-proto encrypted packets.
         if !outer_tx_mbufs.is_empty() {
             let nb_tx = outer_tx_mbufs.len() as u16;
             let sent = port::tx_burst(outer_port_id, queue_id, &mut outer_tx_mbufs, nb_tx);
@@ -860,7 +860,7 @@ fn send_raw_frames(
 
 /// Result from handshake-only phase.
 pub struct HandshakeResult {
-    /// quictun-quic connection state for the data plane.
+    /// quictun-proto connection state for the data plane.
     pub conn_state: LocalConnectionState,
     /// Learned network identity (peer MAC, ports, etc.).
     pub identity: NetIdentity,
@@ -1032,7 +1032,7 @@ pub fn run_handshake_only(
         // Check for connected
         if drive_result.connected {
             if let Some(cs) = drive_result.connection_state.take() {
-                tracing::info!("handshake complete (quictun-quic data plane ready)");
+                tracing::info!("handshake complete (quictun-proto data plane ready)");
                 // Drain any remaining handshake transmits
                 drain_and_send(
                     state,
@@ -1060,8 +1060,8 @@ pub fn run_handshake_only(
                     arp_table: arp_table.clone(),
                 });
             }
-            tracing::info!("tunnel established but no quictun-quic keys — cannot use multi-core");
-            anyhow::bail!("multi-core requires quictun-quic keys");
+            tracing::info!("tunnel established but no quictun-proto keys — cannot use multi-core");
+            anyhow::bail!("multi-core requires quictun-proto keys");
         }
         if drive_result.connection_lost {
             anyhow::bail!("connection lost during handshake");

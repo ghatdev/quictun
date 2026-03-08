@@ -3757,7 +3757,7 @@ impl Connection {
     }
 
     //
-    // quictun-quic: Key extraction for custom data-plane
+    // quictun-proto: Key extraction for custom data-plane
     //
 
     /// Extract 1-RTT keys after handshake completes.

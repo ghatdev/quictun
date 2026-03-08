@@ -22,7 +22,7 @@ use quictun_core::{icmp, mss};
 use quictun_core::nat::{self, NatForwardKey, NatTable};
 use quictun_core::peer::PeerConfig;
 use quictun_core::routing::{RouteAction, RoutingTable};
-use quictun_quic::cid_to_u64;
+use quictun_proto::cid_to_u64;
 
 use crate::engine::resolve_completed_handshake;
 

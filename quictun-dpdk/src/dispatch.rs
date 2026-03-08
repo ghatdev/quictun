@@ -9,10 +9,10 @@ use std::sync::Mutex;
 use anyhow::Result;
 use ipnet::Ipv4Net;
 use rustc_hash::FxHashMap;
-use quictun_quic::local::LocalConnectionState;
+use quictun_proto::local::LocalConnectionState;
 use quinn_proto::ConnectionId;
 
-use quictun_quic::cid_to_u64;
+use quictun_proto::cid_to_u64;
 use crate::ffi;
 use crate::ring::SpscRing;
 
@@ -54,7 +54,7 @@ impl DpdkDispatchTable {
         self.worker_load[worker_id] += 1;
     }
 
-    /// Register a CID → worker mapping from raw bytes (quictun-quic CID).
+    /// Register a CID → worker mapping from raw bytes (quictun-proto CID).
     pub fn register_cid_raw(&mut self, cid: &[u8], worker_id: usize) {
         self.connections
             .insert(cid_to_u64(cid), DispatchEntry { worker_id });

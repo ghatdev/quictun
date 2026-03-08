@@ -1,4 +1,4 @@
-//! quictun-quic: Optimized QUIC 1-RTT data plane for DATAGRAM tunneling.
+//! quictun-proto: Optimized QUIC 1-RTT data plane for DATAGRAM tunneling.
 //!
 //! Replaces quinn-proto for 1-RTT short header packets after handshake.
 //!

@@ -5,7 +5,7 @@ members = [
     "quictun-core",
     "quictun-tun",
     "quictun-dpdk",
-    "quictun-quic",
+    "quictun-proto",
     "quictun-net",
     "quictun-cli",
 ]
@@ -73,8 +73,8 @@ tun-rs = { version = "2", features = ["async"] }
 libc = "0.2"
 crossbeam-channel = "0.5"
 
-# quictun-quic
-quictun-quic = { path = "quictun-quic" }
+# quictun-proto
+quictun-proto = { path = "quictun-proto" }
 smallvec = { version = "1", features = ["const_generics"] }
 arc-swap = "1"
 parking_lot = "0.12"

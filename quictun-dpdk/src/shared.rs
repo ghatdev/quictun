@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use quictun_core::peer;
-use quictun_quic::local::LocalConnectionState;
+use quictun_proto::local::LocalConnectionState;
 use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig};
 use tracing::{info, warn};
 
@@ -51,7 +51,7 @@ pub struct DriveResult {
     pub connected: bool,
     /// Whether the connection was lost.
     pub connection_lost: bool,
-    /// quictun-quic connection state, set once on Event::Connected.
+    /// quictun-proto connection state, set once on Event::Connected.
     pub connection_state: Option<LocalConnectionState>,
 }
 
@@ -98,7 +98,7 @@ pub fn process_events(state: &mut QuicState, result: &mut DriveResult) {
                 info!("quic: connection established");
                 result.connected = true;
 
-                // Extract 1-RTT keys for quictun-quic data plane
+                // Extract 1-RTT keys for quictun-proto data plane
                 if let Some(keys) = conn.take_1rtt_keys() {
                     let local_cid = conn.local_cid().clone();
                     let remote_cid = conn.remote_cid();
@@ -129,7 +129,7 @@ pub fn process_events(state: &mut QuicState, result: &mut DriveResult) {
                 }
             }
             Event::DatagramReceived => {
-                // Only process datagrams via quinn-proto if quictun-quic hasn't taken over.
+                // Only process datagrams via quinn-proto if quictun-proto hasn't taken over.
                 // After key extraction, quinn-proto can't decrypt 1-RTT data anyway.
                 while let Some(datagram) = conn.datagrams().recv() {
                     result.datagrams.push(datagram);

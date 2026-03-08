@@ -1082,7 +1082,7 @@ dependencies = [
  "ipnet",
  "libc",
  "quictun-crypto",
- "quictun-quic",
+ "quictun-proto",
  "quictun-tun",
  "quinn",
  "quinn-proto",
@@ -1128,7 +1128,7 @@ dependencies = [
  "pkg-config",
  "quictun-core",
  "quictun-crypto",
- "quictun-quic",
+ "quictun-proto",
  "quinn-proto",
  "rustc-hash",
  "rustls",
@@ -1149,7 +1149,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "quictun-core",
- "quictun-quic",
+ "quictun-proto",
  "quictun-tun",
  "quinn-proto",
  "rustc-hash",
@@ -1160,7 +1160,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quictun-quic"
+name = "quictun-proto"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
