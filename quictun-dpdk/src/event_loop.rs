@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::dispatch::{DpdkDispatchTable, WorkerRings};
+use crate::dispatch::{DpdkDispatchTable, PipelineRings, WorkerRings};
 use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
@@ -542,11 +542,12 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             &dpdk_config.peers,
         )
     } else {
-        // Multi-core: dispatcher + worker architecture.
-        let n_workers = n_cores - 1; // core 0 = dispatcher
+        // Multi-core: pipeline architecture (SharedConnectionState).
+        // Core 0 = I/O, Workers 1..N = crypto (round-robin, any-connection).
+        let n_workers = n_cores - 1;
 
         // Configure outer port: 1 RX queue, n_cores TX queues.
-        // Close and reconfigure for dispatcher mode.
+        // Close and reconfigure for dispatcher mode (same port config).
         port::close_port(dpdk_config.port_id);
         let (new_mac, hw_udp, hw_ip) =
             port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
@@ -567,14 +568,11 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             .ok_or_else(|| anyhow::anyhow!("multi-core DPDK requires listener mode"))?;
         let mut multi_state = MultiQuicState::new(multi_server_config);
 
-        // Create per-worker ring bundles.
-        let mut worker_rings: Vec<WorkerRings> = Vec::with_capacity(n_workers);
+        // Create per-worker pipeline ring bundles.
+        let mut pipeline_rings: Vec<PipelineRings> = Vec::with_capacity(n_workers);
         for i in 0..n_workers {
-            worker_rings.push(WorkerRings::new(i)?);
+            pipeline_rings.push(PipelineRings::new(i)?);
         }
-
-        // Build dispatch table.
-        let mut dispatch_table = DpdkDispatchTable::new(n_workers);
 
         // Single inner port on core 0.
         let inner = inner_ports
@@ -585,11 +583,11 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         let adaptive_poll = dpdk_config.adaptive_poll;
         let outer_port_id = dpdk_config.port_id;
 
-        // Spawn worker threads (pinned to cores 1..N).
+        // Spawn pipeline worker threads (pinned to cores 1..N).
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n_workers);
 
-            for (idx, rings) in worker_rings.iter().enumerate() {
+            for (idx, rings) in pipeline_rings.iter().enumerate() {
                 let shutdown = shutdown.clone();
                 let worker_identity = identity.clone();
                 let inner_eth_hdr = &inner.eth_hdr;
@@ -597,7 +595,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
                 handles.push(s.spawn(move || -> Result<()> {
                     let mempool = mempool.as_ptr();
-                    let core_idx = idx + 1; // core 0 is dispatcher
+                    let core_idx = idx + 1; // core 0 is I/O
                     let tx_queue = core_idx as u16;
 
                     // Pin thread to CPU.
@@ -613,13 +611,13 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                             )
                         };
                         if ret == 0 {
-                            tracing::info!(core = core_idx, "pinned worker thread to CPU");
+                            tracing::info!(core = core_idx, "pinned pipeline worker to CPU");
                         } else {
-                            tracing::warn!(core = core_idx, "failed to pin worker thread to CPU");
+                            tracing::warn!(core = core_idx, "failed to pin pipeline worker to CPU");
                         }
                     }
 
-                    engine::run_worker(
+                    engine::run_pipeline_worker(
                         outer_port_id,
                         tx_queue,
                         mempool,
@@ -634,13 +632,12 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 }));
             }
 
-            // Run dispatcher on core 0 (this thread).
-            let disp_result = engine::run_dispatcher(
+            // Run pipeline I/O on core 0 (this thread).
+            let io_result = engine::run_pipeline_io(
                 outer_port_id,
                 mempool,
                 &mut multi_state,
-                &mut dispatch_table,
-                &worker_rings,
+                &pipeline_rings,
                 &identity,
                 &mut arp_table,
                 &inner,
@@ -652,9 +649,9 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
             // Signal shutdown and wait for workers.
             shutdown.store(true, Ordering::Release);
-            let mut result = disp_result;
+            let mut result = io_result;
             for handle in handles {
-                if let Err(e) = handle.join().expect("worker thread panicked") {
+                if let Err(e) = handle.join().expect("pipeline worker panicked") {
                     if result.is_ok() {
                         result = Err(e);
                     }

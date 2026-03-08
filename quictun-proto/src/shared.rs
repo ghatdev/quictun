@@ -285,6 +285,34 @@ impl SharedConnectionState {
         self.key_update.is_key_exhausted()
     }
 
+    /// Encrypt a standalone ACK packet using shared state. Thread-safe (`&self`).
+    ///
+    /// Called by the I/O thread (core 0) periodically when `replay.needs_ack()`.
+    /// Generates ACK ranges from the replay window and encrypts them.
+    pub fn encrypt_ack(&self, buf: &mut [u8]) -> Result<crate::EncryptResult, ParseError> {
+        let ack_ranges = self.replay.generate_ack_ranges();
+        let pn = self.tx.next_pn();
+        let key_guard = self.tx.load_packet_key();
+        crate::encrypt_ack_packet(
+            &ack_ranges,
+            self.tx.remote_cid(),
+            pn,
+            self.tx.largest_acked(),
+            self.tx.key_phase(),
+            &***key_guard,
+            self.tx.header_key(),
+            self.tag_len,
+            buf,
+        )
+    }
+
+    /// Process an ACK frame received from the peer. Thread-safe (`&self`).
+    ///
+    /// Updates `largest_acked` in TxState atomically.
+    pub fn process_ack(&self, ack: &crate::AckFrame) {
+        self.tx.update_largest_acked(ack.largest_acked);
+    }
+
     /// Check if key update should be initiated and do so if threshold reached.
     ///
     /// Called by the I/O thread (e.g., container dispatcher) periodically.
@@ -524,6 +552,35 @@ mod tests {
         let ranges = shared_server.replay.generate_ack_ranges();
         assert!(!ranges.is_empty());
         assert_eq!(ranges[0], 0..10);
+
+        // After ACK generation, needs_ack should return false.
+        assert!(!shared_server.replay.needs_ack());
+    }
+
+    #[test]
+    fn shared_encrypt_ack_roundtrip() {
+        let (client, server) = make_pair();
+        let split_client = client.into_split();
+        let shared_server = server.into_shared();
+
+        // Encrypt + decrypt 10 packets so server has data to ACK.
+        for _ in 0..10 {
+            let mut buf = vec![0u8; 2048];
+            let result = split_client
+                .tx
+                .encrypt_datagram(b"data", &mut buf)
+                .expect("encrypt");
+            shared_server
+                .decrypt_in_place(&mut buf[..result.len])
+                .expect("decrypt");
+        }
+
+        // Server generates and encrypts an ACK packet.
+        assert!(shared_server.replay.needs_ack());
+        let mut ack_buf = vec![0u8; 256];
+        let result = shared_server.encrypt_ack(&mut ack_buf).expect("encrypt_ack");
+        assert!(result.len > 0);
+        assert!(result.len <= 256);
 
         // After ACK generation, needs_ack should return false.
         assert!(!shared_server.replay.needs_ack());

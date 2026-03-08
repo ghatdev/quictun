@@ -4,12 +4,13 @@
 //! worker cores via SPSC rings. Workers own `LocalConnectionState` per connection.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use ipnet::Ipv4Net;
 use rustc_hash::FxHashMap;
 use quictun_proto::local::LocalConnectionState;
+use quictun_proto::shared::SharedConnectionState;
 use quinn_proto::ConnectionId;
 
 use quictun_proto::cid_to_u64;
@@ -175,4 +176,56 @@ pub struct ConnectionEntry {
     pub tunnel_ip: Ipv4Addr,
     pub remote_addr: std::net::SocketAddr,
     pub remote_mac: [u8; 6],
+}
+
+// ── Pipeline architecture (SharedConnectionState) ──────────────────────
+
+/// Per-worker ring bundle for pipeline mode (virtio/TAP).
+///
+/// Workers share `Arc<SharedConnectionState>` — any worker processes any
+/// connection's packets via round-robin dispatch from core 0.
+///
+/// - `decrypt_rx`: core 0 → worker (outer QUIC packets for decrypt)
+/// - `encrypt_rx`: core 0 → worker (inner IP packets for encrypt)
+/// - `inner_tx`: worker → core 0 (decrypted datagrams for TAP TX)
+/// - `control`: rare messages (new connection broadcasts)
+pub struct PipelineRings {
+    pub decrypt_rx: SpscRing,
+    pub encrypt_rx: SpscRing,
+    pub inner_tx: SpscRing,
+    pub control: Mutex<Vec<PipelineControlMessage>>,
+}
+
+impl PipelineRings {
+    /// Create ring bundle for pipeline worker `idx`.
+    pub fn new(idx: usize) -> Result<Self> {
+        Ok(Self {
+            decrypt_rx: SpscRing::new(&format!("pl_dec_rx_{idx}"), RING_CAPACITY, 0)?,
+            encrypt_rx: SpscRing::new(&format!("pl_enc_rx_{idx}"), RING_CAPACITY, 0)?,
+            inner_tx: SpscRing::new(&format!("pl_inner_tx_{idx}"), RING_CAPACITY, 0)?,
+            control: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+/// Per-connection metadata held by pipeline workers alongside `Arc<SharedConnectionState>`.
+pub struct PipelineConnection {
+    pub conn: Arc<SharedConnectionState>,
+    pub tunnel_ip: Ipv4Addr,
+    pub remote_addr: SocketAddr,
+    pub remote_mac: [u8; 6],
+}
+
+/// Control message for pipeline workers (broadcast from core 0).
+pub enum PipelineControlMessage {
+    /// Broadcast: add a new connection to all workers.
+    AddConnection {
+        conn: Arc<SharedConnectionState>,
+        tunnel_ip: Ipv4Addr,
+        remote_addr: SocketAddr,
+        remote_mac: [u8; 6],
+        cid: u64,
+    },
+    /// Remove a connection from all workers.
+    RemoveConnection { cid: u64 },
 }
