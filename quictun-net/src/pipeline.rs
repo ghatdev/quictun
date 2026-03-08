@@ -89,9 +89,14 @@ enum DecryptOutcome {
 }
 
 /// Decrypt batch: QUIC packets → inner packets.
+///
+/// Uses a contiguous slab instead of Vec<Vec<u8>> to eliminate per-packet
+/// heap allocation in the recvmmsg → decrypt path.
 struct DecryptBatch {
-    // Input: packets (owned, mutable — worker decrypts in place).
-    packets: Vec<Vec<u8>>,
+    // Input: contiguous buffer holding all packet data.
+    slab: Vec<u8>,
+    // (offset, length) for each packet in the slab.
+    offsets: Vec<(usize, usize)>,
     // Key snapshot from RxState.
     rx_header_key: Arc<Box<dyn HeaderKey>>,
     rx_packet_key: Arc<Box<dyn PacketKey>>,
@@ -103,6 +108,22 @@ struct DecryptBatch {
     peer_key_phase: bool,
     // Output: per-packet results.
     results: Vec<DecryptOutcome>,
+}
+
+impl DecryptBatch {
+    fn packet(&self, i: usize) -> &[u8] {
+        let (offset, len) = self.offsets[i];
+        &self.slab[offset..offset + len]
+    }
+
+    fn packet_mut(&mut self, i: usize) -> &mut [u8] {
+        let (offset, len) = self.offsets[i];
+        &mut self.slab[offset..offset + len]
+    }
+
+    fn packet_count(&self) -> usize {
+        self.offsets.len()
+    }
 }
 
 unsafe impl Send for DecryptBatch {}
@@ -178,31 +199,36 @@ fn crypto_worker(
                 let _ = done_tx.send(CryptoResult::Encrypt(batch));
             }
             CryptoJob::Decrypt(mut batch) => {
-                let count = batch.packets.len();
+                let count = batch.packet_count();
                 batch.results.clear();
 
-                for i in 0..count {
-                    let packet = &mut batch.packets[i];
-                    let pkt_len = packet.len();
+                // Cache fields to avoid borrow conflicts with packet_mut.
+                let cid_len = batch.cid_len;
+                let tag_len = batch.tag_len;
+                let largest_rx_pn = batch.largest_rx_pn;
+                let peer_key_phase = batch.peer_key_phase;
+                let rx_header_key = Arc::clone(&batch.rx_header_key);
+                let rx_packet_key = Arc::clone(&batch.rx_packet_key);
 
+                for i in 0..count {
                     match unprotect_header(
-                        packet,
-                        batch.cid_len,
-                        batch.tag_len,
-                        &**batch.rx_header_key,
-                        batch.largest_rx_pn,
+                        batch.packet_mut(i),
+                        cid_len,
+                        tag_len,
+                        &**rx_header_key,
+                        largest_rx_pn,
                     ) {
                         Ok(hdr) => {
                             // Key phase mismatch: skip AEAD (wrong key would corrupt buffer).
                             // Return to I/O thread for retry with rotated key.
-                            if hdr.key_phase != batch.peer_key_phase {
+                            if hdr.key_phase != peer_key_phase {
                                 batch.results.push(DecryptOutcome::KeyPhaseMismatch { hdr });
                                 continue;
                             }
                             match decrypt_payload_in_place(
-                                &mut packet[..pkt_len],
+                                batch.packet_mut(i),
                                 &hdr,
-                                &**batch.rx_packet_key,
+                                &**rx_packet_key,
                             ) {
                                 Ok(result) => {
                                     batch.results.push(DecryptOutcome::Ok {
@@ -828,7 +854,7 @@ fn handle_decrypt_completion(
 
                 // Write datagrams to TUN.
                 for range in datagrams {
-                    let datagram = &batch.packets[i][range.clone()];
+                    let datagram = &batch.packet(i)[range.clone()];
                     if datagram.len() < 20 {
                         continue;
                     }
@@ -859,10 +885,8 @@ fn handle_decrypt_completion(
                 entry.rx.check_key_phase(hdr.key_phase, &entry.key_update, &entry.tx);
 
                 // Retry AEAD with rotated key.
-                let packet = &mut batch.packets[i];
-                let pkt_len = packet.len();
                 let key = entry.rx.packet_key();
-                match decrypt_payload_in_place(&mut packet[..pkt_len], &hdr, &**key) {
+                match decrypt_payload_in_place(batch.packet_mut(i), &hdr, &**key) {
                     Ok(result) => {
                         if !entry.rx.accept_decrypted_pn(hdr.pn) {
                             continue;
@@ -877,7 +901,7 @@ fn handle_decrypt_completion(
                         }
 
                         for datagram_range in &result.datagrams {
-                            let datagram = &packet[datagram_range.clone()];
+                            let datagram = &batch.packet(i)[datagram_range.clone()];
                             if datagram.len() < 20 {
                                 continue;
                             }
@@ -999,8 +1023,9 @@ fn pipeline_udp_rx_linux(
             Err(e) => return Err(e).context("recvmmsg failed"),
         };
 
-        // Group short-header packets by CID.
-        let mut decrypt_groups: FxHashMap<u64, Vec<Vec<u8>>> = FxHashMap::default();
+        // Group short-header packets by CID into slab buffers.
+        let mut decrypt_groups: FxHashMap<u64, (Vec<u8>, Vec<(usize, usize)>)> =
+            FxHashMap::default();
 
         for i in 0..n_msgs {
             let n = recv_lens[i];
@@ -1027,16 +1052,16 @@ fn pipeline_udp_rx_linux(
             let cid_key = cid_to_u64(&recv_bufs[i][1..1 + cid_len]);
 
             if connections.contains_key(&cid_key) {
-                decrypt_groups
-                    .entry(cid_key)
-                    .or_default()
-                    .push(recv_bufs[i][..n].to_vec());
+                let (slab, offsets) = decrypt_groups.entry(cid_key).or_default();
+                let offset = slab.len();
+                slab.extend_from_slice(&recv_bufs[i][..n]);
+                offsets.push((offset, n));
             }
         }
 
         // Create decrypt batches per connection.
-        for (cid_key, packets) in decrypt_groups {
-            submit_decrypt_batch(connections, cid_key, packets, job_tx, in_flight);
+        for (cid_key, (slab, offsets)) in decrypt_groups {
+            submit_decrypt_batch(connections, cid_key, slab, offsets, job_tx, in_flight);
         }
 
         if n_msgs < max_batch {
@@ -1057,7 +1082,8 @@ fn pipeline_udp_rx(
     job_tx: &Sender<CryptoJob>,
     in_flight: &mut usize,
 ) -> Result<()> {
-    let mut decrypt_groups: FxHashMap<u64, Vec<Vec<u8>>> = FxHashMap::default();
+    let mut decrypt_groups: FxHashMap<u64, (Vec<u8>, Vec<(usize, usize)>)> =
+        FxHashMap::default();
 
     loop {
         match udp.recv_from(recv_buf) {
@@ -1075,10 +1101,10 @@ fn pipeline_udp_rx(
                 } else if cid_len > 0 && n > cid_len {
                     let cid_key = cid_to_u64(&recv_buf[1..1 + cid_len]);
                     if connections.contains_key(&cid_key) {
-                        decrypt_groups
-                            .entry(cid_key)
-                            .or_default()
-                            .push(recv_buf[..n].to_vec());
+                        let (slab, offsets) = decrypt_groups.entry(cid_key).or_default();
+                        let offset = slab.len();
+                        slab.extend_from_slice(&recv_buf[..n]);
+                        offsets.push((offset, n));
                     }
                 }
             }
@@ -1087,8 +1113,8 @@ fn pipeline_udp_rx(
         }
     }
 
-    for (cid_key, packets) in decrypt_groups {
-        submit_decrypt_batch(connections, cid_key, packets, job_tx, in_flight);
+    for (cid_key, (slab, offsets)) in decrypt_groups {
+        submit_decrypt_batch(connections, cid_key, slab, offsets, job_tx, in_flight);
     }
 
     Ok(())
@@ -1097,7 +1123,8 @@ fn pipeline_udp_rx(
 fn submit_decrypt_batch(
     connections: &FxHashMap<u64, PipelineConnEntry>,
     cid_key: u64,
-    packets: Vec<Vec<u8>>,
+    slab: Vec<u8>,
+    offsets: Vec<(usize, usize)>,
     job_tx: &Sender<CryptoJob>,
     in_flight: &mut usize,
 ) {
@@ -1106,9 +1133,10 @@ fn submit_decrypt_batch(
         None => return,
     };
 
-    let packets_count = packets.len();
+    let packets_count = offsets.len();
     let batch = Box::new(DecryptBatch {
-        packets,
+        slab,
+        offsets,
         rx_header_key: entry.rx.header_key(),
         rx_packet_key: entry.rx.packet_key(),
         largest_rx_pn: entry.rx.largest_rx_pn(),
