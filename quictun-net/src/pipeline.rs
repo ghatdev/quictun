@@ -29,6 +29,7 @@ use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::MultiQuicState;
 use quictun_quic::frame::AckFrame;
 use quictun_quic::split::{KeyUpdateState, RxState, TxState};
+use quictun_quic::packet::ShortHeader;
 use quictun_quic::{decrypt_payload_in_place, encrypt_packet, unprotect_header};
 use quictun_quic::cid_to_u64;
 use quinn_proto::crypto::{HeaderKey, PacketKey};
@@ -81,6 +82,10 @@ enum DecryptOutcome {
     },
     /// AEAD or header unprotect failed.
     Failed,
+    /// Header unprotected but key_phase differs from expected.
+    /// Packet data is preserved (AEAD not attempted with wrong key).
+    /// I/O thread retries with the correct key after committing rotation.
+    KeyPhaseMismatch { hdr: ShortHeader },
 }
 
 /// Decrypt batch: QUIC packets → inner packets.
@@ -94,6 +99,8 @@ struct DecryptBatch {
     cid_len: usize,
     tag_len: usize,
     cid_key: u64,
+    // Expected peer key phase (for detecting key rotation).
+    peer_key_phase: bool,
     // Output: per-packet results.
     results: Vec<DecryptOutcome>,
 }
@@ -186,6 +193,12 @@ fn crypto_worker(
                         batch.largest_rx_pn,
                     ) {
                         Ok(hdr) => {
+                            // Key phase mismatch: skip AEAD (wrong key would corrupt buffer).
+                            // Return to I/O thread for retry with rotated key.
+                            if hdr.key_phase != batch.peer_key_phase {
+                                batch.results.push(DecryptOutcome::KeyPhaseMismatch { hdr });
+                                continue;
+                            }
                             match decrypt_payload_in_place(
                                 &mut packet[..pkt_len],
                                 &hdr,
@@ -658,11 +671,11 @@ fn drain_completions(
             CryptoResult::Encrypt(batch) => {
                 handle_encrypt_completion(udp, connections, &batch)?;
             }
-            CryptoResult::Decrypt(batch) => {
+            CryptoResult::Decrypt(mut batch) => {
                 handle_decrypt_completion(
                     tun,
                     connections,
-                    &batch,
+                    &mut batch,
                     tun_write_pending,
                     #[cfg(target_os = "linux")]
                     offload,
@@ -745,7 +758,7 @@ fn handle_encrypt_completion(
 fn handle_decrypt_completion(
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
-    batch: &DecryptBatch,
+    batch: &mut DecryptBatch,
     tun_write_pending: &mut std::collections::VecDeque<Vec<u8>>,
     #[cfg(target_os = "linux")] offload: bool,
 ) {
@@ -755,9 +768,13 @@ fn handle_decrypt_completion(
     };
 
     let mut close_received = false;
+    let mut rotation_committed = false;
 
-    for (i, result) in batch.results.iter().enumerate() {
-        match result {
+    // Process results. We iterate by index to allow mutable access to batch.packets
+    // for KeyPhaseMismatch retry.
+    let result_count = batch.results.len();
+    for i in 0..result_count {
+        match &batch.results[i] {
             DecryptOutcome::Ok {
                 pn,
                 key_phase,
@@ -765,27 +782,36 @@ fn handle_decrypt_completion(
                 ack,
                 close_received: pkt_close,
             } => {
+                let pn = *pn;
+                let key_phase = *key_phase;
+                let datagrams = datagrams.clone();
+                let ack_largest = ack.as_ref().map(|a| a.largest_acked);
+                let pkt_close = *pkt_close;
+
                 // Key phase check (sequential, on I/O thread).
-                entry.rx.check_key_phase(*key_phase, &entry.key_update, &entry.tx);
+                // Skip if rotation was already committed in this batch.
+                if !rotation_committed {
+                    entry.rx.check_key_phase(key_phase, &entry.key_update, &entry.tx);
+                }
 
                 // Replay check (sequential).
-                if !entry.rx.accept_decrypted_pn(*pn) {
+                if !entry.rx.accept_decrypted_pn(pn) {
                     continue; // Duplicate.
                 }
 
                 entry.last_rx = Instant::now();
 
                 // Process ACK.
-                if let Some(ack_frame) = ack {
-                    entry.tx.update_largest_acked(ack_frame.largest_acked);
+                if let Some(largest_acked) = ack_largest {
+                    entry.tx.update_largest_acked(largest_acked);
                 }
 
-                if *pkt_close {
+                if pkt_close {
                     close_received = true;
                 }
 
                 // Write datagrams to TUN.
-                for range in datagrams {
+                for range in &datagrams {
                     let datagram = &batch.packets[i][range.clone()];
                     if datagram.len() < 20 {
                         continue;
@@ -797,6 +823,51 @@ fn handle_decrypt_completion(
                         continue;
                     }
                     write_to_tun(tun, datagram, tun_write_pending, #[cfg(target_os = "linux")] offload);
+                }
+            }
+            DecryptOutcome::KeyPhaseMismatch { hdr } => {
+                let hdr = *hdr;
+
+                // Commit key rotation on I/O thread (sequential, idempotent).
+                entry.rx.check_key_phase(hdr.key_phase, &entry.key_update, &entry.tx);
+                rotation_committed = true;
+
+                // Retry AEAD with rotated key.
+                let packet = &mut batch.packets[i];
+                let pkt_len = packet.len();
+                let key = entry.rx.packet_key();
+                match decrypt_payload_in_place(&mut packet[..pkt_len], &hdr, &**key) {
+                    Ok(result) => {
+                        if !entry.rx.accept_decrypted_pn(hdr.pn) {
+                            continue;
+                        }
+                        entry.last_rx = Instant::now();
+
+                        if let Some(ack_frame) = &result.ack {
+                            entry.tx.update_largest_acked(ack_frame.largest_acked);
+                        }
+                        if result.close_received {
+                            close_received = true;
+                        }
+
+                        for datagram_range in &result.datagrams {
+                            let datagram = &packet[datagram_range.clone()];
+                            if datagram.len() < 20 {
+                                continue;
+                            }
+                            let src_ip =
+                                Ipv4Addr::new(datagram[12], datagram[13], datagram[14], datagram[15]);
+                            if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                continue;
+                            }
+                            write_to_tun(tun, datagram, tun_write_pending, #[cfg(target_os = "linux")] offload);
+                        }
+
+                        debug!("key rotation: retried decrypt on I/O thread succeeded");
+                    }
+                    Err(_) => {
+                        debug!("key rotation: retry decrypt failed, dropping packet");
+                    }
                 }
             }
             DecryptOutcome::Failed => {
@@ -1021,6 +1092,7 @@ fn submit_decrypt_batch(
         cid_len: entry.rx.local_cid_len(),
         tag_len: entry.tx.tag_len(),
         cid_key,
+        peer_key_phase: entry.rx.peer_key_phase(),
         results: Vec::new(),
     });
 

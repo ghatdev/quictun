@@ -7,6 +7,7 @@ use quinn_proto::ConnectionId;
 use crate::ParseError;
 
 /// Parsed 1-RTT short header (after header unprotection).
+#[derive(Clone, Copy)]
 pub struct ShortHeader {
     pub key_phase: bool,
     pub spin: bool,
