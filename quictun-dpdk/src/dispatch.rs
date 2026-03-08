@@ -229,3 +229,53 @@ pub enum PipelineControlMessage {
     /// Remove a connection from all workers.
     RemoveConnection { cid: u64 },
 }
+
+// ── Router Pipeline architecture (SharedConnectionState) ────────────
+
+/// Per-worker ring bundle for router pipeline mode.
+///
+/// Workers share `Arc<SharedConnectionState>` — any worker processes any
+/// connection's packets. Workers TX directly to outer NIC (no return ring).
+///
+/// - `decrypt_rx`: core 0 → worker (QUIC packets for decrypt, round-robin)
+/// - `return_rx`: core 0 → worker (NAT return traffic, directed by port range)
+/// - `control`: rare messages (new connection broadcasts)
+pub struct RouterPipelineRings {
+    pub decrypt_rx: SpscRing,
+    pub return_rx: SpscRing,
+    pub control: Mutex<Vec<RouterPipelineControlMessage>>,
+}
+
+impl RouterPipelineRings {
+    /// Create ring bundle for router pipeline worker `idx`.
+    pub fn new(idx: usize) -> Result<Self> {
+        Ok(Self {
+            decrypt_rx: SpscRing::new(&format!("rpl_dec_rx_{idx}"), RING_CAPACITY, 0)?,
+            return_rx: SpscRing::new(&format!("rpl_ret_rx_{idx}"), RING_CAPACITY, 0)?,
+            control: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+/// Per-connection metadata held by router pipeline workers.
+pub struct RouterPipelineConnection {
+    pub conn: Arc<SharedConnectionState>,
+    pub tunnel_ip: Ipv4Addr,
+    pub remote_addr: SocketAddr,
+    pub remote_mac: [u8; 6],
+}
+
+/// Control message for router pipeline workers (broadcast from core 0).
+pub enum RouterPipelineControlMessage {
+    /// Broadcast: add a new connection to all workers.
+    AddConnection {
+        conn: Arc<SharedConnectionState>,
+        tunnel_ip: Ipv4Addr,
+        remote_addr: SocketAddr,
+        remote_mac: [u8; 6],
+        cid: u64,
+        allowed_ips: Vec<Ipv4Net>,
+    },
+    /// Remove a connection from all workers.
+    RemoveConnection { cid: u64 },
+}

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::dispatch::{DpdkDispatchTable, PipelineRings, WorkerRings};
+use crate::dispatch::{PipelineRings, RouterPipelineRings};
 use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
@@ -278,7 +278,9 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             return result;
         }
 
-        // Multi-core router: dispatcher + worker architecture.
+        // Multi-core router: pipeline architecture (SharedConnectionState).
+        // Core 0 = I/O (RX classify, handshake, ACK, keepalive),
+        // Workers 1..N = crypto + routing + NAT (round-robin, any connection).
         let n_workers = n_cores - 1;
 
         // Restrict to listener mode.
@@ -286,12 +288,11 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             .ok_or_else(|| anyhow::anyhow!("multi-core router requires listener mode"))?;
         let mut multi_state = MultiQuicState::new(multi_server_config);
 
-        // Reconfigure outer port: 1 RX queue, 1 TX queue.
-        // Workers TX via inner_tx ring to dispatcher (virtio doesn't support multi-queue TX).
-        // Stop (not close) so we can reconfigure the same device.
+        // Reconfigure outer port: 1 RX queue, n_cores TX queues.
+        // Workers TX directly to outer NIC via per-worker TX queue.
         port::stop_port(dpdk_config.port_id);
         let (new_mac, hw_udp, hw_ip) =
-            port::configure_port_dispatcher(dpdk_config.port_id, 1, mempool)?;
+            port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
         identity.local_mac = new_mac;
 
         let checksum_mode = if dpdk_config.no_udp_checksum {
@@ -304,14 +305,11 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             ChecksumMode::Software
         };
 
-        // Create per-worker ring bundles (router mode: MP forward_rx).
-        let mut worker_rings: Vec<WorkerRings> = Vec::with_capacity(n_workers);
+        // Create per-worker router pipeline ring bundles (2 rings each).
+        let mut pipeline_rings: Vec<RouterPipelineRings> = Vec::with_capacity(n_workers);
         for i in 0..n_workers {
-            worker_rings.push(WorkerRings::new_router_mode(i)?);
+            pipeline_rings.push(RouterPipelineRings::new(i)?);
         }
-
-        // Build dispatch table.
-        let mut dispatch_table = DpdkDispatchTable::new(n_workers);
 
         // Compute NAT port ranges.
         let port_ranges = quictun_core::nat::compute_port_ranges(n_workers);
@@ -327,24 +325,23 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             n_workers,
             enable_nat,
             mss_clamp,
-            "starting router mode (multi-core)"
+            "starting router pipeline mode (multi-core)"
         );
 
         let result = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n_workers);
 
-            for (idx, rings) in worker_rings.iter().enumerate() {
+            for (idx, rings) in pipeline_rings.iter().enumerate() {
                 let shutdown = shutdown.clone();
                 let worker_identity = identity.clone();
                 let worker_arp = arp_table.clone();
                 let mempool = SendPtr(mempool);
                 let (port_start, port_end) = port_ranges[idx];
-                let worker_rings_ref = &worker_rings;
                 let peers_ref = peers;
 
                 handles.push(s.spawn(move || -> Result<()> {
                     let mempool = mempool.as_ptr();
-                    let core_idx = idx + 1; // core 0 is dispatcher
+                    let core_idx = idx + 1; // core 0 is I/O
                     let tx_queue = core_idx as u16;
 
                     // Pin thread to CPU.
@@ -360,18 +357,17 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                             )
                         };
                         if ret == 0 {
-                            tracing::info!(core = core_idx, "pinned router worker to CPU");
+                            tracing::info!(core = core_idx, "pinned router pipeline worker to CPU");
                         } else {
-                            tracing::warn!(core = core_idx, "failed to pin router worker to CPU");
+                            tracing::warn!(core = core_idx, "failed to pin router pipeline worker to CPU");
                         }
                     }
 
-                    crate::router::run_router_worker(
+                    crate::router::run_router_pipeline_worker(
                         outer_port_id,
                         tx_queue,
                         mempool,
                         rings,
-                        worker_rings_ref,
                         &worker_identity,
                         &worker_arp,
                         &shutdown,
@@ -389,13 +385,12 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 }));
             }
 
-            // Run dispatcher on core 0 (this thread).
-            let disp_result = crate::router::run_router_dispatcher(
+            // Run pipeline I/O on core 0 (this thread).
+            let io_result = crate::router::run_router_pipeline_io(
                 outer_port_id,
                 mempool,
                 &mut multi_state,
-                &mut dispatch_table,
-                &worker_rings,
+                &pipeline_rings,
                 &identity,
                 &mut arp_table,
                 &shutdown,
@@ -409,9 +404,9 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
             // Signal shutdown and wait for workers.
             shutdown.store(true, Ordering::Release);
-            let mut result = disp_result;
+            let mut result = io_result;
             for handle in handles {
-                if let Err(e) = handle.join().expect("router worker panicked") {
+                if let Err(e) = handle.join().expect("router pipeline worker panicked") {
                     if result.is_ok() {
                         result = Err(e);
                     }
