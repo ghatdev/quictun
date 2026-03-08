@@ -43,15 +43,25 @@ const TUN_WRITE_BUF_CAPACITY: usize = 256;
 ///
 /// Avoids per-datagram heap allocation on the decrypt→TUN path.
 /// Inner Vecs are never dropped — only truncated and reused via `resize()`.
+///
+/// Each buffer is allocated with GRO_BUF_CAP capacity so that tun-rs GRO
+/// can extend the first buffer in a coalescing group with subsequent packets'
+/// payloads without hitting `InsufficientCap`.
 #[cfg(target_os = "linux")]
-struct GroTxPool {
+pub(crate) struct GroTxPool {
     bufs: Vec<Vec<u8>>,
     active: usize,
 }
 
+/// Capacity per buffer for GRO coalescing. Must be large enough to hold
+/// the maximum coalesced packet (virtio hdr + multiple TCP segments).
+/// 65536 matches the max GRO/GSO packet size (16-bit gso_size field).
+#[cfg(target_os = "linux")]
+const GRO_BUF_CAP: usize = 65536;
+
 #[cfg(target_os = "linux")]
 impl GroTxPool {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             bufs: Vec::new(),
             active: 0,
@@ -59,16 +69,21 @@ impl GroTxPool {
     }
 
     /// Add a datagram to the pool, prepending VIRTIO_NET_HDR_LEN zero bytes.
-    fn push_datagram(&mut self, datagram: &[u8]) {
+    pub(crate) fn push_datagram(&mut self, datagram: &[u8]) {
         let hdr_len = quictun_tun::VIRTIO_NET_HDR_LEN;
         let total = hdr_len + datagram.len();
         if self.active < self.bufs.len() {
             let buf = &mut self.bufs[self.active];
+            // Ensure capacity for GRO coalescing (extend_from_slice by tun-rs).
+            if buf.capacity() < GRO_BUF_CAP {
+                buf.reserve(GRO_BUF_CAP - buf.capacity());
+            }
             buf.resize(total, 0);
             buf[..hdr_len].fill(0);
             buf[hdr_len..].copy_from_slice(datagram);
         } else {
-            let mut buf = vec![0u8; total];
+            let mut buf = Vec::with_capacity(GRO_BUF_CAP);
+            buf.resize(total, 0);
             buf[hdr_len..].copy_from_slice(datagram);
             self.bufs.push(buf);
         }
@@ -76,21 +91,21 @@ impl GroTxPool {
     }
 
     /// Return the active buffers as a mutable slice (for `send_multiple`).
-    fn as_mut_slice(&mut self) -> &mut [Vec<u8>] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [Vec<u8>] {
         &mut self.bufs[..self.active]
     }
 
     /// Iterator over active buffers (for fallback WouldBlock buffering).
-    fn iter(&self) -> impl Iterator<Item = &Vec<u8>> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.bufs[..self.active].iter()
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.active == 0
     }
 
     /// Reset the pool without dropping inner Vecs.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.active = 0;
     }
 }

@@ -41,6 +41,8 @@ use crate::engine::{
 };
 #[cfg(target_os = "linux")]
 use crate::engine::flush_gso_sync;
+#[cfg(target_os = "linux")]
+use crate::engine::GroTxPool;
 use quictun_tun::TunOptions;
 
 // ── Batch types ──────────────────────────────────────────────────────────
@@ -491,6 +493,16 @@ fn pipeline_io_loop(
     let mut idle_iters: u32 = 0;
     const BUSY_POLL_THRESHOLD: u32 = 64;
 
+    // GRO TX pool and table for batched TUN writes.
+    #[cfg(target_os = "linux")]
+    let mut gro_tx_pool = GroTxPool::new();
+    #[cfg(target_os = "linux")]
+    let mut gro_table = if config.offload {
+        Some(quictun_tun::GROTable::default())
+    } else {
+        None
+    };
+
     loop {
         let mut signal_received = false;
         let mut udp_readable;
@@ -566,6 +578,10 @@ fn pipeline_io_loop(
             in_flight_batches,
             #[cfg(target_os = "linux")]
             config.offload,
+            #[cfg(target_os = "linux")]
+            &mut gro_tx_pool,
+            #[cfg(target_os = "linux")]
+            &mut gro_table,
         )?;
 
         // ── Drain buffered TUN writes ────────────────────────────────
@@ -614,6 +630,10 @@ fn pipeline_io_loop(
             in_flight_batches,
             #[cfg(target_os = "linux")]
             config.offload,
+            #[cfg(target_os = "linux")]
+            &mut gro_tx_pool,
+            #[cfg(target_os = "linux")]
+            &mut gro_table,
         )?;
         drain_tun_write_buf(tun, tun_write_pending);
 
@@ -664,6 +684,10 @@ fn pipeline_io_loop(
             in_flight_batches,
             #[cfg(target_os = "linux")]
             config.offload,
+            #[cfg(target_os = "linux")]
+            &mut gro_tx_pool,
+            #[cfg(target_os = "linux")]
+            &mut gro_table,
         )?;
 
         // ── Timeouts + keepalives ────────────────────────────────────
@@ -717,6 +741,8 @@ fn drain_completions(
     tun_write_pending: &mut std::collections::VecDeque<Vec<u8>>,
     in_flight_batches: &mut usize,
     #[cfg(target_os = "linux")] offload: bool,
+    #[cfg(target_os = "linux")] gro_tx_pool: &mut GroTxPool,
+    #[cfg(target_os = "linux")] gro_table: &mut Option<quictun_tun::GROTable>,
 ) -> Result<()> {
     while let Ok(result) = done_rx.try_recv() {
         *in_flight_batches = in_flight_batches.saturating_sub(1);
@@ -732,10 +758,32 @@ fn drain_completions(
                     tun_write_pending,
                     #[cfg(target_os = "linux")]
                     offload,
+                    #[cfg(target_os = "linux")]
+                    gro_tx_pool,
                 );
             }
         }
     }
+
+    // Flush accumulated GRO TX buffers to TUN.
+    #[cfg(target_os = "linux")]
+    if offload && !gro_tx_pool.is_empty() {
+        if let Some(gro) = gro_table {
+            match tun.send_multiple(gro, gro_tx_pool.as_mut_slice(), quictun_tun::VIRTIO_NET_HDR_LEN) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    for buf in gro_tx_pool.iter() {
+                        tun_write_pending.push_back(buf.clone());
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "TUN send_multiple failed");
+                }
+            }
+            gro_tx_pool.reset();
+        }
+    }
+
     Ok(())
 }
 
@@ -814,6 +862,7 @@ fn handle_decrypt_completion(
     batch: &mut DecryptBatch,
     tun_write_pending: &mut std::collections::VecDeque<Vec<u8>>,
     #[cfg(target_os = "linux")] offload: bool,
+    #[cfg(target_os = "linux")] gro_tx_pool: &mut GroTxPool,
 ) {
     let entry = match connections.get_mut(&batch.cid_key) {
         Some(e) => e,
@@ -852,7 +901,7 @@ fn handle_decrypt_completion(
                     close_received = true;
                 }
 
-                // Write datagrams to TUN.
+                // Write datagrams to TUN (via GRO pool on Linux, per-packet otherwise).
                 for range in datagrams {
                     let datagram = &batch.packet(i)[range.clone()];
                     if datagram.len() < 20 {
@@ -864,7 +913,14 @@ fn handle_decrypt_completion(
                         debug!(src = %src_ip, "dropping: source IP not in allowed_ips");
                         continue;
                     }
-                    write_to_tun(tun, datagram, tun_write_pending, #[cfg(target_os = "linux")] offload);
+                    #[cfg(target_os = "linux")]
+                    if offload {
+                        gro_tx_pool.push_datagram(datagram);
+                    } else {
+                        write_to_tun(tun, datagram, tun_write_pending, false);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    write_to_tun(tun, datagram, tun_write_pending);
                 }
             }
             DecryptOutcome::KeyPhaseMismatch { .. } => {
@@ -910,7 +966,14 @@ fn handle_decrypt_completion(
                             if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
                                 continue;
                             }
-                            write_to_tun(tun, datagram, tun_write_pending, #[cfg(target_os = "linux")] offload);
+                            #[cfg(target_os = "linux")]
+                            if offload {
+                                gro_tx_pool.push_datagram(datagram);
+                            } else {
+                                write_to_tun(tun, datagram, tun_write_pending, false);
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            write_to_tun(tun, datagram, tun_write_pending);
                         }
 
                         debug!("key rotation: retried decrypt on I/O thread succeeded");
