@@ -78,9 +78,14 @@ enum DecryptOutcome {
 }
 
 /// A container of packets for batch crypto processing.
+///
+/// Uses a contiguous slab buffer to avoid per-packet heap allocation.
+/// Packets are stored consecutively in `slab` with boundaries in `offsets`.
 struct Container {
-    /// Raw packet data (owned, worker decrypts/encrypts in place).
-    packets: Vec<Vec<u8>>,
+    /// Contiguous buffer holding all packets back-to-back.
+    slab: Vec<u8>,
+    /// Byte offsets: packet i occupies slab[offsets[i]..offsets[i+1]].
+    offsets: Vec<usize>,
     /// Decrypt results per packet (filled by worker).
     decrypt_results: Vec<DecryptOutcome>,
     /// Encrypt output buffer (contiguous GSO buffer).
@@ -96,8 +101,77 @@ struct Container {
     conn: Option<Arc<SharedConnectionState>>,
 }
 
+impl Container {
+    /// Number of packets in this container.
+    fn packet_count(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    /// Reset for reuse — clears logical state but keeps allocated memory.
+    fn reset(&mut self) {
+        self.slab.clear();
+        self.offsets.clear();
+        self.offsets.push(0);
+        self.decrypt_results.clear();
+        self.encrypt_buf.clear();
+        self.encrypt_lens.clear();
+        self.encrypt_count = 0;
+        self.cid_key = 0;
+        self.direction = Direction::Decrypt;
+        self.conn = None;
+    }
+}
+
+/// Reusable pool of containers (sync.Pool equivalent).
+/// Lives on the I/O thread — no synchronization needed.
+struct ContainerPool {
+    pool: Vec<Box<Container>>,
+}
+
+impl ContainerPool {
+    fn new() -> Self {
+        Self { pool: Vec::new() }
+    }
+
+    /// Take a container from the pool, or allocate a new one.
+    fn take(&mut self) -> Box<Container> {
+        match self.pool.pop() {
+            Some(mut c) => {
+                c.reset();
+                c
+            }
+            None => Box::new(Container {
+                slab: Vec::new(),
+                offsets: vec![0],
+                decrypt_results: Vec::new(),
+                encrypt_buf: Vec::new(),
+                encrypt_lens: Vec::new(),
+                encrypt_count: 0,
+                cid_key: 0,
+                direction: Direction::Decrypt,
+                conn: None,
+            }),
+        }
+    }
+
+    /// Return a container to the pool for reuse.
+    fn put(&mut self, container: Box<Container>) {
+        self.pool.push(container);
+    }
+}
+
 // SAFETY: SharedConnectionState is Send+Sync. All other fields are owned.
 unsafe impl Send for Container {}
+
+#[derive(Default)]
+struct ContainerStats {
+    decrypt_ok: u64,
+    decrypt_fail: u64,
+    containers_completed: u64,
+    tun_writes: u64,
+    gro_flushes: u64,
+    gro_would_block: u64,
+}
 
 // ── Per-connection state ─────────────────────────────────────────────────
 
@@ -123,10 +197,15 @@ fn container_worker(
     while let Ok(mut container) = job_rx.recv() {
         match &container.direction {
             Direction::Decrypt => {
-                let conn = container.conn.as_ref().expect("decrypt container must have conn");
+                // Clone Arc to avoid borrow conflict with packet_mut.
+                let conn = Arc::clone(container.conn.as_ref().expect("decrypt container must have conn"));
                 container.decrypt_results.clear();
+                let n = container.packet_count();
 
-                for packet in &mut container.packets {
+                for i in 0..n {
+                    let start = container.offsets[i];
+                    let end = container.offsets[i + 1];
+                    let packet = &mut container.slab[start..end];
                     match conn.decrypt_in_place(packet) {
                         Ok(result) => {
                             container.decrypt_results.push(DecryptOutcome::Ok {
@@ -135,7 +214,8 @@ fn container_worker(
                                 close_received: result.close_received,
                             });
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            debug!(worker = id, error = ?e, pkt_len = packet.len(), "decrypt failed");
                             container.decrypt_results.push(DecryptOutcome::Failed);
                         }
                     }
@@ -151,21 +231,34 @@ fn container_worker(
                 header_key,
                 ..
             } => {
+                // Copy encrypt params to avoid borrow conflict with encrypt_buf.
+                let pn_start = *pn_start;
+                let key_phase = *key_phase;
+                let largest_acked = *largest_acked;
+                let tag_len = *tag_len;
+                let remote_cid = remote_cid.clone();
+                let packet_key = Arc::clone(packet_key);
+                let header_key = Arc::clone(header_key);
+
                 let mut gso_pos = 0usize;
                 container.encrypt_lens.clear();
                 container.encrypt_count = 0;
+                let n = container.packet_count();
 
-                for (i, payload) in container.packets.iter().enumerate() {
+                for i in 0..n {
+                    let start = container.offsets[i];
+                    let end = container.offsets[i + 1];
+                    let payload = &container.slab[start..end];
                     let pn = pn_start + i as u64;
                     match encrypt_packet(
                         payload,
-                        remote_cid,
+                        &remote_cid,
                         pn,
-                        *largest_acked,
-                        *key_phase,
-                        &***packet_key,
-                        &***header_key,
-                        *tag_len,
+                        largest_acked,
+                        key_phase,
+                        &**packet_key,
+                        &**header_key,
+                        tag_len,
                         &mut container.encrypt_buf[gso_pos..],
                     ) {
                         Ok(result) => {
@@ -324,6 +417,7 @@ pub fn run_container(
 
     // Track in-flight containers.
     let mut in_flight: usize = 0;
+
 
     // 7. Spawn workers.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -485,6 +579,10 @@ fn container_io_loop(
     ack_timer_interval: Duration,
     in_flight: &mut usize,
 ) -> Result<RunResult> {
+    let mut stats_deadline = Instant::now() + Duration::from_secs(2);
+    let mut stats = ContainerStats::default();
+    let mut container_pool = ContainerPool::new();
+
     loop {
         // Compute timeout.
         let mut timeout = Duration::from_secs(5);
@@ -540,6 +638,8 @@ fn container_io_loop(
             #[cfg(target_os = "linux")] offload,
             #[cfg(target_os = "linux")] gro_table,
             #[cfg(target_os = "linux")] gro_tx_pool,
+            &mut stats,
+            &mut container_pool,
         )?;
 
         // ── Drain buffered TUN writes ────────────────────────────────
@@ -550,6 +650,7 @@ fn container_io_loop(
             #[cfg(target_os = "linux")]
             {
                 udp_rx_linux(
+                    &mut container_pool,
                     udp, connections, config.cid_len, multi_state,
                     recv_bufs, recv_lens, recv_addrs, recv_work,
                     response_buf, job_tx, in_flight,
@@ -558,6 +659,7 @@ fn container_io_loop(
             #[cfg(not(target_os = "linux"))]
             {
                 udp_rx(
+                    &mut container_pool,
                     udp, connections, config.cid_len, multi_state,
                     recv_buf, response_buf, job_tx, in_flight,
                 )?;
@@ -570,6 +672,8 @@ fn container_io_loop(
             #[cfg(target_os = "linux")] offload,
             #[cfg(target_os = "linux")] gro_table,
             #[cfg(target_os = "linux")] gro_tx_pool,
+            &mut stats,
+            &mut container_pool,
         )?;
         drain_tun_write_buf(tun, tun_write_pending);
 
@@ -581,14 +685,15 @@ fn container_io_loop(
                     tun_rx_offload(
                         tun, connections, ip_to_cid, job_tx, in_flight,
                         tun_original_buf, tun_split_bufs, tun_split_sizes,
+                        &mut container_pool,
                     )?;
                 } else {
-                    tun_rx(tun, connections, ip_to_cid, job_tx, in_flight)?;
+                    tun_rx(tun, connections, ip_to_cid, job_tx, in_flight, &mut container_pool)?;
                 }
             }
             #[cfg(not(target_os = "linux"))]
             {
-                tun_rx(tun, connections, ip_to_cid, job_tx, in_flight)?;
+                tun_rx(tun, connections, ip_to_cid, job_tx, in_flight, &mut container_pool)?;
             }
         }
 
@@ -598,6 +703,8 @@ fn container_io_loop(
             #[cfg(target_os = "linux")] offload,
             #[cfg(target_os = "linux")] gro_table,
             #[cfg(target_os = "linux")] gro_tx_pool,
+            &mut stats,
+            &mut container_pool,
         )?;
 
         // ── Timeouts + keepalives ────────────────────────────────────
@@ -607,6 +714,23 @@ fn container_io_loop(
         if Instant::now() >= *next_ack_deadline {
             send_acks(udp, connections, encrypt_buf);
             *next_ack_deadline = Instant::now() + ack_timer_interval;
+        }
+
+        // ── Periodic debug stats ────────────────────────────────────
+        if Instant::now() >= stats_deadline {
+            info!(
+                in_flight = *in_flight,
+                pending = tun_write_pending.len(),
+                decrypt_ok = stats.decrypt_ok,
+                decrypt_fail = stats.decrypt_fail,
+                containers = stats.containers_completed,
+                tun_writes = stats.tun_writes,
+                gro_flushes = stats.gro_flushes,
+                gro_would_block = stats.gro_would_block,
+                "container stats"
+            );
+            stats = ContainerStats::default();
+            stats_deadline = Instant::now() + Duration::from_secs(2);
         }
 
         // ── Drive handshakes ─────────────────────────────────────────
@@ -641,11 +765,25 @@ fn drain_completions(
     #[cfg(target_os = "linux")] offload: bool,
     #[cfg(target_os = "linux")] gro_table: &mut Option<quictun_tun::GROTable>,
     #[cfg(target_os = "linux")] gro_tx_pool: &mut GroTxPool,
+    stats: &mut ContainerStats,
+    container_pool: &mut ContainerPool,
 ) -> Result<()> {
     while let Ok(container) = done_rx.try_recv() {
         *in_flight = in_flight.saturating_sub(1);
+        stats.containers_completed += 1;
+        let pkt_count: u64;
         match &container.direction {
             Direction::Decrypt => {
+                // Count decrypt outcomes.
+                let mut ok = 0u64;
+                for result in &container.decrypt_results {
+                    match result {
+                        DecryptOutcome::Ok { .. } => ok += 1,
+                        DecryptOutcome::Failed => stats.decrypt_fail += 1,
+                    }
+                }
+                stats.decrypt_ok += ok;
+                pkt_count = ok;
                 handle_decrypt_completion(
                     tun, connections, &container, tun_write_pending,
                     #[cfg(target_os = "linux")] offload,
@@ -654,10 +792,45 @@ fn drain_completions(
                 );
             }
             Direction::Encrypt { remote_addr, .. } => {
+                pkt_count = container.encrypt_count as u64;
                 handle_encrypt_completion(udp, connections, &container, *remote_addr)?;
             }
         }
+        // Check key update threshold for this connection.
+        if pkt_count > 0 {
+            if let Some(conn) = &container.conn {
+                conn.maybe_initiate_key_update(pkt_count);
+            }
+        }
+        // Recycle container to pool.
+        container_pool.put(container);
     }
+
+    // Flush accumulated GRO datagrams once after draining ALL completions.
+    #[cfg(target_os = "linux")]
+    if offload && !gro_tx_pool.is_empty() {
+        if let Some(gro) = gro_table {
+            stats.gro_flushes += 1;
+            match tun.send_multiple(gro, gro_tx_pool.as_mut_slice(), quictun_tun::VIRTIO_NET_HDR_LEN) {
+                Ok(_) => {
+                    stats.tun_writes += gro_tx_pool.active as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    stats.gro_would_block += 1;
+                    for buf in gro_tx_pool.iter() {
+                        if tun_write_pending.len() < tun_write_pending.capacity().max(256) {
+                            tun_write_pending.push_back(buf.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "TUN send_multiple failed");
+                }
+            }
+            gro_tx_pool.reset();
+        }
+    }
+
     Ok(())
 }
 
@@ -768,7 +941,8 @@ fn handle_decrypt_completion(
 
                 // Write datagrams to TUN.
                 for range in datagrams {
-                    let datagram = &container.packets[i][range.clone()];
+                    let pkt_start = container.offsets[i];
+                    let datagram = &container.slab[pkt_start + range.start..pkt_start + range.end];
                     if datagram.len() < 20 {
                         continue;
                     }
@@ -797,26 +971,6 @@ fn handle_decrypt_completion(
         }
     }
 
-    // Flush GRO batch.
-    #[cfg(target_os = "linux")]
-    if offload && !gro_tx_pool.is_empty() {
-        if let Some(gro) = gro_table {
-            match tun.send_multiple(gro, gro_tx_pool.as_mut_slice(), quictun_tun::VIRTIO_NET_HDR_LEN) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    for buf in gro_tx_pool.iter() {
-                        if tun_write_pending.len() < tun_write_pending.capacity().max(256) {
-                            tun_write_pending.push_back(buf.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(error = %e, "TUN send_multiple failed");
-                }
-            }
-            gro_tx_pool.reset();
-        }
-    }
 
     if close_received {
         let cid_key = container.cid_key;
@@ -835,9 +989,6 @@ fn write_to_tun_simple(
     datagram: &[u8],
     pending: &mut std::collections::VecDeque<Vec<u8>>,
 ) {
-    #[cfg(target_os = "linux")]
-    let data = datagram.to_vec();
-    #[cfg(not(target_os = "linux"))]
     let data = datagram.to_vec();
 
     if !pending.is_empty() {
@@ -882,6 +1033,7 @@ fn drain_tun_write_buf(
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn udp_rx_linux(
+    pool: &mut ContainerPool,
     udp: &std::net::UdpSocket,
     connections: &mut FxHashMap<u64, ContainerConnEntry>,
     cid_len: usize,
@@ -905,7 +1057,9 @@ fn udp_rx_linux(
             Err(e) => return Err(e).context("recvmmsg failed"),
         };
 
-        let mut decrypt_groups: FxHashMap<u64, Vec<Vec<u8>>> = FxHashMap::default();
+        // Collect (cid_key, buf_index, len) to avoid per-packet to_vec().
+        let mut decrypt_indices: FxHashMap<u64, SmallVec<[(usize, usize); 16]>> =
+            FxHashMap::default();
 
         for i in 0..n_msgs {
             let n = recv_lens[i];
@@ -930,15 +1084,19 @@ fn udp_rx_linux(
             let cid_key = cid_to_u64(&recv_bufs[i][1..1 + cid_len]);
 
             if connections.contains_key(&cid_key) {
-                decrypt_groups
+                decrypt_indices
                     .entry(cid_key)
                     .or_default()
-                    .push(recv_bufs[i][..n].to_vec());
+                    .push((i, n));
             }
         }
 
-        for (cid_key, packets) in decrypt_groups {
-            submit_decrypt_container(connections, cid_key, packets, job_tx, in_flight);
+        for (cid_key, indices) in &decrypt_indices {
+            let slices: SmallVec<[&[u8]; 16]> = indices
+                .iter()
+                .map(|&(idx, len)| &recv_bufs[idx][..len])
+                .collect();
+            submit_decrypt_container(connections, *cid_key, &slices, job_tx, in_flight, pool);
         }
 
         if n_msgs < max_batch {
@@ -950,6 +1108,7 @@ fn udp_rx_linux(
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn udp_rx(
+    pool: &mut ContainerPool,
     udp: &std::net::UdpSocket,
     connections: &mut FxHashMap<u64, ContainerConnEntry>,
     cid_len: usize,
@@ -959,7 +1118,8 @@ fn udp_rx(
     job_tx: &Sender<Box<Container>>,
     in_flight: &mut usize,
 ) -> Result<()> {
-    let mut decrypt_groups: FxHashMap<u64, Vec<Vec<u8>>> = FxHashMap::default();
+    // Non-Linux: single recv_buf, must copy into per-cid slabs.
+    let mut decrypt_slabs: FxHashMap<u64, (Vec<u8>, Vec<usize>)> = FxHashMap::default();
 
     loop {
         match udp.recv_from(recv_buf) {
@@ -977,10 +1137,11 @@ fn udp_rx(
                 } else if cid_len > 0 && n > cid_len {
                     let cid_key = cid_to_u64(&recv_buf[1..1 + cid_len]);
                     if connections.contains_key(&cid_key) {
-                        decrypt_groups
+                        let entry = decrypt_slabs
                             .entry(cid_key)
-                            .or_default()
-                            .push(recv_buf[..n].to_vec());
+                            .or_insert_with(|| (Vec::new(), vec![0]));
+                        entry.0.extend_from_slice(&recv_buf[..n]);
+                        entry.1.push(entry.0.len());
                     }
                 }
             }
@@ -989,35 +1150,64 @@ fn udp_rx(
         }
     }
 
-    for (cid_key, packets) in decrypt_groups {
-        submit_decrypt_container(connections, cid_key, packets, job_tx, in_flight);
+    for (cid_key, (slab, offsets)) in decrypt_slabs {
+        submit_decrypt_container_slab(connections, cid_key, slab, offsets, job_tx, in_flight, pool);
     }
 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn submit_decrypt_container(
     connections: &FxHashMap<u64, ContainerConnEntry>,
     cid_key: u64,
-    packets: Vec<Vec<u8>>,
+    packets: &[&[u8]],
     job_tx: &Sender<Box<Container>>,
     in_flight: &mut usize,
+    pool: &mut ContainerPool,
 ) {
     let entry = match connections.get(&cid_key) {
         Some(e) => e,
         None => return,
     };
 
-    let container = Box::new(Container {
-        packets,
-        decrypt_results: Vec::new(),
-        encrypt_buf: Vec::new(),
-        encrypt_lens: Vec::new(),
-        encrypt_count: 0,
-        cid_key,
-        direction: Direction::Decrypt,
-        conn: Some(Arc::clone(&entry.shared)),
-    });
+    let mut container = pool.take();
+    for pkt in packets {
+        container.slab.extend_from_slice(pkt);
+        container.offsets.push(container.slab.len());
+    }
+    container.cid_key = cid_key;
+    container.direction = Direction::Decrypt;
+    container.conn = Some(Arc::clone(&entry.shared));
+
+    if job_tx.try_send(container).is_ok() {
+        *in_flight += 1;
+    } else {
+        debug!("decrypt container dropped (channel full)");
+    }
+}
+
+/// Submit a decrypt container from a pre-built slab (non-Linux path).
+fn submit_decrypt_container_slab(
+    connections: &FxHashMap<u64, ContainerConnEntry>,
+    cid_key: u64,
+    slab: Vec<u8>,
+    offsets: Vec<usize>,
+    job_tx: &Sender<Box<Container>>,
+    in_flight: &mut usize,
+    pool: &mut ContainerPool,
+) {
+    let entry = match connections.get(&cid_key) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let mut container = pool.take();
+    container.slab = slab;
+    container.offsets = offsets;
+    container.cid_key = cid_key;
+    container.direction = Direction::Decrypt;
+    container.conn = Some(Arc::clone(&entry.shared));
 
     if job_tx.try_send(container).is_ok() {
         *in_flight += 1;
@@ -1034,8 +1224,10 @@ fn tun_rx(
     ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
     job_tx: &Sender<Box<Container>>,
     in_flight: &mut usize,
+    pool: &mut ContainerPool,
 ) -> Result<()> {
-    let mut groups: FxHashMap<u64, Vec<Vec<u8>>> = FxHashMap::default();
+    // Accumulate TUN packets into per-cid slabs (no per-packet alloc).
+    let mut groups: FxHashMap<u64, (Vec<u8>, Vec<usize>)> = FxHashMap::default();
 
     loop {
         let mut packet = [0u8; 1500];
@@ -1056,15 +1248,19 @@ fn tun_rx(
                 if !connections.contains_key(&cid) {
                     continue;
                 }
-                groups.entry(cid).or_default().push(packet[..n].to_vec());
+                let entry = groups
+                    .entry(cid)
+                    .or_insert_with(|| (Vec::new(), vec![0]));
+                entry.0.extend_from_slice(&packet[..n]);
+                entry.1.push(entry.0.len());
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e).context("TUN recv failed"),
         }
     }
 
-    for (cid_key, payloads) in groups {
-        submit_encrypt_container(connections, cid_key, payloads, job_tx, in_flight);
+    for (cid_key, (slab, offsets)) in groups {
+        submit_encrypt_container(connections, cid_key, slab, offsets, job_tx, in_flight, pool);
     }
 
     Ok(())
@@ -1081,8 +1277,9 @@ fn tun_rx_offload(
     original_buf: &mut [u8],
     split_bufs: &mut [Vec<u8>],
     split_sizes: &mut [usize],
+    pool: &mut ContainerPool,
 ) -> Result<()> {
-    let mut groups: FxHashMap<u64, Vec<Vec<u8>>> = FxHashMap::default();
+    let mut groups: FxHashMap<u64, (Vec<u8>, Vec<usize>)> = FxHashMap::default();
 
     loop {
         let n_pkts = match tun.recv_multiple(original_buf, split_bufs, split_sizes, 0) {
@@ -1110,12 +1307,16 @@ fn tun_rx_offload(
             if !connections.contains_key(&cid) {
                 continue;
             }
-            groups.entry(cid).or_default().push(packet.to_vec());
+            let entry = groups
+                .entry(cid)
+                .or_insert_with(|| (Vec::new(), vec![0]));
+            entry.0.extend_from_slice(packet);
+            entry.1.push(entry.0.len());
         }
     }
 
-    for (cid_key, payloads) in groups {
-        submit_encrypt_container(connections, cid_key, payloads, job_tx, in_flight);
+    for (cid_key, (slab, offsets)) in groups {
+        submit_encrypt_container(connections, cid_key, slab, offsets, job_tx, in_flight, pool);
     }
 
     Ok(())
@@ -1124,9 +1325,11 @@ fn tun_rx_offload(
 fn submit_encrypt_container(
     connections: &mut FxHashMap<u64, ContainerConnEntry>,
     cid_key: u64,
-    payloads: Vec<Vec<u8>>,
+    slab: Vec<u8>,
+    offsets: Vec<usize>,
     job_tx: &Sender<Box<Container>>,
     in_flight: &mut usize,
+    pool: &mut ContainerPool,
 ) {
     let entry = match connections.get_mut(&cid_key) {
         Some(e) => e,
@@ -1134,7 +1337,7 @@ fn submit_encrypt_container(
     };
 
     let tx = &entry.shared.tx;
-    let count = payloads.len() as u64;
+    let count = (offsets.len() - 1) as u64;
 
     // Assign PNs atomically.
     let pn_start = tx.next_pn_batch(count);
@@ -1144,27 +1347,24 @@ fn submit_encrypt_container(
     let packet_key = Arc::clone(&*key_guard);
     drop(key_guard);
 
-    let gso_buf_size = payloads.len() * MAX_PACKET;
+    let gso_buf_size = count as usize * MAX_PACKET;
 
-    let container = Box::new(Container {
-        packets: payloads,
-        decrypt_results: Vec::new(),
-        encrypt_buf: vec![0u8; gso_buf_size],
-        encrypt_lens: Vec::with_capacity(count as usize),
-        encrypt_count: 0,
-        cid_key,
-        direction: Direction::Encrypt {
-            pn_start,
-            key_phase: tx.key_phase(),
-            largest_acked: tx.largest_acked(),
-            tag_len: tx.tag_len(),
-            remote_cid: tx.remote_cid().clone(),
-            packet_key,
-            header_key: tx.header_key_arc(),
-            remote_addr: entry.remote_addr,
-        },
-        conn: None,
-    });
+    let mut container = pool.take();
+    container.slab = slab;
+    container.offsets = offsets;
+    container.encrypt_buf.resize(gso_buf_size, 0);
+    container.cid_key = cid_key;
+    container.conn = Some(Arc::clone(&entry.shared));
+    container.direction = Direction::Encrypt {
+        pn_start,
+        key_phase: tx.key_phase(),
+        largest_acked: tx.largest_acked(),
+        tag_len: tx.tag_len(),
+        remote_cid: tx.remote_cid().clone(),
+        packet_key,
+        header_key: tx.header_key_arc(),
+        remote_addr: entry.remote_addr,
+    };
 
     if job_tx.try_send(container).is_ok() {
         *in_flight += 1;

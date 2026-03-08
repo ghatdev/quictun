@@ -384,6 +384,11 @@ impl KeyUpdateState {
         self.key_exhausted.store(true, Ordering::Relaxed);
     }
 
+    /// Access the packets-since-key-update counter.
+    pub fn packets_since_update(&self) -> &AtomicU64 {
+        &self.packets_since_key_update
+    }
+
     /// Reset the packets-since-key-update counter.
     pub fn reset_packets_since_update(&self) {
         self.packets_since_key_update.store(0, Ordering::Relaxed);

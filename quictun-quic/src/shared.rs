@@ -143,10 +143,10 @@ impl SharedConnectionState {
     /// Steps:
     /// 1. Read `largest_rx_pn` (atomic, lock-free) for PN decode
     /// 2. Header unprotect (pure computation)
-    /// 3. Load RX key (ArcSwap, lock-free)
+    /// 3. Check key phase — if changed, try next-gen key first
     /// 4. AEAD decrypt (~500ns, pure computation)
     /// 5. Replay check + accept (~10-20ns mutex)
-    /// 6. Key phase rotation (rare, CAS)
+    /// 6. If key phase changed and AEAD succeeded, commit rotation (CAS)
     ///
     /// AEAD runs before replay check so the mutex isn't held during crypto.
     /// Duplicate packets waste ~500ns of crypto — acceptable at <0.1% rate.
@@ -166,28 +166,76 @@ impl SharedConnectionState {
             largest,
         )?;
 
-        // 3. Load current RX key (lock-free via ArcSwap).
-        let key_guard = self.rx_packet_key.load();
+        // 3. Check key phase BEFORE AEAD to detect peer rotation.
+        let current_phase = self.peer_key_phase.load(Ordering::Acquire);
+        let phase_changed = hdr.key_phase != current_phase;
 
-        // 4. AEAD decrypt (pure computation, ~500ns).
-        let result = decrypt_payload_in_place(packet, &hdr, &***key_guard)?;
+        // 4. AEAD decrypt — if key phase changed, try next-gen key.
+        let result = if phase_changed {
+            self.decrypt_with_next_key(packet, &hdr)?
+        } else {
+            let key_guard = self.rx_packet_key.load();
+            decrypt_payload_in_place(packet, &hdr, &***key_guard)?
+        };
 
         // 5. Replay check + accept (~10-20ns mutex).
         if !self.replay.test_and_accept(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
 
-        // 6. Key phase rotation (rare — happens once per 7M packets).
-        let current_phase = self.peer_key_phase.load(Ordering::Acquire);
-        if hdr.key_phase != current_phase {
+        // 6. If key phase changed and AEAD succeeded, commit the rotation.
+        if phase_changed {
             self.handle_key_phase_change(hdr.key_phase);
         }
 
         Ok(result)
     }
 
+    /// Try decrypting with the next generation key (peer-initiated key rotation).
+    ///
+    /// AEAD decrypt modifies the buffer in-place, so we save a copy before
+    /// trying the next-gen key. This only happens during key rotation (~once
+    /// per 7M packets), so the copy cost is negligible.
+    fn decrypt_with_next_key(
+        &self,
+        packet: &mut [u8],
+        hdr: &crate::packet::ShortHeader,
+    ) -> Result<DecryptedInPlace, ParseError> {
+        // Save payload so we can retry if the first key fails.
+        let saved = packet[hdr.payload_offset..].to_vec();
+
+        // First check if we have a pending RX key (we initiated the rotation).
+        {
+            let pending = self.pending_rx_key.lock();
+            if let Some(key) = &*pending {
+                if let Ok(result) = decrypt_payload_in_place(packet, hdr, &**key) {
+                    return Ok(result);
+                }
+                // Restore payload for next attempt.
+                packet[hdr.payload_offset..].copy_from_slice(&saved);
+            }
+        }
+
+        // Peer-initiated: peek next generation key.
+        {
+            let keys = self.key_update.next_keys().expect("key mutex");
+            if let Some((next_rx, _)) = keys.front() {
+                if let Ok(result) = decrypt_payload_in_place(packet, hdr, &**next_rx) {
+                    return Ok(result);
+                }
+                // Restore payload for next attempt.
+                packet[hdr.payload_offset..].copy_from_slice(&saved);
+            }
+        }
+
+        // Neither next-gen key works — fall back to current key.
+        let key_guard = self.rx_packet_key.load();
+        decrypt_payload_in_place(packet, hdr, &***key_guard)
+    }
+
     fn handle_key_phase_change(&self, new_phase: bool) {
         let old_phase = !new_phase;
+        tracing::debug!(old_phase, new_phase, "key phase change detected");
         // CAS: only one thread wins the rotation.
         if self
             .peer_key_phase
@@ -235,6 +283,32 @@ impl SharedConnectionState {
 
     pub fn is_key_exhausted(&self) -> bool {
         self.key_update.is_key_exhausted()
+    }
+
+    /// Check if key update should be initiated and do so if threshold reached.
+    ///
+    /// Called by the I/O thread (e.g., container dispatcher) periodically.
+    /// Pops next-gen keys, stores pending RX key, swaps TX key, flips key phase.
+    pub fn maybe_initiate_key_update(&self, count: u64) {
+        let prev = self
+            .key_update
+            .packets_since_update()
+            .fetch_add(count, Ordering::Relaxed);
+        if prev + count >= crate::KEY_UPDATE_THRESHOLD && prev < crate::KEY_UPDATE_THRESHOLD {
+            let mut next_keys = self.key_update.next_keys().expect("key mutex");
+            if let Some((new_rx, new_tx)) = next_keys.pop_front() {
+                let mut pending = self.pending_rx_key.lock();
+                *pending = Some(new_rx);
+                self.tx.store_packet_key(Arc::new(new_tx));
+                let old_phase = self.tx.key_phase();
+                self.tx.set_key_phase(!old_phase);
+                self.key_update.reset_packets_since_update();
+                tracing::debug!("key update: TX rotated, awaiting peer response");
+            } else {
+                self.key_update.set_key_exhausted();
+                warn!("key update: no pre-computed keys available, connection must be closed");
+            }
+        }
     }
 }
 
