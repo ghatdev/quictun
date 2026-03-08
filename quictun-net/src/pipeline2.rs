@@ -206,7 +206,7 @@ pub fn run_pipeline2(
         drain_transmits(&udp_socket, &mut multi_state)?;
 
         for ch in result.completed {
-            let Some((hs, conn_state, local_cids)) = multi_state.extract_connection(ch) else {
+            let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
                 continue;
             };
             let matched_peer = if config.peers.len() == 1 {
@@ -224,9 +224,8 @@ pub fn run_pipeline2(
             let tunnel_ip = matched_peer.tunnel_ip;
             let allowed_ips = matched_peer.allowed_ips.clone();
             let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
-            let cid_bytes: Vec<u8> = hs.local_cid[..].to_vec();
+            let cid_bytes: Vec<u8> = conn_state.local_cid()[..].to_vec();
             let cid_key = cid_to_u64(&cid_bytes);
-            let _ = &local_cids; // All local CIDs available; primary used for connection table.
             let shared = Arc::new(conn_state.into_shared());
             let last_rx_epoch = Arc::new(AtomicU64::new(epoch_millis()));
 

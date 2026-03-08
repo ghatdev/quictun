@@ -197,7 +197,10 @@ impl MultiQuicState {
 
     /// Extract keys from a completed handshake and remove it from the map.
     ///
-    /// Returns `(HandshakeState, LocalConnectionState)` on success.
+    /// Uses the handshake CID (`conn.local_cid()`) for local_cid, because we extract
+    /// the connection immediately after handshake — the peer has not yet received our
+    /// NEW_CONNECTION_ID frames, so it still uses the handshake CID as DCID.
+    /// Similarly, `remote_cid()` returns the peer's handshake CID (no rotation yet).
     pub fn extract_connection(
         &mut self,
         ch: ConnectionHandle,
@@ -209,7 +212,7 @@ impl MultiQuicState {
         let conn_state = LocalConnectionState::with_ack_interval(
             extracted.keys,
             extracted.key_gens,
-            extracted.local_cid,
+            *hs.connection.local_cid(),
             extracted.remote_cid,
             is_server,
             self.ack_interval,

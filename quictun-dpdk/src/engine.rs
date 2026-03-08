@@ -76,10 +76,8 @@ pub struct ResolvedHandshake {
     pub remote_addr: SocketAddr,
     pub remote_mac: [u8; 6],
     pub cid: u64,
-    /// Raw CID bytes for logging (primary CID).
+    /// Raw CID bytes for logging.
     pub cid_bytes: Vec<u8>,
-    /// All local CID u64 keys (primary + rotated). For dispatch table registration.
-    pub all_cid_keys: Vec<u64>,
     /// Peer's allowed IP networks (for router-mode routing table).
     pub allowed_ips: Vec<ipnet::Ipv4Net>,
 }
@@ -90,7 +88,6 @@ pub struct ResolvedHandshake {
 pub(crate) fn resolve_completed_handshake(
     hs: &shared::HandshakeState,
     conn_state: LocalConnectionState,
-    local_cids: &[quinn_proto::ConnectionId],
     peers: &[PeerConfig],
     identity: &NetIdentity,
     arp_table: &ArpTable,
@@ -126,7 +123,6 @@ pub(crate) fn resolve_completed_handshake(
 
     let cid_bytes = conn_state.local_cid().to_vec();
     let cid = cid_to_u64(&cid_bytes);
-    let all_cid_keys: Vec<u64> = local_cids.iter().map(|c| cid_to_u64(c)).collect();
 
     Some(ResolvedHandshake {
         conn: conn_state,
@@ -135,7 +131,6 @@ pub(crate) fn resolve_completed_handshake(
         remote_mac,
         cid,
         cid_bytes,
-        all_cid_keys,
         allowed_ips,
     })
 }
@@ -624,7 +619,7 @@ pub fn run(
             let drive_result = multi_state.poll_handshakes();
 
             for ch in drive_result.completed {
-                if let Some((mut hs, conn_state, local_cids)) = multi_state.extract_connection(ch) {
+                if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
                     // Drain final handshake transmits.
                     drain_handshake_transmits(
                         &mut hs.connection,
@@ -641,7 +636,7 @@ pub fn run(
                     );
 
                     let Some(resolved) =
-                        resolve_completed_handshake(&hs, conn_state, &local_cids, peers, identity, arp_table)
+                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
                     else {
                         continue;
                     };
@@ -662,7 +657,6 @@ pub fn run(
                         tunnel_ip = %resolved.tunnel_ip,
                         remote = %resolved.remote_addr,
                         cid = %hex::encode(&resolved.cid_bytes),
-                        num_cids = resolved.all_cid_keys.len(),
                         "connection established"
                     );
                 }
@@ -1106,7 +1100,6 @@ pub fn run_handshake_only(
 // ── Multi-client dispatcher + worker loops ──────────────────────────────
 
 use crate::dispatch::{ControlMessage, DpdkDispatchTable, WorkerRings};
-use quinn_proto::ConnectionId;
 
 /// Run the multi-client dispatcher on core 0.
 ///
@@ -1334,19 +1327,16 @@ pub fn run_dispatcher(
         let drive_result = multi_state.poll_handshakes();
 
         for ch in drive_result.completed {
-            if let Some((mut hs, conn_state, local_cids)) = multi_state.extract_connection(ch) {
+            if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
                 let Some(resolved) =
-                    resolve_completed_handshake(&hs, conn_state, &local_cids, peers, identity, arp_table)
+                    resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
                 else {
                     continue;
                 };
 
                 // Assign to least-loaded worker.
                 let worker_id = dispatch_table.least_loaded_worker();
-                // Register ALL local CIDs in dispatch table.
-                for cid in &local_cids {
-                    dispatch_table.register_cid(cid, worker_id);
-                }
+                dispatch_table.register_cid_raw(&resolved.cid_bytes, worker_id);
                 dispatch_table.add_route(resolved.tunnel_ip, worker_id);
 
                 // Drain final handshake transmits.
@@ -1378,7 +1368,6 @@ pub fn run_dispatcher(
                     tunnel_ip = %resolved.tunnel_ip,
                     worker = worker_id,
                     cid = %hex::encode(&resolved.cid_bytes),
-                    num_cids = local_cids.len(),
                     "connection assigned to worker"
                 );
             }
