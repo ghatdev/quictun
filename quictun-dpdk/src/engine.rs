@@ -491,27 +491,37 @@ pub fn run(
 
         for i in 0..nb as usize {
             // SAFETY: inner rx_burst wrote a valid mbuf pointer; exclusive ownership taken.
-            let mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
-            let data = mbuf.data();
-            if data.len() < ETH_HLEN {
-                continue;
-            }
-            let ethertype = u16::from_be_bytes([data[12], data[13]]);
-            match ethertype {
-                0x0800 => {
-                    // IPv4: route by dest IP, encrypt via quictun-proto.
-                    if data.len() < ETH_HLEN + 20 {
-                        continue;
-                    }
-                    inner_rx += 1;
-                    let ip_payload = &data[ETH_HLEN..];
+            let mut mbuf = unsafe { Mbuf::from_raw(inner_rx_mbufs[i]) };
 
-                    let dst_ip = Ipv4Addr::new(
+            // Extract fields from immutable data borrow, then drop the borrow.
+            let (ethertype, ip_payload_len, dst_ip) = {
+                let data = mbuf.data();
+                if data.len() < ETH_HLEN + 20 {
+                    let et = if data.len() >= ETH_HLEN {
+                        u16::from_be_bytes([data[12], data[13]])
+                    } else {
+                        0
+                    };
+                    (et, 0, Ipv4Addr::UNSPECIFIED)
+                } else {
+                    let et = u16::from_be_bytes([data[12], data[13]]);
+                    let ip_len = data.len() - ETH_HLEN;
+                    let dst = Ipv4Addr::new(
                         data[ETH_HLEN + 16],
                         data[ETH_HLEN + 17],
                         data[ETH_HLEN + 18],
                         data[ETH_HLEN + 19],
                     );
+                    (et, ip_len, dst)
+                }
+            };
+
+            match ethertype {
+                0x0800 => {
+                    if ip_payload_len == 0 {
+                        continue;
+                    }
+                    inner_rx += 1;
 
                     // Look up connection by dest IP, with single-connection default route.
                     let entry = if let Some(&cid) = ip_to_cid.get(&dst_ip) {
@@ -526,64 +536,72 @@ pub fn run(
                         continue;
                     };
 
-                    let max_quic_len = 1
-                        + entry.conn.remote_cid().len()
-                        + 4
-                        + 1
-                        + ip_payload.len()
-                        + entry.conn.tag_len();
-                    let max_frame_len = net::HEADER_SIZE + max_quic_len;
-                    let Ok(max_frame_len_u16) = u16::try_from(max_frame_len) else {
-                        continue;
-                    };
+                    // Zero-copy encrypt: reuse the inner RX mbuf.
+                    //
+                    // Inner mbuf layout: [inner ETH(14)][IP payload(N)]
+                    // QUIC short header(13) + DATAGRAM type(1) = 14 bytes = ETH_HLEN.
+                    // So the QUIC overhead exactly replaces the inner ETH header.
+                    //
+                    // Steps:
+                    // 1. Prepend 42 bytes for outer ETH(14)+IP(20)+UDP(8) using headroom
+                    // 2. Append tag_len bytes for AEAD tag
+                    // 3. Write QUIC header + DG type over old inner ETH position
+                    // 4. Encrypt QUIC payload in-place (no copy!)
+                    // 5. Write outer headers
+                    let tag_len = entry.conn.tag_len();
 
-                    if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
-                        if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
-                            match entry.conn.encrypt_datagram(
-                                ip_payload,
-                                &mut buf[net::HEADER_SIZE..],
-                            ) {
-                                Ok(result) => {
-                                    let remote_ip = match entry.remote_addr.ip() {
-                                        std::net::IpAddr::V4(ip) => ip,
-                                        _ => Ipv4Addr::UNSPECIFIED,
-                                    };
-                                    ip_id = ip_id.wrapping_add(1);
-                                    let actual_len = net::build_udp_packet_inplace(
-                                        &identity.local_mac,
-                                        &entry.remote_mac,
-                                        identity.local_ip,
-                                        remote_ip,
-                                        identity.local_port,
-                                        entry.remote_addr.port(),
-                                        result.len,
-                                        buf,
-                                        0,
-                                        ip_id,
-                                        checksum_mode,
-                                    );
-                                    tx_mbuf.truncate(actual_len as u16);
-                                    match checksum_mode {
-                                        ChecksumMode::HardwareUdpOnly => {
-                                            tx_mbuf.set_tx_udp_checksum_offload()
-                                        }
-                                        ChecksumMode::HardwareFull => {
-                                            tx_mbuf.set_tx_full_checksum_offload()
-                                        }
-                                        _ => {}
-                                    }
-                                    outer_tx_mbufs.push(tx_mbuf.into_raw());
+                    if mbuf.prepend(net::HEADER_SIZE as u16).is_none() {
+                        continue;
+                    }
+                    if mbuf.append(tag_len as u16).is_none() {
+                        continue;
+                    }
+
+                    let buf = mbuf.data_mut();
+                    // buf layout: [42 bytes for outer hdrs][old inner ETH(14)][IP payload(N)][tag space]
+                    let quic_buf = &mut buf[net::HEADER_SIZE..];
+
+                    match entry.conn.encrypt_datagram_in_place(ip_payload_len, quic_buf) {
+                        Ok(result) => {
+                            let remote_ip = match entry.remote_addr.ip() {
+                                std::net::IpAddr::V4(ip) => ip,
+                                _ => Ipv4Addr::UNSPECIFIED,
+                            };
+                            ip_id = ip_id.wrapping_add(1);
+                            net::build_udp_packet_inplace(
+                                &identity.local_mac,
+                                &entry.remote_mac,
+                                identity.local_ip,
+                                remote_ip,
+                                identity.local_port,
+                                entry.remote_addr.port(),
+                                result.len,
+                                buf,
+                                0,
+                                ip_id,
+                                checksum_mode,
+                            );
+                            // No truncate needed: prepend(42) + original(14+N) + append(tag)
+                            // = 42 + 14 + N + tag = HEADER_SIZE + result.len exactly.
+                            match checksum_mode {
+                                ChecksumMode::HardwareUdpOnly => {
+                                    mbuf.set_tx_udp_checksum_offload()
                                 }
-                                Err(e) => {
-                                    tracing::trace!(error = %e, "quictun-proto encrypt failed");
+                                ChecksumMode::HardwareFull => {
+                                    mbuf.set_tx_full_checksum_offload()
                                 }
+                                _ => {}
                             }
+                            outer_tx_mbufs.push(mbuf.into_raw());
+                        }
+                        Err(e) => {
+                            tracing::trace!(error = %e, "quictun-proto encrypt failed");
                         }
                     }
                 }
                 0x0806 => {
                     // ARP: reply to requests with our inner port MAC.
-                    if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(data) {
+                    if let Some(ParsedPacket::Arp(arp)) = net::parse_packet(mbuf.data()) {
                         if arp.is_request {
                             let inner_mac: [u8; 6] = inner.eth_hdr.bytes[6..12]
                                 .try_into()

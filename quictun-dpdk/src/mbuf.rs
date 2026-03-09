@@ -124,6 +124,19 @@ impl Mbuf {
         unsafe { ffi::shim_rte_pktmbuf_data_len(self.raw) as usize }
     }
 
+    /// Prepend `len` bytes at the head, consuming headroom.
+    ///
+    /// Returns a mutable pointer to the new data start, or `None` if
+    /// there's not enough headroom.
+    pub fn prepend(&mut self, len: u16) -> Option<*mut u8> {
+        let ptr = unsafe { ffi::shim_rte_pktmbuf_prepend(self.raw, len) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr as *mut u8)
+        }
+    }
+
     /// Remove `len` bytes from the beginning of the mbuf's data.
     ///
     /// Advances the data pointer forward and decreases data_len by `len`.

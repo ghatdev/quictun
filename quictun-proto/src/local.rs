@@ -18,7 +18,7 @@ use crate::frame::AckFrame;
 use crate::{
     DecryptedInPlace, DecryptedPacket, EncryptResult, KEY_UPDATE_THRESHOLD,
     MAX_ACK_RANGES, ParseError, decrypt_payload, decrypt_payload_in_place, encrypt_packet,
-    prepare_key_generations, unprotect_header,
+    encrypt_packet_in_place, prepare_key_generations, unprotect_header,
 };
 
 /// Pre-assigned metadata for one packet in a batch (parallel encrypt).
@@ -221,6 +221,37 @@ impl LocalConnectionState {
 
         encrypt_packet(
             payload,
+            &self.remote_cid,
+            pn,
+            self.largest_acked,
+            self.key_phase,
+            &*self.tx_packet_key,
+            &*self.tx_header_key,
+            self.tag_len,
+            buf,
+        )
+    }
+
+    /// Encrypt a datagram in-place where the payload is already positioned in `buf`.
+    ///
+    /// The payload must start at offset `1 + remote_cid.len() + 4 + 1` (= 14 for 8-byte CID).
+    /// Writes the QUIC short header and DATAGRAM frame type over the first bytes,
+    /// then encrypts in-place — **no payload copy**.
+    pub fn encrypt_datagram_in_place(
+        &mut self,
+        payload_len: usize,
+        buf: &mut [u8],
+    ) -> Result<EncryptResult, ParseError> {
+        self.packets_since_key_update += 1;
+        if self.packets_since_key_update == KEY_UPDATE_THRESHOLD {
+            self.initiate_key_update();
+        }
+
+        let pn = self.pn_counter;
+        self.pn_counter += 1;
+
+        encrypt_packet_in_place(
+            payload_len,
             &self.remote_cid,
             pn,
             self.largest_acked,

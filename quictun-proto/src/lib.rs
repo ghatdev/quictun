@@ -206,6 +206,44 @@ pub fn encrypt_packet(
     seal_packet(remote_cid, pn, header_len, frame_pos, tx_packet_key, tx_header_key, tag_len, buf)
 }
 
+/// Encrypt a 1-RTT QUIC packet in-place where the datagram payload is already positioned.
+///
+/// The caller must arrange `buf` so that the payload starts at offset
+/// `1 + remote_cid.len() + 4 + 1` (short header + DATAGRAM frame type byte).
+/// This function writes the short header and frame type over the first bytes,
+/// then encrypts in-place — **no payload copy**.
+///
+/// `payload_len` is the length of the payload already in the buffer.
+/// `buf` must be at least `header_overhead + payload_len + tag_len` bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_packet_in_place(
+    payload_len: usize,
+    remote_cid: &ConnectionId,
+    pn: u64,
+    largest_acked: u64,
+    key_phase: bool,
+    tx_packet_key: &dyn PacketKey,
+    tx_header_key: &dyn HeaderKey,
+    tag_len: usize,
+    buf: &mut [u8],
+) -> Result<EncryptResult, ParseError> {
+    let (header_len, _pn_len) = packet::build_short_header(
+        remote_cid,
+        pn,
+        largest_acked,
+        key_phase,
+        false, // spin bit
+        buf,
+    );
+
+    // Write DATAGRAM frame type byte. Payload is already at buf[header_len + 1..].
+    buf[header_len] = 0x30; // DATAGRAM_NO_LEN
+
+    let frame_pos = header_len + 1 + payload_len;
+
+    seal_packet(remote_cid, pn, header_len, frame_pos, tx_packet_key, tx_header_key, tag_len, buf)
+}
+
 /// Build and encrypt a 1-RTT QUIC packet containing only an ACK frame.
 ///
 /// Used for standalone timer-driven ACKs, decoupled from the data path.
