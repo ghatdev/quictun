@@ -1,11 +1,14 @@
 # QuicTun
 
+> **Status: Experimental** — Under active development. APIs and config format may change.
+
 A high-performance VPN tunnel over QUIC + TLS 1.3 with Raw Public Keys (RFC 7250). P-256 ECDSA pinned identities, no certificate authorities.
 
 ## Why
 
 - **Standards-based** — QUIC (RFC 9000), TLS 1.3 (RFC 8446), QUIC Datagrams (RFC 9221). No custom crypto.
 - **FIPS-ready** — All cryptography via aws-lc-rs (FIPS 140-3 Certificate #4631).
+- **CA-ready** — RPK for pinned identities by default, but the TLS 1.3 handshake supports full X.509 CA chains for enterprise deployments.
 - **Firewall traversal** — UDP 443, indistinguishable from HTTP/3 to DPI.
 - **Low overhead** — 20-byte per-packet overhead with zero-length CIDs (vs. WireGuard's 32 bytes).
 - **Multiple data planes** — mio (default), DPDK kernel-bypass.
@@ -32,6 +35,17 @@ quictun-net/      Sync mio engine (default kernel data plane)
 quictun-dpdk/     Linux DPDK kernel-bypass data plane
 quictun-cli/      CLI binary (genkey, pubkey, up, down)
 ```
+
+### Protocol Design
+
+The handshake uses standard QUIC (quinn-proto) for connection establishment and TLS 1.3
+key exchange. After the handshake completes, the data plane switches to quictun-proto — a
+custom 1-RTT implementation optimized for tunnel traffic. It uses the same QUIC packet
+format (short header, AEAD encryption, header protection) and is compliant with RFC 9000
+and RFC 9001 for the subset it implements, but intentionally omits features unnecessary
+for point-to-point tunnels: CID rotation, connection migration, ECN, streams, and
+flow/congestion control. This hybrid approach gets QUIC's handshake and firewall traversal
+benefits while eliminating per-packet overhead from the full QUIC state machine.
 
 ### Data Planes
 
