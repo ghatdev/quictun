@@ -9,40 +9,44 @@
 ## Environment
 
 - **Host:** AMD Ryzen 9700X (Zen 5), Proxmox KVM
-- **VMs:** 4 vCPUs, 7.7GB RAM, virtio NIC, AVX-512
+- **vm1 (listener):** 4 vCPUs, 7.7GB RAM, virtio NIC, AVX-512
+- **vm2 (connector):** 2 vCPUs, 7.7GB RAM, virtio NIC, AVX-512
 - **OS:** Ubuntu 6.8.0-87-generic x86_64
 - **NIC:** ens19 (secondary), same Proxmox bridge
 - **Tool:** iperf3 TCP, 10s duration
-- **Cipher:** AES-128-GCM (hardware accelerated)
+- **Cipher:** AES-128-GCM (hardware accelerated via AVX-512)
 - **Raw baseline:** 26.8 Gbps (no tunnel, virtual bridge)
+- **VM variance:** ~7-10% run-to-run. Numbers are median of 2-3 runs.
 
 ---
 
 ## Throughput
 
+### DPDK Engine (quictun-dpdk)
+
+| Config | Throughput | Direction | Notes |
+|--------|-----------|-----------|-------|
+| **single-core optimized** | **16.0 Gbps** | reverse (-R) | Zero-copy encrypt + decrypt, 10.5x kernel WG |
+| **single-core optimized** | **13.4 Gbps** | forward | vm2 connector-limited (2 vCPUs) |
+| single-core default | 8.1 Gbps | forward | split vq, no zero-copy |
+| kernel ← DPDK connector (-R) | 10.8 Gbps | reverse | DPDK as receiver, kernel connector |
+| kernel → DPDK listener | 7.67 Gbps | forward | kernel connector bottleneck |
+| TAP PMD | 3.98 Gbps | forward | IPI bottleneck (14% CPU) |
+
+DPDK benchmarks use DPDK engines on both VMs (statically linked binary).
+
 ### Kernel Engine (quictun-net)
 
 | Config | Throughput | Retrans | Notes |
 |--------|-----------|---------|-------|
-| **pipeline + GRO (2 threads)** | **10.7 Gbps** | 41–474 | GRO 27:1 coalescing |
+| **pipeline + GRO (2 threads)** | **10.7 Gbps** | 41-474 | GRO 27:1 coalescing |
 | single-thread + GRO | 10.2 Gbps | ~0 | GRO only |
-| pipeline, no GRO (2 threads) | 6.50 Gbps | 2–12 | epoll skip + slab batches |
+| pipeline, no GRO (2 threads) | 6.50 Gbps | 2-12 | epoll skip + slab batches |
 | single-thread, no GRO | 3.17 Gbps | ~0 | per-packet TUN writes |
 
 Pipeline adds ~5% over single-thread with GRO — within VM variance. AES-128-GCM on
-AVX-512 is ~1 µs/pkt; crypto is only ~4% of CPU. The pipeline offloads crypto to a
-worker thread, but there's barely any work to offload. ChaCha20 (no HW accel) would
-benefit more.
-
-### DPDK Engine (quictun-dpdk)
-
-| Config | Throughput | Notes |
-|--------|-----------|-------|
-| **virtio-user tuned** | **14.0 Gbps** | packed vq, AVX-512, 9.1× kernel WG |
-| virtio-user default | 8.1 Gbps | split vq, zero-copy decrypt |
-| kernel ← DPDK connector (-R) | 10.8 Gbps | DPDK as receiver |
-| kernel → DPDK listener | 7.67 Gbps | exceeds wireguard-go |
-| TAP PMD | 3.98 Gbps | IPI bottleneck (14% CPU) |
+AVX-512 is ~1 us/pkt; crypto is only ~4% of CPU. The pipeline offloads crypto to a
+worker thread, but there's barely any work to offload.
 
 ### DPDK Router
 
@@ -50,7 +54,7 @@ benefit more.
 |--------|-----------|-------|
 | single-core NAT | 6.95 Gbps | via vm3 |
 | single-core NAT (-R) | 3.47 Gbps | reverse direction |
-| multi-core NAT | 1.89 Gbps | ring TX overhead |
+| multi-core pipeline (2 cores) | 10.6 Gbps | ring overhead ~3% |
 
 ### Competitors
 
@@ -86,7 +90,7 @@ Measured with `ping -i 0.1` through tunnel. Raw VM-to-VM latency: 0.39 ms avg.
 
 ### Spike Analysis
 
-Occasional spikes to 5–7 ms are caused by **VM hypervisor scheduling**, not our code:
+Occasional spikes to 5-7 ms are caused by **VM hypervisor scheduling**, not our code:
 
 - bpftrace shows 69 events in 10 s where the I/O thread is off-CPU for > 5 ms
 - Single-thread and pipeline exhibit the same spike pattern
@@ -97,14 +101,31 @@ lowering average latency from 4.05 ms to 2.24 ms under load.
 
 ---
 
-## GRO: The Key Optimization
+## DPDK Profiling
+
+Profiled on vm1 single-core at 13 Gbps (forward direction):
+
+| Component | CPU % | Notes |
+|-----------|-------|-------|
+| NIC rx_burst | ~50% | Polling outer port (DPDK poll mode) |
+| Loop overhead | ~35% | Parse, lookup, mbuf ops, tx_burst |
+| ~~Instant::now()~~ | ~~12%~~ | Fixed: rate-limited to every 32K iterations |
+| Crypto (AES-GCM) | <0.5% | AVX-512, essentially free |
+
+The bottleneck is the vhost kthread (~100% CPU) that copies packets between kernel
+(TAP) and DPDK hugepage memory. This is inherent to virtio-user and is the
+DPDK-recommended inner path (KNI was removed in DPDK 23.11).
+
+---
+
+## GRO: The Key Kernel Optimization
 
 The single biggest throughput gain came from fixing GRO buffer capacity.
 
 ### Problem
 
 `GroTxPool::push_datagram()` allocated buffers at exactly the packet size (~1390 bytes).
-tun-rs GRO coalescing requires `buf_capacity() >= 2 × bufs_offset + coalesced_len` to
+tun-rs GRO coalescing requires `buf_capacity() >= 2 * bufs_offset + coalesced_len` to
 merge packets. With capacity ~1390 and a minimum of ~2728 needed for 2 packets, tun-rs
 returned `InsufficientCap` for **every** packet — 1:1 coalescing ratio, zero benefit,
 pure overhead.
@@ -122,11 +143,13 @@ coalescing.
 | Coalescing ratio | 1:1 | 27:1 |
 | TUN write CPU | 52% | 2% |
 | Throughput (pipeline) | 6.50 Gbps | **10.7 Gbps (+65%)** |
-| Throughput (single) | 3.17 Gbps | **10.2 Gbps (+3.2×)** |
+| Throughput (single) | 3.17 Gbps | **10.2 Gbps (+3.2x)** |
 
 ---
 
-## Optimization History (Kernel Engine)
+## Optimization History
+
+### Kernel Engine
 
 | Step | Change | Before | After | Delta |
 |------|--------|--------|-------|-------|
@@ -135,3 +158,15 @@ coalescing.
 | Slab batches | Contiguous slab vs Vec\<Vec\<u8\>\> | 6.50 Gbps | 6.47 Gbps | neutral |
 | GRO fix | Vec::with_capacity(65536) | 6.50 Gbps | 10.7 Gbps | **+65%** |
 | Engine cleanup | Remove container/per-core/pipeline v2 | 10.7 Gbps | 10.3 Gbps | same |
+
+### DPDK Engine (single-core)
+
+| Step | Change | Before | After | Delta |
+|------|--------|--------|-------|-------|
+| Baseline | virtio-user, packed vq, AVX-512 | — | 14.0 Gbps | — |
+| Zero-copy decrypt | rte_pktmbuf_adj reuse | 14.0 Gbps | 16.0 Gbps (-R) | **+14%** |
+| Rate-limit clock | Instant::now() every 32K iters | (included above) | (included above) | ~0% fwd |
+| Zero-copy encrypt | rte_pktmbuf_prepend reuse | 16.0 Gbps (-R) | 15.7 Gbps (-R) | neutral |
+
+Zero-copy encrypt eliminates mempool alloc + ~1400-byte copy per TX packet, but
+throughput is unchanged because the vhost kthread is the bottleneck, not our engine.

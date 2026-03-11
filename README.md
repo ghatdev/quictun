@@ -29,17 +29,17 @@ quictun-core/     Config, QUIC builders, peer management, NAT, ICMP, routing
 quictun-proto/    Custom QUIC 1-RTT data plane (RFC 9000/9001 compliant)
 quictun-tun/      Sync TUN device wrapper (tun-rs v2)
 quictun-net/      Sync mio engine (default kernel data plane)
-quictun-dpdk/     [Experimental] Linux DPDK kernel-bypass data plane
+quictun-dpdk/     Linux DPDK kernel-bypass data plane
 quictun-cli/      CLI binary (genkey, pubkey, up, down)
 ```
 
 ### Data Planes
 
-| Data Plane | Throughput | Latency (under load) | Notes |
-|------------|-----------|---------------------|-------|
-| **Kernel + GRO** | **10.7 Gbps** | 2.3 ms avg | Default, 2 threads |
-| **DPDK virtio-user** | **14.0 Gbps** | — | 9.1x kernel WireGuard |
-| **DPDK router** | **6.95 Gbps** | — | Single-core, NAT |
+| Data Plane | Throughput | Notes |
+|------------|-----------|-------|
+| **DPDK single-core** | **16.0 Gbps** | Zero-copy encrypt + decrypt, 10.5x kernel WireGuard |
+| **Kernel + GRO** | **10.7 Gbps** | Default, 2 threads |
+| **DPDK router** | **6.95 Gbps** | Single-core, NAT |
 
 Kernel WireGuard: 1.53 Gbps. Tailscale wireguard-go: 7.37 Gbps (same hardware).
 
@@ -47,9 +47,11 @@ See [docs/benchmarks.md](docs/benchmarks.md) for full results.
 
 ## Config
 
+### Listener (kernel engine)
+
 ```toml
 [interface]
-mode = "listener"          # or "connector"
+mode = "listener"
 private_key = "base64-encoded-private-key"
 address = "10.0.0.1/24"
 listen_port = 443
@@ -62,6 +64,28 @@ cc = "none"                # no congestion control
 [[peers]]
 public_key = "base64-encoded-public-key"
 allowed_ips = ["10.0.0.0/24"]
+keepalive = 25
+```
+
+### Listener (DPDK engine)
+
+```toml
+[interface]
+mode = "listener"
+private_key = "base64-encoded-private-key"
+address = "10.0.0.1/24"
+listen_port = 4433
+ciphers = ["aes-128-gcm"]
+
+[engine]
+backend = "dpdk-virtio"    # or "dpdk-router"
+dpdk_local_ip = "10.23.30.100"
+dpdk_cores = 1
+cc = "none"
+
+[[peers]]
+public_key = "base64-encoded-public-key"
+allowed_ips = ["10.0.0.2/32"]
 keepalive = 25
 ```
 
