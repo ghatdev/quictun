@@ -2,7 +2,7 @@
 
 **Date:** March 2026
 
-**Author:** SeoulValley Engineering
+**Author:** SeongUk Cho
 
 ---
 

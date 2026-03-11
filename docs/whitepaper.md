@@ -1,6 +1,6 @@
 # QuicTun: A QUIC-Based Secure Tunnel Primitive Built on RFC-Standardized Protocols
 
-**Authors:** SeoulValley Engineering
+**Authors:** SeongUk Cho
 
 **Date:** February 2026
 
