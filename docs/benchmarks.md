@@ -48,6 +48,22 @@ Pipeline adds ~5% over single-thread with GRO — within VM variance. AES-128-GC
 AVX-512 is ~1 us/pkt; crypto is only ~4% of CPU. The pipeline offloads crypto to a
 worker thread, but there's barely any work to offload.
 
+### Cipher Comparison: AES-128-GCM vs ChaCha20-Poly1305
+
+| Engine | Cipher | Throughput | Notes |
+|--------|--------|-----------|-------|
+| DPDK single-core | AES-128-GCM | **16.0 Gbps** (-R) / **13.4 Gbps** (fwd) | AES-NI + AVX-512, crypto <0.5% CPU |
+| DPDK single-core | ChaCha20 | **10.7 Gbps** (-R) / **10.3 Gbps** (fwd) | -33% rev, -23% fwd |
+| Kernel single-thread + GRO | AES-128-GCM | **6.76 Gbps** | threads=1 |
+| Kernel single-thread + GRO | ChaCha20 | **4.76 Gbps** | -30% vs AES |
+
+AES-128-GCM with AES-NI is effectively free on this hardware (Zen 5, AVX-512). With
+AES, the bottleneck is I/O (vhost kthread for DPDK, TUN syscalls for kernel). ChaCha20
+makes crypto the bottleneck — ~30% slower across all engines. This matches external
+findings (Yuce 2025: AES-GCM 11-19% faster than ChaCha20 on AES-NI hardware); the
+larger gap here is because quictun's non-crypto overhead is lower, making the cipher
+difference more visible.
+
 ### DPDK Router
 
 | Config | Throughput | Notes |
