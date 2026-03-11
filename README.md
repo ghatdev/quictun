@@ -41,11 +41,34 @@ quictun-cli/      CLI binary (genkey, pubkey, up, down)
 The handshake uses standard QUIC (quinn-proto) for connection establishment and TLS 1.3
 key exchange. After the handshake completes, the data plane switches to quictun-proto — a
 custom 1-RTT implementation optimized for tunnel traffic. It uses the same QUIC packet
-format (short header, AEAD encryption, header protection) and is compliant with RFC 9000
-and RFC 9001 for the subset it implements, but intentionally omits features unnecessary
-for point-to-point tunnels: CID rotation, connection migration, ECN, streams, and
-flow/congestion control. This hybrid approach gets QUIC's handshake and firewall traversal
-benefits while eliminating per-packet overhead from the full QUIC state machine.
+format (short header, AEAD encryption, header protection) and is wire-compatible with
+RFC 9000 and RFC 9001 for the subset it implements.
+
+**What quictun-proto implements (RFC-compliant):**
+- Short header format, header protection, AEAD encrypt/decrypt (RFC 9000/9001)
+- DATAGRAM frames (RFC 9221), ACK frames, PING, PADDING, CONNECTION_CLOSE
+- Key update via key_phase bit rotation with pre-computed key generations
+- Replay protection via sliding-window bitmap (65536 PNs)
+- Fixed 4-byte packet number encoding for lock-free parallel encrypt
+
+**Intentionally omitted (by design):**
+- Streams, flow control — tunnel is DATAGRAM-only, fire-and-forget
+- Loss detection, retransmission — inner TCP handles its own recovery
+- Congestion control — avoids double-CC with inner TCP (delay-based CC planned)
+
+**Not yet implemented (planned):**
+- Connection migration + PATH_CHALLENGE/RESPONSE — tunnel drops on network change today
+- CID rotation — fixed CIDs allow observer tracking; rotation preserves privacy
+- Spin bit — passive RTT measurement for operators
+- ECN passthrough — useful when delay-based CC is added
+
+**Design note: fixed 4-byte PN.** Standard QUIC uses 1-4 byte variable PN encoding
+based on `largest_acked`, creating a TX→RX state dependency. quictun-proto uses fixed
+4-byte PN unconditionally: the encoder needs only an atomic counter, no ACK state.
+This enables lock-free parallel encrypt across pipeline workers and multi-core DPDK,
+and preserves the zero-copy mbuf layout where QUIC header (13) + DATAGRAM type (1) =
+14 bytes = Ethernet header size. Cost: 2 extra bytes/pkt for the first ~47ms of a
+connection (after that, variable PN would need 3-4 bytes anyway at line rate).
 
 ### Data Planes
 
