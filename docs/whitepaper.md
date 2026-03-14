@@ -2,9 +2,9 @@
 
 **Authors:** SeongUk Cho
 
-**Date:** February 2026
+**Date:** March 2026
 
-**Version:** 1.0
+**Version:** 2.0
 
 ---
 
@@ -12,9 +12,9 @@
 
 WireGuard established a new standard for VPN simplicity, but its design choices — the Noise protocol framework with Curve25519, ChaCha20-Poly1305, and BLAKE2s — create barriers in environments requiring FIPS 140-3 compliance. Its fixed UDP port is trivially blocked by restrictive firewalls, and it lacks native support for connection migration.
 
-We present **QuicTun**, a secure tunnel primitive built directly on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), leveraging Raw Public Keys (RFC 7250) for WireGuard-style identity management without the overhead of X.509 certificate infrastructure. Like WireGuard, QuicTun is a point-to-point tunnel — it creates a secure, encrypted link between two peers. What operators build on top of it (site-to-site VPN, remote access gateway, mesh overlay, multi-hop relay) is an application-layer concern, not a protocol concern. By adopting QUIC as the transport layer, QuicTun inherits encryption, multiplexing, congestion control, and connection migration as first-class protocol features rather than re-implementing them.
+We present **QuicTun**, a secure tunnel primitive that uses a **two-phase protocol design**: standard QUIC (RFC 9000) and TLS 1.3 (RFC 8446) for connection establishment, then a purpose-built 1-RTT data plane for steady-state packet forwarding. This split eliminates QUIC's stream state machine, congestion control, and loss detection from the hot path while retaining the full security guarantees of the TLS 1.3 handshake. Raw Public Keys (RFC 7250) provide WireGuard-style identity management without X.509 certificate infrastructure. Like WireGuard, QuicTun is a point-to-point tunnel — it creates a secure, encrypted link between two peers. What operators build on top of it (site-to-site VPN, remote access gateway, mesh overlay, multi-hop relay) is an application-layer concern, not a protocol concern.
 
-Our per-packet overhead analysis demonstrates that QuicTun with zero-length Connection IDs achieves a **20-byte overhead** per tunneled packet — 37.5% less than WireGuard's 32-byte overhead — while operating over a fully RFC-standardized protocol stack. Because QuicTun's entire cryptographic layer delegates to aws-lc-rs (FIPS 140-3 Certificate #4631), deployments requiring FIPS compliance can enable it through configuration rather than architectural changes. QuicTun operates on UDP port 443, making it indistinguishable from standard QUIC/HTTP3 traffic to network middleboxes and DPI systems.
+Our per-packet overhead analysis demonstrates that QuicTun with zero-length Connection IDs achieves a **20-byte overhead** per tunneled packet with variable packet number encoding — 37.5% less than WireGuard's 32-byte overhead — while operating over a fully RFC-standardized protocol stack. A fixed 4-byte packet number mode (23-byte overhead) enables lock-free parallel encryption across CPU cores. Because QuicTun's entire cryptographic layer delegates to aws-lc-rs (FIPS 140-3 Certificate #4631), deployments requiring FIPS compliance can enable it through configuration rather than architectural changes. QuicTun operates on UDP port 443, making it indistinguishable from standard QUIC/HTTP3 traffic to network middleboxes and DPI systems.
 
 ---
 
@@ -43,11 +43,11 @@ WireGuard [Donenfeld 2017] is widely recognized for its minimal attack surface (
 
 This paper makes the following contributions:
 
-1. **Architecture.** We present QuicTun, a tunnel primitive that uses QUIC datagrams (RFC 9221) for data-plane transport and QUIC streams for control-plane signaling, achieving clean separation of concerns over a single UDP flow.
-2. **Overhead analysis.** We provide a byte-level comparison showing QuicTun achieves 20-byte per-packet overhead (with zero-length CIDs), compared to WireGuard's 32 bytes.
+1. **Two-phase protocol architecture.** We present QuicTun, a tunnel primitive that uses standard QUIC for connection establishment and a purpose-built 1-RTT data plane for steady-state forwarding. The data plane uses QUIC DATAGRAM frames (RFC 9221) with the same wire format and AEAD encryption as standard QUIC short header packets, but eliminates streams, congestion control, and loss detection from the hot path.
+2. **Overhead analysis.** We provide a byte-level comparison showing QuicTun achieves 20-byte per-packet overhead (with zero-length CIDs and variable packet numbers), compared to WireGuard's 32 bytes. A fixed 4-byte packet number mode (23 bytes overhead) enables lock-free parallel encryption.
 3. **FIPS-ready cryptography.** We describe a cryptographic architecture that delegates all primitives to aws-lc-rs (FIPS 140-3 Certificate #4631), enabling FIPS-compliant operation through a configuration flag without architectural changes.
 4. **Firewall traversal.** We demonstrate that QuicTun on UDP 443 is protocol-indistinguishable from standard HTTP/3 traffic to passive DPI systems.
-5. **Performance tiers.** We present a three-tier architecture (TUN, XDP/AF_XDP, DPDK) enabling deployment from 1 Gbps edge nodes to 100 Gbps data center gateways.
+5. **Performance tiers.** We present a two-tier data-plane architecture — a kernel engine using synchronous I/O with GRO/GSO offloads, and a DPDK kernel-bypass engine — enabling deployment from edge nodes to data center gateways. The DPDK tier includes a router mode for dedicated gateway appliances with NAT and multi-core pipeline support.
 
 ---
 
@@ -117,13 +117,13 @@ WireGuard's primitives — Curve25519, ChaCha20-Poly1305, BLAKE2s — are not FI
 |---|---|---|---|---|---|
 | FIPS 140-3 ready | No | Yes | Yes | Yes | **Yes** |
 | Connection migration | No | IKEv2 MOBIKE | No | Yes | **Yes** |
-| Built-in congestion control | No | No | No | Yes | **Yes** |
+| Congestion control | No | No | No | Yes | **Optional (pluggable)** |
 | Firewall traversal (443) | No | UDP 500/4500 | TCP 443 | Yes | **Yes** |
 | 1-RTT handshake | Yes (1-RTT) | 2-RTT | 2+ RTT | 1-RTT | **1-RTT** |
 | Per-packet overhead | 32 B | 50–73 B | 46–69 B | 29+ B | **20 B** |
 | DPI resistance | Low | Low | Medium | High | **High** |
 | RFC standardized transport | No | Yes | No | Yes | **Yes** |
-| Kernel-mode data path | Yes | Yes | No | No | **Yes (XDP)** |
+| Kernel-bypass data path | Yes | Yes | No | No | **Yes (DPDK)** |
 | Path MTU discovery | ICMP-based | ICMP-based | ICMP-based | DPLPMTUD | **DPLPMTUD** |
 | Code complexity | ~4K LoC | ~100K+ LoC | ~100K+ LoC | Varies | **~15K LoC** |
 
@@ -182,9 +182,9 @@ The following are explicitly out of scope for the tunnel primitive:
 
 ### 4.1 System Architecture
 
-QuicTun is a point-to-point tunnel primitive with a **data-plane-only** architecture: all tunnel traffic uses QUIC DATAGRAM frames (RFC 9221) for unreliable, low-overhead IP packet transport. Management and configuration are handled out-of-band (static configuration, local CLI/API), following WireGuard's proven model of zero in-band control plane.
+QuicTun is a point-to-point tunnel primitive with a **two-phase, data-plane-only** architecture. Connection establishment uses standard QUIC (quinn-proto) for the TLS 1.3 handshake. Once 1-RTT keys are established, the data plane switches to **quictun-proto** — a purpose-built 1-RTT implementation that processes only DATAGRAM, ACK, PING, and CONNECTION_CLOSE frames. This eliminates QUIC's stream state machine, flow control, loss detection, and congestion control from the forwarding path. Management and configuration are handled out-of-band (static configuration, local CLI), following WireGuard's proven model of zero in-band control plane.
 
-This separation provides security benefits: the data path only parses DATAGRAM, ACK, and PING frames — no stream state machine, no flow control complexity, no stream-related attack surface. Configuration changes require local OS-level access (CLI or Unix socket), never over the wire.
+This separation provides security benefits: the data path parses only four frame types — no stream reassembly, no flow control complexity, no stream-related attack surface. The handshake path uses the full QUIC state machine but runs only at connection setup (milliseconds). Configuration changes require local OS-level access (CLI), never over the wire.
 
 **Figure 1: System Architecture**
 
@@ -192,34 +192,31 @@ This separation provides security benefits: the data path only parses DATAGRAM, 
 graph TB
     subgraph "User Space"
         App["Application Traffic"]
-        TUN["TUN Interface"]
+        TUN["TUN Interface<br/>(or DPDK virtio)"]
 
         subgraph "QuicTun Process"
-            DP["Data Plane<br/>(QUIC Datagrams)"]
-            CC["Congestion Control"]
+            HS["Handshake<br/>(quinn-proto + rustls)"]
+            DP["Data Plane<br/>(quictun-proto)"]
             KM["Key Manager<br/>(aws-lc-rs FIPS)"]
-            MGMT["Management API<br/>(Unix Socket / CLI)"]
         end
-
-        QUIC["QUIC Stack<br/>(quinn + rustls)"]
     end
 
-    subgraph "Kernel Space"
-        XDP["XDP/AF_XDP<br/>(Optional Fast Path)"]
-        UDP["UDP Socket"]
+    subgraph "Network I/O"
+        MIO["Kernel Engine<br/>(mio + UDP socket)"]
+        DPDK["DPDK Engine<br/>(poll-mode drivers)"]
     end
 
     NET["Network<br/>(UDP 443)"]
 
     App --> TUN
     TUN --> DP
-    DP --> QUIC
-    CC --> QUIC
-    KM --> QUIC
-    QUIC --> UDP
-    QUIC -.-> XDP
-    XDP --> UDP
-    UDP --> NET
+    HS --> DP
+    KM --> HS
+    KM --> DP
+    DP --> MIO
+    DP --> DPDK
+    MIO --> NET
+    DPDK --> NET
 ```
 
 ### 4.2 Management (Out-of-Band)
@@ -236,24 +233,41 @@ Following WireGuard's design philosophy, QuicTun has **no in-band control plane*
 
 ### 4.3 Data Plane
 
-The data plane uses QUIC DATAGRAM frames (RFC 9221) to transport tunneled IP packets. Each DATAGRAM frame carries a single IP packet without additional framing — the QUIC layer provides encryption, integrity, and replay protection.
+QuicTun uses a **two-phase data plane**. During connection establishment, the standard QUIC stack (quinn-proto) handles the TLS 1.3 handshake. Once 1-RTT keys are extracted, a purpose-built data plane (quictun-proto) takes over for all steady-state packet forwarding.
 
-Key properties of DATAGRAM frames for VPN use:
+**Phase 1: Handshake (quinn-proto).** Standard QUIC Initial and Handshake packets carry the TLS 1.3 key exchange with RPK authentication. This phase uses the full QUIC state machine and runs only at connection setup.
 
-- **Unreliable delivery** — Lost datagrams are not retransmitted by QUIC, avoiding head-of-line blocking and allowing inner-protocol congestion control (e.g., TCP) to operate correctly.
-- **Congestion-controlled** — DATAGRAM frames are subject to QUIC's congestion control, preventing the tunnel from overwhelming the network path.
+**Phase 2: Data forwarding (quictun-proto).** After 1-RTT keys are established, quictun-proto processes packets using the same QUIC short header wire format (RFC 9000) and AEAD encryption (RFC 9001). It implements:
+- **DATAGRAM frames** (RFC 9221) — each carries a single tunneled IP packet
+- **ACK frames** — timer-driven, for peer liveness and key update confirmation
+- **PING frames** — keepalive
+- **CONNECTION_CLOSE** — graceful shutdown
+- **Key update** — via key_phase bit rotation with pre-computed key generations
+- **Replay protection** — sliding-window bitmap (65536 packet numbers)
+
+**Intentionally excluded from the data plane:** streams, flow control, loss detection, retransmission, and congestion control. These are unnecessary for a DATAGRAM-only tunnel where inner protocols (TCP) handle their own reliability and rate adaptation.
+
+**Design rationale:** A general-purpose QUIC implementation allocates significant CPU to state that a tunnel never uses — stream reassembly buffers, per-stream flow control windows, loss detection timers, and congestion window calculations. Profiling of an earlier full-QUIC design showed the QUIC state machine consuming ~19% of CPU at line rate. The two-phase design eliminates this overhead while preserving the security properties of the TLS 1.3 handshake.
+
+Key properties of the data plane:
+
+- **Unreliable delivery** — Lost datagrams are not retransmitted, avoiding head-of-line blocking and allowing inner-protocol congestion control to operate correctly.
 - **Minimal framing** — A DATAGRAM frame adds only a type byte and length field, contributing to QuicTun's low per-packet overhead.
+- **Wire-compatible** — Data-plane packets are valid QUIC short header packets. Middleboxes, load balancers, and QUIC-aware firewalls handle them identically to standard QUIC traffic.
 
 ### 4.4 Connection Lifecycle
 
 ```
-1. Client sends QUIC Initial (ClientHello with RPK)
-2. Server responds with Handshake (ServerHello with RPK)
-3. TLS 1.3 handshake completes (1-RTT), 1-RTT keys extracted
-4. Data plane begins: IP packets sent as DATAGRAM frames
-5. Connection migration handled transparently via QUIC CIDs
-6. Shutdown via CONNECTION_CLOSE or idle timeout
+1. Client sends QUIC Initial (ClientHello with RPK)          ← quinn-proto
+2. Server responds with Handshake (ServerHello with RPK)      ← quinn-proto
+3. TLS 1.3 handshake completes, 1-RTT keys extracted          ← quinn-proto
+4. Data plane switches to quictun-proto                        ← handoff
+5. IP packets sent as DATAGRAM frames in QUIC short headers    ← quictun-proto
+6. Key rotation via key_phase bit at volume threshold          ← quictun-proto
+7. Shutdown via CONNECTION_CLOSE or idle timeout               ← quictun-proto
 ```
+
+The handoff at step 4 is the critical design point. quinn-proto provides the full QUIC state machine for secure connection establishment; quictun-proto provides a minimal, high-performance forwarding engine for the lifetime of the tunnel. Packet routing between the two phases uses the QUIC header form bit: long header (bit 7 = 1) routes to quinn-proto for handshake processing; short header (bit 7 = 0) routes to quictun-proto for data forwarding.
 
 ---
 
@@ -427,6 +441,31 @@ The per-packet overhead is the central quantitative contribution of this paper. 
 
 The AEAD tag is identical in both protocols (16 bytes): AES-GCM and ChaCha20-Poly1305 both produce 16-byte tags.
 
+### 5.4.1 Fixed 4-Byte Packet Number Mode
+
+Standard QUIC uses 1–4 byte variable packet number encoding, where the encoder selects the shortest representation based on `largest_acked`. This creates a TX→RX state dependency: the encoder must know the latest ACK state to choose the encoding length. This dependency prevents lock-free parallel encryption across CPU cores.
+
+QuicTun's data plane offers a **fixed 4-byte packet number** mode: the encoder needs only an atomic counter, no ACK state. This enables:
+
+- **Lock-free parallel encrypt** — Multiple CPU cores can encrypt packets concurrently without synchronization on ACK state.
+- **Zero-copy mbuf alignment** — QUIC header (1 flags + 0 CID + 4 PN = 5 bytes) + DATAGRAM frame (1 type + 1 length = 2 bytes) = 7 bytes. With header protection sample offset, this preserves efficient memory alignment for DMA-based packet I/O.
+- **Stateless encoding** — The packet number encoder is a single atomic increment, eliminating a class of concurrency bugs.
+
+The cost is 3 extra bytes per packet compared to the 1-byte minimum (23 vs 20 bytes overhead with CID=0). In practice, variable encoding would reach 3–4 bytes within ~47ms at line rate, so the cost applies only to the first fraction of a connection's lifetime. For long-lived tunnels, the amortized overhead difference is negligible.
+
+### Table 2a: Overhead with Fixed 4-Byte Packet Number (CID=0)
+
+| Component | Variable PN (min) | Fixed 4-Byte PN |
+|---|---|---|
+| QUIC flags byte | 1 | 1 |
+| Connection ID | 0 | 0 |
+| Packet number | 1 | 4 |
+| DATAGRAM frame type | 1 | 1 |
+| DATAGRAM length (varint) | 1 | 1 |
+| AEAD tag | 16 | 16 |
+| **Total (excl. UDP)** | **20** | **23** |
+| **Overhead vs WireGuard** | **-37.5%** | **-28.1%** |
+
 ### 5.5 Connection ID Tradeoffs
 
 QUIC Connection IDs (CIDs) enable connection migration by providing a session identifier that is independent of the network 5-tuple. The CID length directly impacts per-packet overhead.
@@ -476,20 +515,22 @@ sequenceDiagram
 
 Migration completes within a single RTT (PATH_CHALLENGE + PATH_RESPONSE), with no cryptographic re-establishment. TLS session keys, tunnel IP assignment, and routing configuration all persist across the migration.
 
+**Note:** Connection migration requires non-zero Connection IDs (CID > 0) so that the server can associate packets from the new address with the existing session. With zero-length CIDs, sessions are bound to the 5-tuple. Deployments requiring migration should configure CID length ≥ 4.
+
 ### 5.7 Congestion Control
 
-QuicTun inherits QUIC's mandatory congestion control, applying it to DATAGRAM frames. This provides:
+QuicTun's data plane (quictun-proto) is **DATAGRAM-only and does not retransmit lost packets**. This design interacts with congestion control differently than a stream-based QUIC connection.
 
-- **Fair coexistence** — The tunnel shares bandwidth fairly with competing TCP and QUIC flows.
-- **Bufferbloat prevention** — BBR or CUBIC pacing prevents excessive queuing in network buffers.
-- **Loss-based adaptation** — The sending rate adapts to observed packet loss, preventing tunnel-induced congestion collapse.
+**The double-CC problem.** Inner TCP connections running through the tunnel perform their own congestion control. Adding a second congestion controller at the tunnel layer creates complex interactions: the outer CC may throttle the tunnel below the capacity that inner TCP has probed, or inner TCP may misinterpret outer CC-induced drops as path congestion. These interactions are well-documented in the tunneling literature and are a primary reason WireGuard deliberately omits congestion control.
 
-QuicTun supports pluggable congestion control algorithms:
-- **CUBIC** (RFC 9438) — Default, well-understood behavior
-- **BBR v2** — Recommended for high-BDP paths (data center interconnects, satellite links)
-- **NewReno** (RFC 9002 default) — Conservative baseline
+**QuicTun's approach.** The data plane treats congestion control as **optional and pluggable** rather than mandatory:
 
-Note: Inner TCP connections running through the tunnel perform their own congestion control. The interaction between inner and outer congestion control is mitigated by using DATAGRAM frames (unreliable) rather than QUIC streams (reliable), ensuring the outer QUIC layer does not retransmit lost datagrams. When QUIC's congestion control drops a datagram due to congestion, the inner TCP detects the loss via its own mechanisms and adapts. This is preferable to WireGuard's approach, where the tunnel has no congestion awareness and inner TCP must discover congestion entirely on its own.
+- **Default: no outer CC.** For point-to-point tunnels on dedicated or well-provisioned links, the data plane forwards datagrams without rate limiting. Inner TCP handles congestion adaptation end-to-end. This matches WireGuard's behavior and avoids double-CC pathology.
+- **Optional: delay-based CC.** For shared network paths where fair coexistence matters, a delay-based congestion controller can be enabled. Delay-based CC (rather than loss-based) is preferred because it can detect queuing before packet loss occurs, reducing interference with inner TCP's loss-based signals.
+
+This pluggable design acknowledges that the optimal CC strategy depends on the deployment: dedicated site-to-site links benefit from no outer CC, while shared WAN paths may benefit from tunnel-level pacing.
+
+**Comparison with WireGuard:** WireGuard has no congestion control and no mechanism to add it. QuicTun's architecture supports CC as an optional layer without protocol changes, giving operators the choice rather than making it for them.
 
 ### 5.8 Path MTU Discovery
 
@@ -565,11 +606,11 @@ All key material is stored within the aws-lc-rs module boundary and zeroized on 
 
 ## 7. Performance Architecture
 
-QuicTun provides three data-plane tiers, enabling deployment across the performance spectrum from edge devices to data center gateways.
+QuicTun provides two data-plane tiers, enabling deployment across the performance spectrum from edge devices to data center gateways.
 
 ### 7.0 Empirical Context: Where the Bottleneck Actually Is
 
-Recent empirical work provides critical context for performance estimates. Yuce et al. [Yuce 2025] modified WireGuard to support AES-GCM with AES-NI and measured performance across kernel and user-space implementations. Their key findings:
+Recent empirical work provides critical context for VPN performance. Yuce et al. [Yuce 2025] modified WireGuard to support AES-GCM with AES-NI and measured performance across kernel and user-space implementations. Their key findings:
 
 1. **Encryption accounts for only ~7% of CPU time.** Flame graph analysis shows the kernel networking stack (conntrack, netfilter, routing) dominates processing. Encryption is not the bottleneck.
 
@@ -581,69 +622,84 @@ Recent empirical work provides critical context for performance estimates. Yuce 
 
 5. **WireGuard's lack of cipher negotiation is a practical limitation.** Their AES implementation requires both peers to use the same cipher, with no way to negotiate. They identify dynamic cipher selection as "promising future work."
 
-These findings directly validate QuicTun's design choices: TLS 1.3 provides the cipher negotiation WireGuard lacks, AES-GCM is the faster cipher on AES-NI hardware, and user-space implementations with kernel bypass (XDP/DPDK) are the established path to high throughput. Critically, since encryption is only ~7% of processing time, QuicTun's additional per-packet overhead (QUIC header protection, congestion control state updates, frame construction) has modest impact on total throughput.
+These findings validate QuicTun's design choices: TLS 1.3 provides the cipher negotiation WireGuard lacks, AES-GCM is the faster cipher on AES-NI hardware, and user-space implementations with kernel bypass are the established path to high throughput. Since encryption is only ~7% of processing time, the dominant bottleneck in any VPN is **packet I/O** — the cost of moving packets between the NIC, kernel, and user space. QuicTun's two-tier architecture addresses this directly: the kernel engine minimizes I/O overhead via GRO/GSO batching; the DPDK engine eliminates kernel involvement entirely. The two-phase protocol design (Section 4.3) further reduces CPU overhead by eliminating the QUIC state machine from the hot path — profiling of a full-QUIC design showed ~19% CPU spent in protocol state management, which quictun-proto eliminates.
 
 ### Table 6: Performance Tier Characteristics
 
-| Tier | Mechanism | Expected Throughput | Latency Overhead | Use Case |
-|---|---|---|---|---|
-| **Tier 1: TUN** | User-space TUN device, tokio event loop | 2–5 Gbps | ~50 μs | Laptops, edge routers, containers |
-| **Tier 2: XDP/AF_XDP** | eBPF fast path, kernel bypass for data plane | 10–25 Gbps | ~10 μs | Branch gateways, medium servers |
-| **Tier 3: DPDK** | Full kernel bypass, poll-mode drivers | 25–100 Gbps | ~5 μs | Data center gateways, backbone nodes |
+| Tier | Mechanism | Throughput Range | Use Case |
+|---|---|---|---|
+| **Kernel Engine** | Synchronous mio event loop, TUN device, UDP socket with GRO/GSO | 5–15 Gbps | Laptops, edge routers, general-purpose servers |
+| **DPDK Engine** | Full kernel bypass, poll-mode drivers, dedicated CPU cores | 15–100 Gbps | Data center gateways, VPN appliances, backbone nodes |
 
 **Figure 6: Performance Tier Architecture**
 
 ```mermaid
 graph LR
-    subgraph "Tier 1: TUN (User Space)"
-        T1_APP["Application"] --> T1_TUN["TUN Device"]
-        T1_TUN --> T1_QT["QuicTun<br/>(tokio)"]
-        T1_QT --> T1_UDP["UDP Socket"]
-        T1_UDP --> T1_NIC["NIC"]
+    subgraph "Kernel Engine (mio)"
+        K_APP["Application"] --> K_TUN["TUN Device<br/>(GRO/GSO)"]
+        K_TUN --> K_QT["quictun-proto<br/>(mio event loop)"]
+        K_QT --> K_UDP["UDP Socket<br/>(GRO/GSO)"]
+        K_UDP --> K_NIC["NIC"]
     end
 
-    subgraph "Tier 2: XDP/AF_XDP (Hybrid)"
-        T2_APP["Application"] --> T2_TUN["TUN Device"]
-        T2_TUN --> T2_QT["QuicTun<br/>(Control)"]
-        T2_QT --> T2_XDP["XDP Program<br/>(eBPF)"]
-        T2_XDP --> T2_AFXDP["AF_XDP<br/>Socket"]
-        T2_AFXDP --> T2_NIC["NIC"]
-    end
-
-    subgraph "Tier 3: DPDK (Full Bypass)"
-        T3_APP["Application"] --> T3_TUN["TUN Device"]
-        T3_TUN --> T3_QT["QuicTun<br/>(Control)"]
-        T3_QT --> T3_DPDK["DPDK<br/>PMD"]
-        T3_DPDK --> T3_NIC["NIC"]
+    subgraph "DPDK Engine"
+        D_APP["Application"] --> D_VIO["Virtio-User<br/>(vhost-net)"]
+        D_VIO --> D_QT["quictun-proto<br/>(poll-mode)"]
+        D_QT --> D_PMD["NIC PMD<br/>(zero-copy)"]
+        D_PMD --> D_NIC["NIC"]
     end
 ```
 
-### 7.1 Tier 1: TUN Device (User Space)
+### 7.1 Kernel Engine (Default)
 
-The baseline tier uses a standard TUN interface with the `tokio` async runtime:
+The kernel engine uses a synchronous event loop (`mio`) with a TUN device and UDP socket:
 
 - IP packets are read from the TUN device, wrapped in QUIC DATAGRAM frames, and sent via a UDP socket.
-- `quinn` manages the QUIC connection state, including congestion control and key updates.
+- quictun-proto manages the data-plane connection state; quinn-proto is used only for handshake.
+- **GRO/GSO offloads** are the critical optimization. Generic Receive Offload (GRO) coalesces multiple incoming UDP packets into a single large buffer per `recvmsg` call; Generic Segmentation Offload (GSO) batches multiple outgoing packets into a single `sendmsg` call. This amortizes per-packet system call overhead — the dominant cost in kernel-based packet I/O. Both TUN-side and UDP-side offloads are supported (Linux kernel ≥ 6.2 for TUN UDP offloads).
+- **Multi-thread pipeline**: With `threads > 1`, the engine runs an I/O thread for TUN/socket operations and N worker threads for encryption/decryption. For CPUs with hardware AES acceleration (AES-NI, ARMv8-CE, AVX-512 VAES), crypto is typically <5% of CPU, so the pipeline provides modest gains. Single-thread mode is sufficient for most deployments.
 - This tier requires no special kernel modules or capabilities beyond `CAP_NET_ADMIN` for TUN device creation.
-- Expected performance: 2–5 Gbps per core depending on CPU and MTU configuration. User-space WireGuard implementations with AES-GCM achieve ~4.4 Gbps per core [Yuce 2025]; QuicTun adds QUIC protocol overhead but benefits from the same AES-NI acceleration.
 
-### 7.2 Tier 2: XDP/AF_XDP (Hybrid Kernel Bypass)
+### 7.2 DPDK Engine (Kernel Bypass)
 
-The XDP tier offloads packet processing to an eBPF program attached to the network interface:
+The DPDK engine provides maximum throughput by eliminating kernel involvement from the packet path entirely:
 
-- **XDP program** (written in Rust using `aya`) performs early packet classification, identifying QuicTun packets by UDP port and QUIC header flags.
-- **AF_XDP sockets** deliver classified packets directly to user space, bypassing the kernel's network stack. Research demonstrates 30%+ improvement in QUIC receive-path performance using AF_XDP [Jaeger 2023].
-- **Encryption remains in user space** within the FIPS module boundary — XDP handles only cleartext outer headers.
-- XDP programs can achieve 26 million packets per second per CPU core on modern hardware [Høiland-Jørgensen et al. 2018].
+- **Poll-mode drivers** (PMDs) provide zero-copy packet I/O directly from NIC hardware queues. The DPDK event loop polls the NIC in a tight loop on a dedicated CPU core, achieving single-digit microsecond latency.
+- **Inner interface** uses virtio-user backed by vhost-net, providing a kernel-visible TUN-equivalent interface for local applications. The virtio PMD supports packed virtqueue with SIMD (AVX-512) batch descriptor processing for high throughput.
+- **quictun-proto runs entirely in user space** with no system calls in the forwarding path. Packet receive, decrypt, TUN write, TUN read, encrypt, and packet transmit are all zero-copy operations within the DPDK mbuf pool.
+- This tier requires hugepage memory allocation and dedicating CPU cores to DPDK. NICs are bound to DPDK via vfio-pci (IOMMU) or uio_pci_generic.
 
-### 7.3 Tier 3: DPDK (Full Kernel Bypass)
+### 7.2.1 Router Mode
 
-The DPDK tier provides maximum throughput for data center deployments:
+For dedicated gateway deployments, the DPDK engine supports a **router mode** where both the inner (LAN-facing) and outer (WAN-facing) interfaces are DPDK-managed. The host acts as a transparent router rather than a tunnel endpoint:
 
-- **Poll-mode drivers** (PMDs) provide zero-copy packet I/O directly from NIC hardware queues.
-- The QUIC stack runs entirely in user space with dedicated CPU cores.
-- RSS (Receive Side Scaling) distributes connections across multiple cores.
-- This tier requires dedicated NICs and hugepage memory allocation.
+```
+LAN hosts → NIC (DPDK) → encrypt → NIC (DPDK) → WAN
+WAN       → NIC (DPDK) → decrypt → NIC (DPDK) → LAN hosts
+```
+
+Router mode adds:
+- **NAT** — Source NAT for LAN-to-WAN traffic, with port-range partitioning for multi-core
+- **ICMP error generation** — TTL exceeded, destination unreachable
+- **ARP handling** — For direct L2 adjacency on LAN and WAN segments
+- **MSS clamping** — Adjusts TCP MSS to prevent fragmentation through the tunnel
+
+This eliminates kernel involvement entirely — no TUN device, no vhost-net, no system calls. The full path from LAN NIC RX to WAN NIC TX (or vice versa) executes in user space on dedicated CPU cores.
+
+### 7.2.2 Multi-Core Pipeline
+
+For multi-core DPDK deployments, QuicTun uses a pipeline architecture:
+
+```
+Core 0 (I/O):    NIC RX → dispatch → ... → collect → NIC TX
+Cores 1..N:      decrypt/encrypt workers (stateless crypto)
+```
+
+Core 0 handles all NIC I/O (RX burst, TX burst) and dispatches packets to worker cores via lock-free ring buffers. Workers perform AEAD decrypt/encrypt using a thread-safe shared connection state (`decrypt_in_place(&self)`, `encrypt_ack(&self)`) that requires no synchronization for crypto operations. Workers return processed packets to core 0 for transmission.
+
+This design is motivated by a practical constraint: many NIC types (notably virtio) support only single-queue TX reliably. Routing all TX through core 0 avoids TX queue contention while still parallelizing the crypto workload.
+
+The fixed 4-byte packet number mode (Section 5.4.1) is essential for multi-core: each worker can encrypt packets independently using only an atomic counter, with no dependency on ACK state from other workers.
 
 ---
 
@@ -686,63 +742,86 @@ QuicTun is implemented in Rust, leveraging the following core dependencies:
 
 | Crate | Role | Version |
 |---|---|---|
-| `quinn` | QUIC protocol implementation | 0.11.x |
-| `rustls` | TLS 1.3 engine | 0.23.x |
+| `quinn` / `quinn-proto` | QUIC handshake (forked for key extraction) | 0.11.x |
+| `rustls` | TLS 1.3 engine with RPK support | 0.23.x |
 | `aws-lc-rs` | FIPS 140-3 validated crypto | 1.x |
-| `aya` | eBPF/XDP programs (Tier 2) | 0.13.x |
-| `tokio` | Async runtime | 1.x |
-| `tun` | TUN device management | Platform-specific |
+| `mio` | Synchronous I/O event loop (kernel engine) | 1.x |
+| `tun-rs` | TUN device management with GRO/GSO | 2.x |
+| `dpdk-sys` | DPDK FFI bindings (DPDK engine) | Custom |
 
 Rust was chosen for:
 - **Memory safety** without garbage collection — critical for a network-facing security tool
 - **Performance** comparable to C, with zero-cost abstractions
 - **Ecosystem maturity** — quinn and rustls are production-grade QUIC/TLS implementations
-- **eBPF support** — aya provides pure-Rust eBPF program compilation without requiring C toolchains
+- **FFI interop** — Direct C FFI for DPDK integration without wrapper overhead
 
 ### 9.2 Crate Architecture
 
 ```
 quictun/
-├── quictun-core/          # Protocol logic, packet handling
-│   ├── data.rs            # Data plane (QUIC datagrams)
-│   ├── config.rs          # Configuration model
-│   └── cc.rs              # Congestion control
-├── quictun-crypto/        # FIPS crypto abstraction
-│   ├── fips.rs            # aws-lc-rs FIPS module wrapper
-│   └── rpk.rs             # Raw Public Key handling
-├── quictun-tun/           # TUN device interface (Tier 1)
-├── quictun-xdp/           # XDP/AF_XDP fast path (Tier 2)
-│   ├── ebpf/              # eBPF programs (aya)
-│   └── afxdp.rs           # AF_XDP socket management
-├── quictun-dpdk/          # DPDK integration (Tier 3)
-├── quictun-server/        # Server binary
-├── quictun-client/        # Client binary
-└── quictun-ctl/           # CLI management tool
+├── quictun-crypto/        # Key generation, serialization, RPK TLS verifiers
+├── quictun-core/          # Config parsing, QUIC connection builders,
+│                          # peer management, NAT, ICMP, routing
+├── quictun-proto/         # Custom 1-RTT data plane (RFC 9000/9001 compliant)
+│                          # Short header, DATAGRAM, ACK, key rotation,
+│                          # replay protection, header protection
+├── quictun-tun/           # Synchronous TUN device wrapper (tun-rs v2)
+├── quictun-net/           # Kernel engine: mio event loop, GRO/GSO,
+│                          # single-thread and pipeline modes
+├── quictun-dpdk/          # DPDK engine: virtio, TAP, router modes,
+│                          # multi-core pipeline, zero-copy packet I/O
+├── quictun-cli/           # CLI binary (genkey, pubkey, up, down)
+└── third_party/quinn/     # Forked quinn-proto for key extraction + in-place decrypt
 ```
+
+The split between `quictun-proto` and `quinn-proto` is the key architectural decision. quinn-proto (forked) handles the full QUIC handshake; quictun-proto handles all data-plane packet processing after 1-RTT keys are established. This allows quictun-proto to be a minimal, auditable implementation (~2K lines) focused exclusively on the tunnel's steady-state needs.
 
 ### 9.3 Configuration Model
 
-QuicTun uses a TOML-based configuration inspired by WireGuard's simplicity:
+QuicTun uses a TOML-based configuration inspired by WireGuard's simplicity. The role is explicit: `mode = "listener"` (accepts connections) or `mode = "connector"` (initiates connections).
+
+**Listener (kernel engine):**
 
 ```toml
 [interface]
-private_key = "base64_encoded_private_key"
-listen_port = 443
+mode = "listener"
+private_key = "base64-encoded-private-key"
 address = "10.0.0.1/24"
-mtu = 1380
-fips_mode = true
+listen_port = 443
 
-[interface.performance]
-tier = "tun"  # "tun" | "xdp" | "dpdk"
-congestion = "bbr"  # "cubic" | "bbr" | "newreno"
+[engine]
+threads = 2            # 1 = single-thread, >1 = pipeline
+offload = true         # GRO/GSO (Linux)
+cc = "none"            # "none" | "cubic" | "bbr"
 
-[peer]
-public_key = "base64_encoded_public_key"
-allowed_ips = ["10.0.0.2/32", "192.168.1.0/24"]
-endpoint = "vpn.example.com:443"
-cid_length = 4
+[[peers]]
+public_key = "base64-encoded-public-key"
+allowed_ips = ["10.0.0.0/24"]
 keepalive = 25
 ```
+
+**Listener (DPDK engine):**
+
+```toml
+[interface]
+mode = "listener"
+private_key = "base64-encoded-private-key"
+address = "10.0.0.1/24"
+listen_port = 4433
+ciphers = ["aes-128-gcm"]
+
+[engine]
+backend = "dpdk-virtio"    # "dpdk-virtio" | "dpdk-router"
+dpdk_local_ip = "10.23.30.100"
+dpdk_cores = 1
+
+[[peers]]
+public_key = "base64-encoded-public-key"
+allowed_ips = ["10.0.0.2/32"]
+keepalive = 25
+```
+
+The `[engine]` section selects the data-plane backend and its parameters. Cipher selection is per-direction: `cipher` on the connector (outbound), `ciphers` (array) on the listener (inbound, negotiated). This allows asymmetric cipher preference — e.g., a gateway offering both AES-128-GCM and ChaCha20, with clients selecting based on hardware capabilities.
 
 ---
 
@@ -785,12 +864,17 @@ WireGuard's core value proposition is auditability through minimalism — approx
 | Crypto primitives | AWS-LC (C) | ~500K |
 | **Total trusted code** | | **~580K** |
 
-**Response:** The dependency on general-purpose libraries is an *implementation choice*, not an *architectural constraint*. QuicTun uses a strict subset of QUIC and TLS 1.3:
+**Response:** QuicTun's two-phase architecture directly addresses this concern. The general-purpose QUIC library (quinn-proto) is used **only for the handshake** — a one-time event at connection setup. The steady-state data plane (quictun-proto) is a purpose-built implementation of approximately **~2K lines of Rust** that processes only four QUIC frame types (DATAGRAM, ACK, PING, CONNECTION_CLOSE).
 
-- **Minimal QUIC needed:** Initial/Handshake packets, short header packets, DATAGRAM frames, connection migration (PATH_CHALLENGE/PATH_RESPONSE), congestion control, and a small number of control streams. Not needed: HTTP/3, QPACK, full stream multiplexing, priority signaling, push streams.
-- **Minimal TLS 1.3 needed:** 1-RTT handshake with mutual RPK authentication, 2–3 cipher suites, HKDF key schedule, KeyUpdate. Not needed: session tickets, PSK resumption, X.509 chain building, OCSP, SCT, dozens of extensions.
+The trusted code surface during steady-state operation is:
 
-A purpose-built implementation covering only this subset could reduce the protocol code to approximately **15–25K lines of Rust**, with the FIPS-validated crypto module (aws-lc-rs) as the only irreducible external dependency. This is a natural maturation path — analogous to Cloudflare building quiche (a focused QUIC library) rather than using a general-purpose implementation — and does not require protocol changes.
+| Component | Role | Approximate LoC |
+|---|---|---|
+| quictun-proto | Data-plane packet processing | ~2K |
+| aws-lc-rs (AEAD only) | AES-GCM / ChaCha20-Poly1305 encrypt/decrypt | Subset of 500K |
+| **Total (data plane)** | | **~2K + crypto** |
+
+The full QUIC stack (~80K lines of quinn + rustls) runs only during the handshake window (milliseconds), not during the data transfer phase that constitutes the vast majority of a tunnel's lifetime. This is analogous to how SSH uses a complex handshake protocol but a simple symmetric cipher for the session — the handshake complexity is amortized over the connection lifetime.
 
 The crypto module is the one dependency that must be trusted — but even here, it is not architecturally locked in. rustls provides a pluggable `CryptoProvider` trait, allowing the crypto backend to be swapped without protocol or application changes:
 
@@ -835,17 +919,26 @@ The intersection of "requires FIPS" and "lacks hardware AES" is effectively empt
 
 QUIC's state machine handles connection establishment, migration, path validation, idle timeout, stream management, key updates, congestion windows, and anti-amplification limits. WireGuard has three states: no handshake, handshake in progress, and established.
 
-**Response:** This is an irreducible tradeoff — the price of features. Connection migration requires path validation states. Congestion control requires window management. Multiplexing requires stream states. Each feature QuicTun provides over WireGuard adds states to the machine.
+**Response:** QuicTun's two-phase architecture directly addresses this concern. The full QUIC state machine (quinn-proto) runs only during connection establishment — a one-time event at startup. The steady-state data plane (quictun-proto) has a minimal state machine comparable in complexity to WireGuard's:
 
-The mitigation is twofold: (1) the QUIC state machine is specified in an IETF RFC that has undergone extensive review, not invented ad hoc, and (2) QuicTun uses only a subset of QUIC states (no HTTP/3 streams, no push, no QPACK). A purpose-built implementation would have a smaller state machine than a full QUIC implementation, though still larger than WireGuard's.
+| State | quictun-proto (data plane) | WireGuard |
+|---|---|---|
+| Packet encrypt/decrypt | AEAD with packet number | AEAD with counter |
+| Replay protection | Sliding-window bitmap | Counter-based |
+| Key rotation | key_phase bit + pre-computed keys | Rehandshake |
+| Keepalive | PING timer | Keepalive timer |
+| Shutdown | CONNECTION_CLOSE | Timeout |
+| Streams, flow control | **None** | None |
+| Congestion control | **None (optional)** | None |
+| Loss detection | **None** | None |
 
-This is an honest tradeoff: more features require more complexity. QuicTun's position is that connection migration, congestion control, and FIPS-ready cryptography are worth the additional states.
+The data-plane state machine is approximately ~2K lines of Rust — within an order of magnitude of WireGuard's ~4K lines of kernel C. The full QUIC complexity exists only in the handshake path, which is a well-specified, extensively reviewed IETF protocol (RFC 9000) and runs for milliseconds at the start of a connection that may last hours or days.
 
 #### 10.3.5 Concern: 0-RTT Replay Risk
 
 QUIC supports 0-RTT session resumption, which is inherently vulnerable to replay attacks. For a VPN tunnel, replayed 0-RTT data could mean replayed tunneled IP packets.
 
-**Response:** QuicTun disables 0-RTT data by default. The tunnel uses 1-RTT handshakes for initial connections and can use session tickets for faster reconnection without sending application data in the 0-RTT window. If 0-RTT is enabled for latency-sensitive deployments, the inner protocol's own replay protection (e.g., TCP sequence numbers, application-layer idempotency) provides a second layer of defense. The configuration makes the tradeoff explicit.
+**Response:** QuicTun does not use 0-RTT data. The data plane (quictun-proto) activates only after the 1-RTT handshake completes and keys are extracted. There is no mechanism to send tunneled IP packets before the handshake finishes. This eliminates the 0-RTT replay concern entirely, by design rather than configuration.
 
 #### 10.3.6 Concern: Connection ID Linkability During Migration
 
@@ -894,7 +987,7 @@ For deployments requiring FIPS 140-3 compliance, QuicTun can be configured for F
 As a tunnel primitive, QuicTun is building-block agnostic. The following scenarios illustrate how it can be composed, not an exhaustive list:
 
 1. **Remote access.** Mobile clients connect to a QuicTun gateway. Connection migration ensures seamless roaming. FIPS mode can be enabled for regulated environments.
-2. **Site-to-site tunnel.** Persistent tunnels between sites. Zero-length CIDs minimize overhead on stable links. XDP/DPDK tiers handle high-throughput interconnects.
+2. **Site-to-site tunnel.** Persistent tunnels between sites. Zero-length CIDs minimize overhead on stable links. The DPDK engine handles high-throughput interconnects; router mode enables dedicated gateway appliances.
 3. **Mesh overlay.** An orchestration layer (analogous to Tailscale or Nebula) can compose multiple QuicTun tunnels into a mesh network. Each tunnel remains a simple peer-to-peer link; the orchestrator manages topology, key distribution, and peer discovery.
 4. **Cloud-native service mesh.** Kubernetes pods use QuicTun sidecars for encrypted east-west traffic. The lightweight overhead (20–28 bytes) and 1-RTT handshake minimize performance impact.
 
@@ -911,12 +1004,15 @@ Available for tunnel:
   - UDP header:                       8 bytes
   = Available for QUIC payload:    1472 bytes
 
-QuicTun (CID=0):
+QuicTun (CID=0, variable PN):
   QUIC payload:                   1472 bytes
-  - QUIC short header:               2 bytes (flags + pkt num)
+  - QUIC short header:               2 bytes (flags + 1-byte pkt num)
   - DATAGRAM frame:                   2 bytes (type + length)
   - AEAD tag:                        16 bytes
   = Available for inner IP packet: 1452 bytes
+
+QuicTun (CID=0, fixed 4-byte PN):
+  = Available for inner IP packet: 1449 bytes
 
 QuicTun (CID=4):
   = Available for inner IP packet: 1448 bytes
@@ -934,41 +1030,45 @@ QuicTun (CID=0) provides **12 additional bytes** of inner MTU compared to WireGu
 
 Security-related tradeoffs (cipher agility, code surface, state machine complexity, etc.) are addressed in detail in Section 10.3. The following are operational and ecosystem limitations:
 
-1. **Congestion control interaction.** The interaction between QUIC's outer congestion control and inner TCP congestion control can cause suboptimal throughput in some scenarios. DATAGRAM frames mitigate the worst cases (the outer layer does not retransmit lost datagrams), and the congestion control algorithm is fully configurable (CUBIC, BBR, NewReno) with tunable parameters (initial window, max window, pacing). Operators can select the algorithm best suited to their network path characteristics.
+1. **No silent rejection.** QUIC requires responding to valid Initial packets (RFC 9000). Unlike WireGuard, which silently drops packets from unknown peers, QuicTun must respond to connection attempts — confirming a QUIC server exists at the address. However, the response is a standard QUIC handshake indistinguishable from HTTP/3. Rate-limiting and Retry tokens (address validation) can be configured to mitigate resource exhaustion from connection floods.
 
-2. **No silent rejection.** QUIC requires responding to valid Initial packets (RFC 9000). Unlike WireGuard, which silently drops packets from unknown peers, QuicTun must respond to connection attempts — confirming a QUIC server exists at the address. However, the response is a standard QUIC handshake indistinguishable from HTTP/3. Rate-limiting and Retry tokens (address validation) can be configured to mitigate resource exhaustion from connection floods.
+2. **RPK ecosystem maturity.** TLS 1.3 with RPK (RFC 7250) has limited deployment. The rustls implementation landed RPK support in version 0.23.16, and known issues remain (rustls#2257). Interoperability with non-Rust TLS stacks may require additional testing.
 
-3. **RPK ecosystem maturity.** TLS 1.3 with RPK (RFC 7250) has limited deployment. The rustls implementation landed RPK support in version 0.23.16, and known issues remain (rustls#2257). Interoperability with non-Rust TLS stacks may require additional testing.
+3. **Performance ceiling without kernel bypass.** The kernel engine tier is limited by system call overhead and memory copies. GRO/GSO offloads mitigate this substantially, but achieving maximum throughput requires the DPDK tier, which adds deployment complexity (dedicated CPU cores, hugepage memory, NIC binding).
 
-4. **Performance ceiling without kernel bypass.** The user-space TUN tier is limited by system call overhead and memory copies. Achieving WireGuard's in-kernel performance requires the XDP or DPDK tiers, which add deployment complexity.
+4. **Traffic analysis.** While QuicTun is protocol-indistinguishable from HTTP/3 at the packet level, VPN traffic has a distinctive statistical profile — larger, more uniform packet sizes than typical web browsing. Sustained traffic analysis (not per-packet DPI) could identify QuicTun traffic. This is a limitation shared by all VPN protocols.
 
-5. **Traffic analysis.** While QuicTun is protocol-indistinguishable from HTTP/3 at the packet level, VPN traffic has a distinctive statistical profile — larger, more uniform packet sizes than typical web browsing. Sustained traffic analysis (not per-packet DPI) could identify QuicTun traffic. This is a limitation shared by all VPN protocols.
+5. **Connection migration.** QuicTun's protocol stack supports connection migration via QUIC Connection IDs and PATH_CHALLENGE/PATH_RESPONSE (Section 5.6), but this requires non-zero CID configuration and is a deployment consideration for mobile use cases.
 
 ### 11.4 Future Work
 
-1. **Post-quantum key exchange.** Integrate ML-KEM (CRYSTALS-Kyber, FIPS 203) for hybrid key exchange (ECDHE + ML-KEM), providing quantum resistance. AWS-LC already includes ML-KEM support.
+1. **Delay-based congestion control.** Implement a delay-based congestion controller for the data plane, enabling fair coexistence on shared network paths without the double-CC pathology of loss-based approaches. Delay-based CC can detect queuing before packet loss occurs, reducing interference with inner TCP's loss-based signals.
 
-2. **Multipath QUIC.** Adopt Multipath QUIC (draft-ietf-quic-multipath) to enable simultaneous use of multiple network paths (Wi-Fi + cellular), improving throughput and resilience.
+2. **Connection migration and CID rotation.** Enable QUIC connection migration via non-zero Connection IDs and PATH_CHALLENGE/PATH_RESPONSE validation. CID rotation on migration events would prevent observer linkability across network transitions.
 
-3. **Encrypted ClientHello (ECH).** Integrate TLS Encrypted ClientHello (draft-ietf-tls-esni) to hide the server identity during handshake, addressing the identity-hiding gap compared to WireGuard.
+3. **Post-quantum key exchange.** Integrate ML-KEM (CRYSTALS-Kyber, FIPS 203) for hybrid key exchange (ECDHE + ML-KEM), providing quantum resistance. AWS-LC already includes ML-KEM support; rustls 0.23.27+ supports X25519MLKEM768 by default.
 
-4. **Hardware offload.** Leverage NIC-level QUIC offload (emerging in SmartNICs) for AEAD encryption/decryption, reducing CPU overhead in Tier 3 deployments.
+4. **Multipath QUIC.** Adopt Multipath QUIC (draft-ietf-quic-multipath) to enable simultaneous use of multiple network paths (Wi-Fi + cellular), improving throughput and resilience.
 
-5. **Formal verification.** Apply formal methods (e.g., ProVerif, Tamarin) to verify QuicTun's protocol composition — specifically the interaction between TLS 1.3 session keys and QUIC DATAGRAM frame processing.
+5. **Encrypted ClientHello (ECH).** Integrate TLS Encrypted ClientHello (draft-ietf-tls-esni) to hide the server identity during handshake, addressing the identity-hiding gap compared to WireGuard.
+
+6. **Formal verification.** Apply formal methods (e.g., ProVerif, Tamarin) to verify QuicTun's protocol composition — specifically the interaction between TLS 1.3 session keys and quictun-proto's data-plane key derivation and rotation.
 
 ---
 
 ## 12. Conclusion
 
-QuicTun demonstrates that QUIC provides a superior transport for secure tunneling compared to custom protocols like WireGuard's Noise-based design.
+QuicTun demonstrates that a two-phase protocol design — standard QUIC for handshake, purpose-built 1-RTT for data forwarding — achieves the best of both worlds: the security guarantees and ecosystem compatibility of TLS 1.3, with a data-plane efficiency comparable to WireGuard's minimal design.
 
-By building on QUIC (RFC 9000) and TLS 1.3 (RFC 8446), QuicTun inherits encryption, congestion control, connection migration, path MTU discovery (DPLPMTUD), and multiplexing as standardized protocol features. The use of QUIC DATAGRAM frames (RFC 9221) achieves a 20-byte per-packet overhead with zero-length Connection IDs — 37.5% less than WireGuard's 32 bytes. Because all cryptographic operations delegate to aws-lc-rs (FIPS 140-3 Certificate #4631), FIPS-compliant operation is a configuration choice, not an engineering project.
+By using QUIC (RFC 9000) and TLS 1.3 (RFC 8446) for connection establishment, QuicTun inherits a formally verified handshake protocol, cipher agility, and firewall traversal on UDP 443. By switching to a minimal data plane (quictun-proto) after key extraction, it eliminates QUIC's stream state machine, congestion control, and loss detection from the forwarding path — the components that would otherwise dominate CPU usage at line rate. The data plane uses the same QUIC short header wire format and AEAD encryption, remaining wire-compatible with RFC 9000.
+
+The use of QUIC DATAGRAM frames (RFC 9221) achieves a 20-byte per-packet overhead with zero-length Connection IDs and variable packet numbers — 37.5% less than WireGuard's 32 bytes. A fixed 4-byte packet number mode (23 bytes) enables lock-free parallel encryption across CPU cores. Because all cryptographic operations delegate to aws-lc-rs (FIPS 140-3 Certificate #4631), FIPS-compliant operation is a configuration choice, not an engineering project.
 
 Raw Public Key authentication (RFC 7250) preserves WireGuard's elegant identity model — peers identified by public keys, no certificate authority required — while remaining compatible with enterprise PKI through TLS 1.3's certificate type negotiation.
 
 Operating on UDP port 443, QuicTun is indistinguishable from HTTP/3 traffic to passive DPI systems, addressing the firewall traversal challenge that limits WireGuard deployment in restrictive network environments.
 
-The three-tier performance architecture (TUN, XDP/AF_XDP, DPDK) enables deployment from laptop endpoints to 100 Gbps data center gateways, scaling with hardware investment rather than protocol redesign.
+The two-tier performance architecture — a kernel engine with GRO/GSO offloads and a DPDK kernel-bypass engine with router mode and multi-core pipeline support — enables deployment from edge devices to data center gateways, scaling with hardware investment rather than protocol redesign.
 
 Like WireGuard, QuicTun is a tunnel primitive — it creates a secure point-to-point link and does not prescribe how that link is used. Site-to-site VPN, remote access, mesh overlay, multi-hop relay, and service mesh encryption are all valid compositions, built at the orchestration layer rather than embedded in the tunnel protocol.
 
