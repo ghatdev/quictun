@@ -21,9 +21,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ipnet = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 mimalloc = "0.1"
-socket2 = "0.5"
+socket2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 quictun-dpdk = { workspace = true }

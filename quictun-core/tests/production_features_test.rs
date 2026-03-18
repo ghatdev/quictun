@@ -112,7 +112,8 @@ fn spawn_echo_server(
 
 #[tokio::test]
 async fn connection_lost_returns_retriable() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, &CipherSuite::all())?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) =
+        make_endpoints(8, &CipherSuite::all())?;
 
     // Use a oneshot to coordinate: server waits for client signal before closing.
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
@@ -245,7 +246,8 @@ async fn aes_only_cipher_echo_round_trip() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_0_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(0, &CipherSuite::all())?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) =
+        make_endpoints(0, &CipherSuite::all())?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -259,7 +261,8 @@ async fn cid_length_0_works() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_4_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(4, &CipherSuite::all())?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) =
+        make_endpoints(4, &CipherSuite::all())?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -273,7 +276,8 @@ async fn cid_length_4_works() -> Result<()> {
 
 #[tokio::test]
 async fn cid_length_8_works() -> Result<()> {
-    let (_, _, server_endpoint, client_endpoint, server_addr) = make_endpoints(8, &CipherSuite::all())?;
+    let (_, _, server_endpoint, client_endpoint, server_addr) =
+        make_endpoints(8, &CipherSuite::all())?;
 
     let server_handle = spawn_echo_server(server_endpoint, 3);
 
@@ -375,23 +379,23 @@ fn generate_test_pki(
     std::path::PathBuf, // client-cert.pem
     std::path::PathBuf, // client-key.pem
 )> {
-    use rcgen::{CertificateParams, KeyPair};
+    use rcgen::{CertificateParams, CertifiedIssuer, KeyPair};
 
     // Generate CA
     let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let mut ca_params = CertificateParams::new(vec!["quictun-test-ca".to_string()])?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key)?;
 
     // Generate server cert signed by CA
     let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let server_params = CertificateParams::new(vec!["quictun".to_string()])?;
-    let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
+    let server_cert = server_params.signed_by(&server_key, &ca)?;
 
     // Generate client cert signed by CA
     let client_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let client_params = CertificateParams::new(vec!["quictun-client".to_string()])?;
-    let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key)?;
+    let client_cert = client_params.signed_by(&client_key, &ca)?;
 
     // Write PEM files
     let ca_path = dir.join("ca.pem");
@@ -400,7 +404,7 @@ fn generate_test_pki(
     let client_cert_path = dir.join("client-cert.pem");
     let client_key_path = dir.join("client-key.pem");
 
-    std::fs::write(&ca_path, ca_cert.pem())?;
+    std::fs::write(&ca_path, ca.pem())?;
     std::fs::write(&server_cert_path, server_cert.pem())?;
     std::fs::write(&server_key_path, server_key.serialize_pem())?;
     std::fs::write(&client_cert_path, client_cert.pem())?;

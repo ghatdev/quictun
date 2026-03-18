@@ -54,7 +54,7 @@ hex = "0.4"
 # Networking
 ipnet = "2"
 mio = { version = "1", features = ["os-poll", "net"] }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
