@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "quictun-crypto",
-    "quictun-core",
-    "quictun-tun",
-    "quictun-dpdk",
-    "quictun-proto",
-    "quictun-net",
-    "quictun-cli",
+  "quictun-crypto",
+  "quictun-core",
+  "quictun-tun",
+  "quictun-dpdk",
+  "quictun-proto",
+  "quictun-net",
+  "quictun-cli",
 ]
 
 [workspace.package]
@@ -24,9 +24,18 @@ quictun-dpdk = { path = "quictun-dpdk" }
 quictun-net = { path = "quictun-net" }
 
 # QUIC + TLS
-quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
-quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs"] }
-rustls = { version = "0.23.20", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
+quinn = { version = "0.11", default-features = false, features = [
+  "rustls-aws-lc-rs",
+  "runtime-tokio",
+] }
+quinn-proto = { version = "0.11", default-features = false, features = [
+  "rustls-aws-lc-rs",
+] }
+rustls = { version = "0.23.20", default-features = false, features = [
+  "aws_lc_rs",
+  "std",
+  "logging",
+] }
 aws-lc-rs = "1"
 
 # Async runtime
@@ -35,7 +44,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.0"
 base64 = "0.22"
 
 # Crypto utilities
@@ -54,7 +63,7 @@ clap = { version = "4", features = ["derive"] }
 rustls-pemfile = "2"
 
 # Test utilities
-rcgen = "0.13"
+rcgen = "0.14"
 
 # Security
 zeroize = { version = "1", features = ["derive"] }
