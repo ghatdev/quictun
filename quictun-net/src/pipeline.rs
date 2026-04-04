@@ -1498,31 +1498,47 @@ fn pipeline_drive_handshakes(
             continue;
         };
 
-        if connections.len() >= max_peers {
-            warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting connection");
-            let mut close_buf = vec![0u8; 128];
-            if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
-                let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
-            }
-            drop(conn_state);
-            continue;
-        }
-
-        // Identify peer by certificate (handles both RPK and X.509 internally).
-        let matched_peer = if peers.len() == 1 {
-            &peers[0]
-        } else {
-            match peer::identify_peer(&hs.connection, peers) {
-                Some(p) => p,
-                None => {
-                    warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
-                    continue;
+        // 1. Always identify peer (no single-peer skip — X.509 needs CN check).
+        let matched_peer = match peer::identify_peer(&hs.connection, peers) {
+            Some(p) => p,
+            None => {
+                warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                let mut close_buf = vec![0u8; 128];
+                if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
+                    let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
                 }
+                continue;
             }
         };
         let tunnel_ip = matched_peer.tunnel_ip;
         let allowed_ips = matched_peer.allowed_ips.clone();
         let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
+
+        // 2. Reconnect: if this peer already has a connection, evict the old one.
+        let old_cid = connections
+            .iter()
+            .find(|(_, e)| e.tunnel_ip == tunnel_ip)
+            .map(|(&cid, _)| cid);
+        if let Some(old) = old_cid {
+            if let Some(entry) = connections.remove(&old) {
+                routing_table.remove_peer_routes(old);
+                info!(
+                    tunnel_ip = %entry.tunnel_ip,
+                    old_cid = %hex::encode(old.to_ne_bytes()),
+                    "evicted stale connection (peer reconnected)"
+                );
+            }
+        }
+
+        // 3. Check max_peers (after eviction, so reconnects don't count double).
+        if connections.len() >= max_peers {
+            warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting");
+            let mut close_buf = vec![0u8; 128];
+            if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
+                let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+            }
+            continue;
+        }
         let cid_bytes: Vec<u8> = conn_state.local_cid()[..].to_vec();
         let cid_key = cid_to_u64(&cid_bytes);
         let now_inst = Instant::now();
