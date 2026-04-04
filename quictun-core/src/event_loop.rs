@@ -66,6 +66,8 @@ pub fn run_engine<I: DataPlaneIo + DataPlaneIoBatch>(
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
     let mut scratch = BytesMut::with_capacity(MAX_PACKET);
     let mut recv_batch = OuterRecvBatch::new(config.batch_size);
+    // GSO buffer for batching encrypted TUN→UDP packets (44 segments × 2048 bytes).
+    let mut gso_buf = vec![0u8; 44 * MAX_PACKET];
 
     // Timer state.
     let ack_interval = Duration::from_millis(config.ack_timer_ms);
@@ -100,7 +102,7 @@ pub fn run_engine<I: DataPlaneIo + DataPlaneIoBatch>(
 
         // ── Inner (TUN) RX ──────────────────────────────────────────
         if readiness.inner {
-            handle_inner_rx(io, manager, &mut encrypt_buf)?;
+            handle_inner_rx(io, manager, &mut encrypt_buf, &mut gso_buf)?;
         }
 
         // ── Timeouts ────────────────────────────────────────────────
@@ -158,19 +160,21 @@ fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
     response_buf: &mut Vec<u8>,
     cid_len: usize,
 ) -> Result<()> {
-    // Use single-packet recv in a loop (simpler, avoids batch borrow issues).
+    // Loop recv_outer_batch until WouldBlock (required for edge-triggered epoll/mio).
     loop {
-        let (n, from) = match io.recv_outer(&mut batch.bufs[0]) {
-            Ok(r) => r,
+        let count = match io.recv_outer_batch(batch) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(e) => return Err(e).context("recv_outer failed"),
+            Err(e) => return Err(e).context("recv_outer_batch failed"),
         };
 
-        {
-            let i = 0;
+        for i in 0..count {
+            let n = batch.lens[i];
             if n == 0 {
                 continue;
             }
+            let from = batch.addrs[i];
             let first_byte = batch.bufs[i][0];
 
             if first_byte & 0x80 != 0 {
@@ -226,7 +230,7 @@ fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
                                         );
                                         continue;
                                     }
-                                    if let Err(e) = io.send_inner(datagram) {
+                                    if let Err(e) = io.send_inner_gro(datagram) {
                                         if e.kind() != io::ErrorKind::WouldBlock {
                                             debug!(error = %e, "TUN write failed");
                                         }
@@ -251,24 +255,36 @@ fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
                         cid = %hex::encode(cid_key.to_ne_bytes()),
                         "peer sent CONNECTION_CLOSE, removed"
                     );
-                    // Remove OS routes for closed connection.
                     for net in &entry.allowed_ips {
                         let _ = io.remove_os_route(*net);
                     }
                 }
             }
         }
+
+        // Flush GRO-coalesced TUN writes after each recvmmsg batch.
+        if let Err(e) = io.flush_inner_gro() {
+            debug!(error = %e, "flush_inner_gro failed");
+        }
     }
 }
 
 // ── Inner (TUN) RX ──────────────────────────────────────────────────────
 
-fn handle_inner_rx<I: DataPlaneIo>(
+fn handle_inner_rx<I: DataPlaneIo + DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     encrypt_buf: &mut [u8],
+    gso_buf: &mut Vec<u8>,
 ) -> Result<()> {
     let mut packet = [0u8; 1500];
+
+    // GSO batching state: accumulate encrypted packets for the same remote.
+    let mut gso_pos: usize = 0;
+    let mut gso_segment_size: usize = 0;
+    let mut gso_remote = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    let mut gso_count: usize = 0;
+    const MAX_GSO_SEGMENTS: usize = 44;
 
     loop {
         match io.recv_inner(&mut packet) {
@@ -304,13 +320,36 @@ fn handle_inner_rx<I: DataPlaneIo>(
 
                 match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf) {
                     Ok(result) => {
-                        if let Err(e) = io.send_outer(
-                            &encrypt_buf[..result.len],
-                            entry.remote_addr,
-                        ) {
-                            debug!(error = %e, "UDP send failed");
-                        }
+                        let remote = entry.remote_addr;
                         entry.last_tx = Instant::now();
+
+                        // Flush if remote changed or segment size changed or buffer full.
+                        if gso_count > 0
+                            && (remote != gso_remote
+                                || result.len != gso_segment_size
+                                || gso_count >= MAX_GSO_SEGMENTS
+                                || gso_pos + result.len > gso_buf.len())
+                        {
+                            if gso_count == 1 {
+                                let _ = io.send_outer(&gso_buf[..gso_pos], gso_remote);
+                            } else {
+                                let _ = io.send_outer_gso(
+                                    &gso_buf[..gso_pos],
+                                    gso_segment_size,
+                                    gso_remote,
+                                );
+                            }
+                            gso_pos = 0;
+                            gso_count = 0;
+                        }
+
+                        // Append to GSO buffer.
+                        gso_buf[gso_pos..gso_pos + result.len]
+                            .copy_from_slice(&encrypt_buf[..result.len]);
+                        gso_pos += result.len;
+                        gso_segment_size = result.len;
+                        gso_remote = remote;
+                        gso_count += 1;
                     }
                     Err(e) => {
                         warn!(error = %e, "encrypt failed, dropping");
@@ -321,6 +360,16 @@ fn handle_inner_rx<I: DataPlaneIo>(
             Err(e) => return Err(e).context("TUN recv failed"),
         }
     }
+
+    // Flush remaining GSO buffer.
+    if gso_count > 0 {
+        if gso_count == 1 {
+            let _ = io.send_outer(&gso_buf[..gso_pos], gso_remote);
+        } else {
+            let _ = io.send_outer_gso(&gso_buf[..gso_pos], gso_segment_size, gso_remote);
+        }
+    }
+
     Ok(())
 }
 

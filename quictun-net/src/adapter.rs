@@ -63,6 +63,12 @@ pub struct KernelAdapter {
     #[cfg(target_os = "linux")]
     offload_enabled: bool,
 
+    // Linux GRO TX coalescing for TUN writes.
+    #[cfg(target_os = "linux")]
+    gro_table: Option<quictun_tun::GROTable>,
+    #[cfg(target_os = "linux")]
+    gro_tx_pool: crate::engine::GroTxPool,
+
     // Cached readiness from last poll.
     outer_ready: bool,
     inner_ready: bool,
@@ -138,6 +144,14 @@ impl KernelAdapter {
             recv_work: quictun_core::batch_io::RecvMmsgWork::new(config.batch_size),
             #[cfg(target_os = "linux")]
             offload_enabled: config.offload,
+            #[cfg(target_os = "linux")]
+            gro_table: if config.offload {
+                Some(quictun_tun::GROTable::default())
+            } else {
+                None
+            },
+            #[cfg(target_os = "linux")]
+            gro_tx_pool: crate::engine::GroTxPool::new(),
             outer_ready: false,
             inner_ready: false,
         })
@@ -315,15 +329,50 @@ impl DataPlaneIoBatch for KernelAdapter {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn send_inner_gro(&mut self, pkt: &[u8]) -> io::Result<()> {
-        // Simple path: immediate send. Full GRO coalescing is handled by
-        // the event_loop using tun-rs GROTable when offload is enabled.
+        if self.offload_enabled {
+            self.gro_tx_pool.push_datagram(pkt);
+            Ok(())
+        } else {
+            self.tun.send(pkt)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn send_inner_gro(&mut self, pkt: &[u8]) -> io::Result<()> {
         self.tun.send(pkt)?;
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn flush_inner_gro(&mut self) -> io::Result<()> {
-        // No-op for simple path. The event_loop manages the GRO table.
+        if !self.offload_enabled || self.gro_tx_pool.is_empty() {
+            return Ok(());
+        }
+        if let Some(ref mut gro) = self.gro_table {
+            match self.tun.send_multiple(
+                gro,
+                self.gro_tx_pool.as_mut_slice(),
+                quictun_tun::VIRTIO_NET_HDR_LEN,
+            ) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Fallback: send individually on backpressure.
+                    for buf in self.gro_tx_pool.iter() {
+                        let _ = self.tun.send(buf);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.gro_tx_pool.reset();
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn flush_inner_gro(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
