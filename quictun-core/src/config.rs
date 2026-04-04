@@ -528,6 +528,11 @@ impl Config {
                 "auth_mode = \"x509\" is only supported with backend = \"kernel\"".into(),
             ));
         }
+        if is_x509 && mode == Mode::Connector && self.interface.server_name.is_none() {
+            return Err(ConfigError::Invalid(
+                "auth_mode = \"x509\" connector requires server_name (must match server certificate SAN)".into(),
+            ));
+        }
 
         // ── Routing section validation ──
         if self.routing.is_some() && backend != Backend::DpdkRouter {

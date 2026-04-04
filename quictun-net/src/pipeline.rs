@@ -1502,7 +1502,9 @@ fn pipeline_drive_handshakes(
         let (tunnel_ip, allowed_ips, keepalive_interval) = if x509 {
             match peer::identify_peer_x509(&hs.connection) {
                 Some(x509_peer) => {
-                    let cfg_peer = peers.iter().find(|p| p.tunnel_ip == x509_peer.tunnel_ip);
+                    let cfg_peer = peers.iter().find(|p| {
+                        p.allowed_ips.iter().any(|net| net.contains(&x509_peer.tunnel_ip))
+                    });
                     let allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()
                     } else {

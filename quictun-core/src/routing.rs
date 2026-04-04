@@ -47,8 +47,13 @@ impl RoutingTable {
         }
     }
 
-    /// Add a route for a peer's allowed IPs.
+    /// Add routes for a peer's allowed IPs.
+    ///
+    /// Removes any existing routes for the same networks first, so that a
+    /// reconnecting peer with a new CID atomically replaces stale routes.
     pub fn add_peer_routes(&mut self, cid_key: u64, allowed_ips: &[Ipv4Net]) {
+        // Remove stale routes for the same prefixes (handles reconnect before timeout).
+        self.routes.retain(|(net, _)| !allowed_ips.contains(net));
         for net in allowed_ips {
             self.routes.push((*net, cid_key));
         }

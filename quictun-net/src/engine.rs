@@ -1306,7 +1306,11 @@ fn drive_handshakes(
                 Some(x509_peer) => {
                     // If configured peers exist (e.g., connector with allowed_ips for
                     // subnet routing), use configured allowed_ips instead of SAN-derived /32s.
-                    let cfg_peer = peers.iter().find(|p| p.tunnel_ip == x509_peer.tunnel_ip);
+                    // Match by checking if the SAN tunnel IP falls within any configured
+                    // allowed_ips network (not exact tunnel_ip match, which fails for subnets).
+                    let cfg_peer = peers.iter().find(|p| {
+                        p.allowed_ips.iter().any(|net| net.contains(&x509_peer.tunnel_ip))
+                    });
                     let allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()
                     } else {
