@@ -1304,13 +1304,21 @@ fn drive_handshakes(
             // X.509/CA: extract identity from certificate SAN IPs.
             match peer::identify_peer_x509(&hs.connection) {
                 Some(x509_peer) => {
-                    // If configured peers exist (e.g., connector with allowed_ips for
-                    // subnet routing), use configured allowed_ips instead of SAN-derived /32s.
-                    // Match by checking if the SAN tunnel IP falls within any configured
-                    // allowed_ips network (not exact tunnel_ip match, which fails for subnets).
-                    let cfg_peer = peers.iter().find(|p| {
-                        p.allowed_ips.iter().any(|net| net.contains(&x509_peer.tunnel_ip))
-                    });
+                    // If configured peers exist, use their allowed_ips for routing
+                    // (SAN IPs can only express /32 host routes).
+                    // Match: tunnel_ip equality, SAN IP containment, or single-peer fallback.
+                    let cfg_peer = peers
+                        .iter()
+                        .find(|p| {
+                            p.tunnel_ip == x509_peer.tunnel_ip
+                                || p.allowed_ips
+                                    .iter()
+                                    .any(|net| net.contains(&x509_peer.tunnel_ip))
+                        })
+                        .or_else(|| {
+                            // Single configured peer (connector): always use it for routing.
+                            if peers.len() == 1 { Some(&peers[0]) } else { None }
+                        });
                     let allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()
                     } else {

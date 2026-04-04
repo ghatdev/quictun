@@ -89,6 +89,10 @@ pub fn identify_peer_x509(conn: &quinn_proto::Connection) -> Option<PeerConfig> 
     }
 
     let tunnel_ip = san_ips[0];
+    // X.509 SAN IP addresses are individual hosts (RFC 5280 §4.2.1.6) — they
+    // cannot represent CIDR subnets. Configless X.509 mode therefore only
+    // installs /32 host routes. Deployments needing subnet routing should use
+    // configured [peer] sections with explicit allowed_ips.
     let allowed_ips: Vec<Ipv4Net> = san_ips
         .iter()
         .map(|ip| Ipv4Net::new(*ip, 32).expect("valid /32"))
