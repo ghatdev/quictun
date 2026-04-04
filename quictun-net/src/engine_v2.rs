@@ -70,23 +70,28 @@ pub fn run_v2(
         drain_initial_transmits(&mut adapter, &mut multi_state)?;
     }
 
-    // 4. Run the shared engine loop.
-    let loop_config = EngineLoopConfig {
-        cid_len: config.cid_len,
-        ack_timer_ms: config.ack_timer_ms as u64,
-        batch_size: config.batch_size,
-        reconnect: config.reconnect,
-        is_connector,
-    };
+    // 4. Run engine loop — single-thread or multi-core.
+    if config.threads > 1 {
+        info!(threads = config.threads, "v2 multi-core engine starting");
+        crate::multicore::run_multicore(&mut adapter, &mut multi_state, &config)
+    } else {
+        let loop_config = EngineLoopConfig {
+            cid_len: config.cid_len,
+            ack_timer_ms: config.ack_timer_ms as u64,
+            batch_size: config.batch_size,
+            reconnect: config.reconnect,
+            is_connector,
+        };
 
-    info!("v2 engine starting");
-    quictun_core::event_loop::run_engine(
-        &mut adapter,
-        &mut manager,
-        &mut multi_state,
-        &config.peers,
-        &loop_config,
-    )
+        info!("v2 single-thread engine starting");
+        quictun_core::event_loop::run_engine(
+            &mut adapter,
+            &mut manager,
+            &mut multi_state,
+            &config.peers,
+            &loop_config,
+        )
+    }
 }
 
 /// Drain initial handshake transmits (Client Hello for connector mode).
