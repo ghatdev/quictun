@@ -574,6 +574,7 @@ fn pipeline_io_loop(
             udp,
             tun,
             connections,
+            routing_table,
             done_rx,
             tun_write_pending,
             in_flight_batches,
@@ -626,6 +627,7 @@ fn pipeline_io_loop(
             udp,
             tun,
             connections,
+            routing_table,
             done_rx,
             tun_write_pending,
             in_flight_batches,
@@ -680,6 +682,7 @@ fn pipeline_io_loop(
             udp,
             tun,
             connections,
+            routing_table,
             done_rx,
             tun_write_pending,
             in_flight_batches,
@@ -709,6 +712,7 @@ fn pipeline_io_loop(
             &config.peers,
             config.max_peers,
             config.x509,
+            is_connector,
         )?;
 
         if !*had_connection && !connections.is_empty() {
@@ -740,6 +744,7 @@ fn drain_completions(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
+    routing_table: &mut RoutingTable,
     done_rx: &Receiver<CryptoResult>,
     tun_write_pending: &mut std::collections::VecDeque<Vec<u8>>,
     in_flight_batches: &mut usize,
@@ -757,6 +762,7 @@ fn drain_completions(
                 handle_decrypt_completion(
                     tun,
                     connections,
+                    routing_table,
                     &mut batch,
                     tun_write_pending,
                     #[cfg(target_os = "linux")]
@@ -862,6 +868,7 @@ fn handle_encrypt_completion(
 fn handle_decrypt_completion(
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
+    routing_table: &mut RoutingTable,
     batch: &mut DecryptBatch,
     tun_write_pending: &mut std::collections::VecDeque<Vec<u8>>,
     #[cfg(target_os = "linux")] offload: bool,
@@ -992,6 +999,7 @@ fn handle_decrypt_completion(
     if close_received {
         let cid_key = batch.cid_key;
         if let Some(removed) = connections.remove(&cid_key) {
+            routing_table.remove_peer_routes(cid_key);
             info!(
                 tunnel_ip = %removed.tunnel_ip,
                 cid = %hex::encode(cid_key.to_ne_bytes()),
@@ -1479,6 +1487,7 @@ fn pipeline_drive_handshakes(
     peers: &[PeerConfig],
     max_peers: usize,
     x509: bool,
+    is_connector: bool,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1515,7 +1524,7 @@ fn pipeline_drive_handshakes(
                                     .any(|net| net.contains(&x509_peer.tunnel_ip))
                         })
                         .or_else(|| {
-                            if peers.len() == 1 { Some(&peers[0]) } else { None }
+                            if peers.len() == 1 && is_connector { Some(&peers[0]) } else { None }
                         });
                     let mut allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()

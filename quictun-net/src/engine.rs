@@ -436,6 +436,7 @@ fn run_single(
                     &udp_socket,
                     &tun,
                     &mut connections,
+                    &mut routing_table,
                     config.cid_len,
                     &mut multi_state,
                     &mut recv_bufs,
@@ -456,6 +457,7 @@ fn run_single(
                     &udp_socket,
                     &tun,
                     &mut connections,
+                    &mut routing_table,
                     config.cid_len,
                     &mut multi_state,
                     &mut recv_buf,
@@ -529,6 +531,7 @@ fn run_single(
             &config.peers,
             config.max_peers,
             config.x509,
+            is_connector,
         )?;
 
         // ── Periodic stats ────────────────────────────────────────────
@@ -748,6 +751,7 @@ fn handle_udp_rx_linux(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, ConnEntry>,
+    routing_table: &mut RoutingTable,
     cid_len: usize,
     multi_state: &mut MultiQuicState,
     recv_bufs: &mut [Vec<u8>],
@@ -845,6 +849,7 @@ fn handle_udp_rx_linux(
                 false
             };
             if close_received && let Some(entry) = connections.remove(&cid_key) {
+                routing_table.remove_peer_routes(cid_key);
                 info!(
                     tunnel_ip = %entry.tunnel_ip,
                     cid = %hex::encode(cid_key.to_ne_bytes()),
@@ -886,6 +891,7 @@ fn handle_udp_rx(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, ConnEntry>,
+    routing_table: &mut RoutingTable,
     cid_len: usize,
     multi_state: &mut MultiQuicState,
     recv_buf: &mut [u8],
@@ -954,6 +960,7 @@ fn handle_udp_rx(
                             false
                         };
                         if close_received && let Some(entry) = connections.remove(&cid_key) {
+                            routing_table.remove_peer_routes(cid_key);
                             info!(
                                 tunnel_ip = %entry.tunnel_ip,
                                 cid = %hex::encode(cid_key.to_ne_bytes()),
@@ -1268,6 +1275,7 @@ fn drive_handshakes(
     peers: &[PeerConfig],
     max_peers: usize,
     x509: bool,
+    is_connector: bool,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1320,8 +1328,14 @@ fn drive_handshakes(
                                     .any(|net| net.contains(&x509_peer.tunnel_ip))
                         })
                         .or_else(|| {
-                            // Single configured peer (connector): always use it for routing.
-                            if peers.len() == 1 { Some(&peers[0]) } else { None }
+                            // Connector has exactly one peer — always use it for routing.
+                            // NOT applied to listener: would let any CA-signed cert
+                            // inherit the single peer's routes, bypassing SAN identity.
+                            if peers.len() == 1 && is_connector {
+                                Some(&peers[0])
+                            } else {
+                                None
+                            }
                         });
                     let mut allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()
