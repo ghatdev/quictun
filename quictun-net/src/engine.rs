@@ -217,6 +217,10 @@ pub struct NetConfig {
     pub poll_events: usize,
     pub max_peers: usize,
     pub x509: bool,
+    /// Server name for TLS SNI / hostname verification.
+    /// Defaults to "quictun" for RPK mode. For X.509, should match the
+    /// server certificate's SAN (DNS name or derive from endpoint).
+    pub server_name: String,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -311,7 +315,7 @@ fn run_single(
         client_config,
     } = setup
     {
-        multi_state.connect(client_config, remote_addr)?;
+        multi_state.connect(client_config, remote_addr, &config.server_name)?;
 
         // Drain initial handshake transmits.
         drain_transmits(&udp_socket, &mut multi_state)?;
@@ -1280,13 +1284,16 @@ fn drive_handshakes(
 
     // Promote completed handshakes.
     for ch in result.completed {
-        if connections.len() >= max_peers {
-            warn!(max_peers, "max_peers reached, rejecting new connection");
-            break;
-        }
         let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
             continue;
         };
+
+        if connections.len() >= max_peers {
+            warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting connection");
+            // Drop extracted connection to clean up handshake state.
+            drop(conn_state);
+            continue;
+        }
 
         // Drain final transmits for this connection (before it was removed).
         // The connection is already removed from handshakes by extract_connection,
@@ -1296,11 +1303,20 @@ fn drive_handshakes(
         let (tunnel_ip, allowed_ips, keepalive_interval) = if x509 {
             // X.509/CA: extract identity from certificate SAN IPs.
             match peer::identify_peer_x509(&hs.connection) {
-                Some(p) => (
-                    p.tunnel_ip,
-                    p.allowed_ips,
-                    p.keepalive.unwrap_or(Duration::from_secs(25)),
-                ),
+                Some(x509_peer) => {
+                    // If configured peers exist (e.g., connector with allowed_ips for
+                    // subnet routing), use configured allowed_ips instead of SAN-derived /32s.
+                    let cfg_peer = peers.iter().find(|p| p.tunnel_ip == x509_peer.tunnel_ip);
+                    let allowed = if let Some(cp) = cfg_peer {
+                        cp.allowed_ips.clone()
+                    } else {
+                        x509_peer.allowed_ips
+                    };
+                    let keepalive = cfg_peer
+                        .and_then(|cp| cp.keepalive)
+                        .unwrap_or(Duration::from_secs(25));
+                    (x509_peer.tunnel_ip, allowed, keepalive)
+                }
                 None => {
                     warn!(remote = %hs.remote_addr, "X.509 peer has no valid SAN IPs, rejecting");
                     continue;

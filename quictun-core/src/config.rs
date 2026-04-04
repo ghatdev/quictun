@@ -174,6 +174,10 @@ pub struct InterfaceConfig {
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
     pub ca_file: Option<String>,
+    /// TLS server name for hostname verification (X.509 connector).
+    /// Defaults to "quictun" for RPK. For X.509, should match the server
+    /// certificate's SAN DNS name.
+    pub server_name: Option<String>,
 }
 
 /// Engine / data plane configuration.
@@ -517,6 +521,11 @@ impl Config {
         if mode == Mode::Connector && backend == Backend::DpdkRouter {
             return Err(ConfigError::Invalid(
                 "connector mode cannot use dpdk-router backend".into(),
+            ));
+        }
+        if is_x509 && backend != Backend::Kernel {
+            return Err(ConfigError::Invalid(
+                "auth_mode = \"x509\" is only supported with backend = \"kernel\"".into(),
             ));
         }
 

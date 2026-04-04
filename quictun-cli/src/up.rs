@@ -106,6 +106,11 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         poll_events: config.engine.poll_events,
         max_peers: config.engine.max_peers,
         x509: is_x509,
+        server_name: config
+            .interface
+            .server_name
+            .clone()
+            .unwrap_or_else(|| "quictun".to_owned()),
     };
 
     // Resolve cipher suites.

@@ -76,10 +76,11 @@ impl MultiQuicState {
         &mut self,
         client_config: quinn_proto::ClientConfig,
         remote_addr: SocketAddr,
+        server_name: &str,
     ) -> anyhow::Result<()> {
         let (ch, conn) = self
             .endpoint
-            .connect(Instant::now(), client_config, remote_addr, "quictun")
+            .connect(Instant::now(), client_config, remote_addr, server_name)
             .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
         let local_cid = *conn.local_cid();
         info!(remote = %remote_addr, cid = %hex_cid(&local_cid), "QUIC connection initiated");
