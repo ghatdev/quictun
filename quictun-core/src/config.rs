@@ -430,10 +430,18 @@ impl Config {
                     ));
                 }
                 if is_x509 {
+                    let mut seen_cns = std::collections::HashSet::new();
                     for (i, peer) in peers.iter().enumerate() {
                         if peer.cn.is_empty() {
                             return Err(ConfigError::Invalid(format!(
                                 "X.509 listener peers[{i}] requires non-empty cn field"
+                            )));
+                        }
+                        let cn_lower = peer.cn.to_ascii_lowercase();
+                        if !seen_cns.insert(cn_lower) {
+                            return Err(ConfigError::Invalid(format!(
+                                "X.509 listener has duplicate cn \"{}\" at peers[{i}]",
+                                peer.cn
                             )));
                         }
                     }
@@ -540,6 +548,13 @@ impl Config {
         if is_x509 && mode == Mode::Connector && self.interface.server_name.is_none() {
             return Err(ConfigError::Invalid(
                 "auth_mode = \"x509\" connector requires server_name (must match server certificate SAN)".into(),
+            ));
+        }
+
+        // ── max_peers ──
+        if self.engine.max_peers == 0 {
+            return Err(ConfigError::Invalid(
+                "max_peers must be at least 1".into(),
             ));
         }
 

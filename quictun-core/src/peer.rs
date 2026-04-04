@@ -93,11 +93,16 @@ fn identify_peer_x509_inner<'a>(
         }
     }
 
+    // DNS names are case-insensitive (RFC 4343).
     let matched = peers.iter().find(|p| {
         if p.cn.is_empty() {
             return false;
         }
-        cert_cn == Some(p.cn.as_str()) || san_dns.iter().any(|&name| name == p.cn)
+        let cn_lower = p.cn.to_ascii_lowercase();
+        cert_cn.is_some_and(|c| c.eq_ignore_ascii_case(&cn_lower))
+            || san_dns
+                .iter()
+                .any(|&name| name.eq_ignore_ascii_case(&cn_lower))
     });
 
     if let Some(p) = matched {
