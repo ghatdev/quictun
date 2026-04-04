@@ -44,7 +44,9 @@ pub fn is_allowed_source(allowed_ips: &[Ipv4Net], src_ip: Ipv4Addr) -> bool {
 
 /// Identify which peer connected by matching their certificate against known peers.
 ///
-/// Works with RPK where the certificate DER equals the SPKI DER.
+/// Dispatches to RPK (SPKI DER match) or X.509 (CN/SAN DNS match) based on
+/// whether peers have `cn` or `spki_der` populated. The engine doesn't need
+/// to know which auth mode is in use — this function handles both.
 pub fn identify_peer<'a>(
     conn: &quinn_proto::Connection,
     peers: &'a [PeerConfig],
@@ -52,16 +54,66 @@ pub fn identify_peer<'a>(
     let identity = conn.crypto_session().peer_identity()?;
     let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity.downcast_ref()?;
     let peer_cert = certs.first()?;
-    let peer_der: &[u8] = peer_cert.as_ref();
 
-    peers.iter().find(|p| p.spki_der == peer_der)
+    // Try RPK match first (SPKI DER comparison).
+    let rpk_match = peers.iter().find(|p| {
+        !p.spki_der.is_empty() && p.spki_der == peer_cert.as_ref()
+    });
+    if rpk_match.is_some() {
+        return rpk_match;
+    }
+
+    // Try X.509 CN/SAN DNS match.
+    identify_peer_x509_inner(peer_cert.as_ref(), peers)
 }
 
-/// Identify which peer connected by matching their X.509 certificate CN or SAN
-/// DNS names against the configured `cn` field.
-///
-/// Same role as [`identify_peer`] for RPK — returns a reference to the matched
-/// config-driven peer. Tunnel IP and routing come from config, not the cert.
+/// X.509 peer matching: cert CN or SAN DNS name against `peer.cn` field.
+fn identify_peer_x509_inner<'a>(
+    cert_der: &[u8],
+    peers: &'a [PeerConfig],
+) -> Option<&'a PeerConfig> {
+    let (_, x509) = x509_parser::parse_x509_certificate(cert_der).ok()?;
+
+    let cert_cn = x509
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok());
+
+    let mut san_dns: Vec<&str> = Vec::new();
+    for ext in x509.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            ext.parsed_extension()
+        {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                    san_dns.push(dns);
+                }
+            }
+        }
+    }
+
+    let matched = peers.iter().find(|p| {
+        if p.cn.is_empty() {
+            return false;
+        }
+        cert_cn == Some(p.cn.as_str()) || san_dns.iter().any(|&name| name == p.cn)
+    });
+
+    if let Some(p) = matched {
+        info!(
+            cn = %p.cn,
+            tunnel_ip = %p.tunnel_ip,
+            "identified X.509 peer by CN/SAN DNS"
+        );
+    }
+
+    matched
+}
+
+/// Legacy X.509 identify — delegates to unified identify_peer.
+/// Kept for API compatibility; callers should prefer `identify_peer`.
+#[deprecated(note = "use identify_peer() which handles both RPK and X.509")]
 pub fn identify_peer_x509<'a>(
     conn: &quinn_proto::Connection,
     peers: &'a [PeerConfig],

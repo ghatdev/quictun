@@ -216,7 +216,6 @@ pub struct NetConfig {
     pub channel_capacity: usize,
     pub poll_events: usize,
     pub max_peers: usize,
-    pub x509: bool,
     /// Server name for TLS SNI / hostname verification.
     /// Defaults to "quictun" for RPK mode. For X.509, should match the
     /// server certificate's SAN (DNS name or derive from endpoint).
@@ -530,7 +529,6 @@ fn run_single(
             &mut routing_table,
             &config.peers,
             config.max_peers,
-            config.x509,
         )?;
 
         // ── Periodic stats ────────────────────────────────────────────
@@ -1273,7 +1271,6 @@ fn drive_handshakes(
     routing_table: &mut RoutingTable,
     peers: &[PeerConfig],
     max_peers: usize,
-    x509: bool,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1309,44 +1306,21 @@ fn drive_handshakes(
         // The connection is already removed from handshakes by extract_connection,
         // but we need to send any buffered packets.
 
-        // Identify peer by certificate.
-        let (tunnel_ip, allowed_ips, keepalive_interval) = if x509 {
-            // X.509/CA: match cert CN/SAN DNS against configured peers.
-            let matched_peer = if peers.len() == 1 {
-                &peers[0]
-            } else {
-                match peer::identify_peer_x509(&hs.connection, peers) {
-                    Some(p) => p,
-                    None => {
-                        warn!(remote = %hs.remote_addr, "X.509 peer CN not matched, rejecting");
-                        continue;
-                    }
-                }
-            };
-            (
-                matched_peer.tunnel_ip,
-                matched_peer.allowed_ips.clone(),
-                matched_peer.keepalive.unwrap_or(Duration::from_secs(25)),
-            )
+        // Identify peer by certificate (handles both RPK and X.509 internally).
+        let matched_peer = if peers.len() == 1 {
+            &peers[0]
         } else {
-            // RPK: match against known peer configs.
-            let matched_peer = if peers.len() == 1 {
-                &peers[0]
-            } else {
-                match peer::identify_peer(&hs.connection, peers) {
-                    Some(p) => p,
-                    None => {
-                        warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
-                        continue;
-                    }
+            match peer::identify_peer(&hs.connection, peers) {
+                Some(p) => p,
+                None => {
+                    warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                    continue;
                 }
-            };
-            (
-                matched_peer.tunnel_ip,
-                matched_peer.allowed_ips.clone(),
-                matched_peer.keepalive.unwrap_or(Duration::from_secs(25)),
-            )
+            }
         };
+        let tunnel_ip = matched_peer.tunnel_ip;
+        let allowed_ips = matched_peer.allowed_ips.clone();
+        let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
 
         let cid_bytes: Vec<u8> = conn_state.local_cid()[..].to_vec();
         let primary_cid_key = cid_to_u64(&cid_bytes);

@@ -99,7 +99,6 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         channel_capacity: config.engine.channel_capacity,
         poll_events: config.engine.poll_events,
         max_peers: config.engine.max_peers,
-        x509: is_x509,
         server_name: config
             .interface
             .server_name
