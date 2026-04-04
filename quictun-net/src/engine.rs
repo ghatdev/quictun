@@ -1284,13 +1284,17 @@ fn drive_handshakes(
 
     // Promote completed handshakes.
     for ch in result.completed {
-        let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+        let Some((hs, mut conn_state)) = multi_state.extract_connection(ch) else {
             continue;
         };
 
         if connections.len() >= max_peers {
             warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting connection");
-            // Drop extracted connection to clean up handshake state.
+            // Send CONNECTION_CLOSE so the peer knows it was rejected.
+            let mut close_buf = vec![0u8; 128];
+            if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
+                let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+            }
             drop(conn_state);
             continue;
         }
@@ -1319,11 +1323,20 @@ fn drive_handshakes(
                             // Single configured peer (connector): always use it for routing.
                             if peers.len() == 1 { Some(&peers[0]) } else { None }
                         });
-                    let allowed = if let Some(cp) = cfg_peer {
+                    let mut allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()
                     } else {
-                        x509_peer.allowed_ips
+                        x509_peer.allowed_ips.clone()
                     };
+                    // Ensure the SAN tunnel IP is always in allowed_ips so the peer's
+                    // own packets pass is_allowed_source(). Without this, configs where
+                    // allowed_ips (e.g. 192.168.1.0/24) is disjoint from the SAN IP
+                    // (e.g. 10.0.0.1) would blackhole the peer's direct traffic.
+                    let tunnel_net = ipnet::Ipv4Net::new(x509_peer.tunnel_ip, 32)
+                        .expect("valid /32");
+                    if !allowed.iter().any(|net| net.contains(&x509_peer.tunnel_ip)) {
+                        allowed.push(tunnel_net);
+                    }
                     let keepalive = cfg_peer
                         .and_then(|cp| cp.keepalive)
                         .unwrap_or(Duration::from_secs(25));

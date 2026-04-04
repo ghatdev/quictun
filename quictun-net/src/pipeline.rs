@@ -1489,12 +1489,16 @@ fn pipeline_drive_handshakes(
     drain_transmits(udp, multi_state)?;
 
     for ch in result.completed {
-        let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
+        let Some((hs, mut conn_state)) = multi_state.extract_connection(ch) else {
             continue;
         };
 
         if connections.len() >= max_peers {
             warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting connection");
+            let mut close_buf = vec![0u8; 128];
+            if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
+                let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+            }
             drop(conn_state);
             continue;
         }
@@ -1513,11 +1517,16 @@ fn pipeline_drive_handshakes(
                         .or_else(|| {
                             if peers.len() == 1 { Some(&peers[0]) } else { None }
                         });
-                    let allowed = if let Some(cp) = cfg_peer {
+                    let mut allowed = if let Some(cp) = cfg_peer {
                         cp.allowed_ips.clone()
                     } else {
-                        x509_peer.allowed_ips
+                        x509_peer.allowed_ips.clone()
                     };
+                    let tunnel_net = ipnet::Ipv4Net::new(x509_peer.tunnel_ip, 32)
+                        .expect("valid /32");
+                    if !allowed.iter().any(|net| net.contains(&x509_peer.tunnel_ip)) {
+                        allowed.push(tunnel_net);
+                    }
                     let keepalive = cfg_peer
                         .and_then(|cp| cp.keepalive)
                         .unwrap_or(Duration::from_secs(25));
