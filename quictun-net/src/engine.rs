@@ -531,7 +531,6 @@ fn run_single(
             &config.peers,
             config.max_peers,
             config.x509,
-            is_connector,
         )?;
 
         // ── Periodic stats ────────────────────────────────────────────
@@ -1275,7 +1274,6 @@ fn drive_handshakes(
     peers: &[PeerConfig],
     max_peers: usize,
     x509: bool,
-    is_connector: bool,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1313,54 +1311,23 @@ fn drive_handshakes(
 
         // Identify peer by certificate.
         let (tunnel_ip, allowed_ips, keepalive_interval) = if x509 {
-            // X.509/CA: extract identity from certificate SAN IPs.
-            match peer::identify_peer_x509(&hs.connection) {
-                Some(x509_peer) => {
-                    // If configured peers exist, use their allowed_ips for routing
-                    // (SAN IPs can only express /32 host routes).
-                    // Match: tunnel_ip equality, SAN IP containment, or single-peer fallback.
-                    let cfg_peer = peers
-                        .iter()
-                        .find(|p| {
-                            p.tunnel_ip == x509_peer.tunnel_ip
-                                || p.allowed_ips
-                                    .iter()
-                                    .any(|net| net.contains(&x509_peer.tunnel_ip))
-                        })
-                        .or_else(|| {
-                            // Connector has exactly one peer — always use it for routing.
-                            // NOT applied to listener: would let any CA-signed cert
-                            // inherit the single peer's routes, bypassing SAN identity.
-                            if peers.len() == 1 && is_connector {
-                                Some(&peers[0])
-                            } else {
-                                None
-                            }
-                        });
-                    let mut allowed = if let Some(cp) = cfg_peer {
-                        cp.allowed_ips.clone()
-                    } else {
-                        x509_peer.allowed_ips.clone()
-                    };
-                    // Ensure the SAN tunnel IP is always in allowed_ips so the peer's
-                    // own packets pass is_allowed_source(). Without this, configs where
-                    // allowed_ips (e.g. 192.168.1.0/24) is disjoint from the SAN IP
-                    // (e.g. 10.0.0.1) would blackhole the peer's direct traffic.
-                    let tunnel_net = ipnet::Ipv4Net::new(x509_peer.tunnel_ip, 32)
-                        .expect("valid /32");
-                    if !allowed.iter().any(|net| net.contains(&x509_peer.tunnel_ip)) {
-                        allowed.push(tunnel_net);
+            // X.509/CA: match cert CN/SAN DNS against configured peers.
+            let matched_peer = if peers.len() == 1 {
+                &peers[0]
+            } else {
+                match peer::identify_peer_x509(&hs.connection, peers) {
+                    Some(p) => p,
+                    None => {
+                        warn!(remote = %hs.remote_addr, "X.509 peer CN not matched, rejecting");
+                        continue;
                     }
-                    let keepalive = cfg_peer
-                        .and_then(|cp| cp.keepalive)
-                        .unwrap_or(Duration::from_secs(25));
-                    (x509_peer.tunnel_ip, allowed, keepalive)
                 }
-                None => {
-                    warn!(remote = %hs.remote_addr, "X.509 peer has no valid SAN IPs, rejecting");
-                    continue;
-                }
-            }
+            };
+            (
+                matched_peer.tunnel_ip,
+                matched_peer.allowed_ips.clone(),
+                matched_peer.keepalive.unwrap_or(Duration::from_secs(25)),
+            )
         } else {
             // RPK: match against known peer configs.
             let matched_peer = if peers.len() == 1 {

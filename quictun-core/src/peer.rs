@@ -20,9 +20,11 @@ pub struct PeerConfig {
     /// SPKI DER of the peer's public key.
     ///
     /// With RPK (raw public keys), the certificate DER IS the SPKI DER,
-    /// so direct comparison works. For X.509, you would need to extract
-    /// the SPKI from the certificate first.
+    /// so direct comparison works. Empty for X.509 mode.
     pub spki_der: Vec<u8>,
+    /// Certificate CN or SAN DNS name (X.509 mode). Used to match peers
+    /// during handshake. Empty for RPK mode.
+    pub cn: String,
     /// Tunnel IP assigned to this peer (first IP from `allowed_ips`).
     pub tunnel_ip: Ipv4Addr,
     /// Networks this peer is allowed to send from.
@@ -55,61 +57,59 @@ pub fn identify_peer<'a>(
     peers.iter().find(|p| p.spki_der == peer_der)
 }
 
-/// Identify a peer from their X.509 certificate by extracting SAN IP addresses.
+/// Identify which peer connected by matching their X.509 certificate CN or SAN
+/// DNS names against the configured `cn` field.
 ///
-/// For X.509/CA mode: the certificate SAN IPs define the peer's tunnel IP
-/// and allowed networks. No per-peer config section is needed — the CA is
-/// the trust anchor and the cert is the identity.
-pub fn identify_peer_x509(conn: &quinn_proto::Connection) -> Option<PeerConfig> {
+/// Same role as [`identify_peer`] for RPK — returns a reference to the matched
+/// config-driven peer. Tunnel IP and routing come from config, not the cert.
+pub fn identify_peer_x509<'a>(
+    conn: &quinn_proto::Connection,
+    peers: &'a [PeerConfig],
+) -> Option<&'a PeerConfig> {
     let identity = conn.crypto_session().peer_identity()?;
     let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity.downcast_ref()?;
     let peer_cert = certs.first()?;
 
-    let (_, x509) =
-        x509_parser::parse_x509_certificate(peer_cert.as_ref()).ok()?;
+    let (_, x509) = x509_parser::parse_x509_certificate(peer_cert.as_ref()).ok()?;
 
-    let mut san_ips: Vec<Ipv4Addr> = Vec::new();
+    // Extract Subject CN.
+    let cert_cn = x509
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok());
+
+    // Extract SAN DNS names.
+    let mut san_dns: Vec<&str> = Vec::new();
     for ext in x509.extensions() {
         if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
             ext.parsed_extension()
         {
             for name in &san.general_names {
-                if let x509_parser::extensions::GeneralName::IPAddress(bytes) = name {
-                    if bytes.len() == 4 {
-                        san_ips.push(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]));
-                    }
+                if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                    san_dns.push(dns);
                 }
             }
         }
     }
 
-    if san_ips.is_empty() {
-        tracing::warn!("X.509 peer cert has no SAN IPv4 addresses, rejecting");
-        return None;
+    // Match: cert CN or any SAN DNS name against peer.cn
+    let matched = peers.iter().find(|p| {
+        if p.cn.is_empty() {
+            return false;
+        }
+        cert_cn == Some(p.cn.as_str()) || san_dns.iter().any(|&name| name == p.cn)
+    });
+
+    if let Some(p) = matched {
+        info!(
+            cn = %p.cn,
+            tunnel_ip = %p.tunnel_ip,
+            "identified X.509 peer by CN/SAN DNS"
+        );
     }
 
-    let tunnel_ip = san_ips[0];
-    // X.509 SAN IP addresses are individual hosts (RFC 5280 §4.2.1.6) — they
-    // cannot represent CIDR subnets. Configless X.509 mode therefore only
-    // installs /32 host routes. Deployments needing subnet routing should use
-    // configured [peer] sections with explicit allowed_ips.
-    let allowed_ips: Vec<Ipv4Net> = san_ips
-        .iter()
-        .map(|ip| Ipv4Net::new(*ip, 32).expect("valid /32"))
-        .collect();
-
-    info!(
-        tunnel_ip = %tunnel_ip,
-        san_count = san_ips.len(),
-        "identified X.509 peer by SAN IPs"
-    );
-
-    Some(PeerConfig {
-        spki_der: peer_cert.as_ref().to_vec(),
-        tunnel_ip,
-        allowed_ips,
-        keepalive: None,
-    })
+    matched
 }
 
 /// Keys extracted from a completed quinn-proto handshake.

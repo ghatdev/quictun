@@ -288,6 +288,10 @@ pub struct PeerConfig {
     /// Base64-encoded public key (RPK mode). Optional for X.509 mode.
     #[serde(default)]
     pub public_key: String,
+    /// Certificate CN or SAN DNS name (X.509 mode). Used to match peers
+    /// during handshake instead of public key matching.
+    #[serde(default)]
+    pub cn: String,
     pub allowed_ips: Vec<String>,
     pub endpoint: Option<SocketAddr>,
     pub keepalive: Option<u64>,
@@ -417,16 +421,21 @@ impl Config {
                         "listener mode uses [[peers]], not [peer]".into(),
                     ));
                 }
+                let peers = self.peers.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("listener mode requires [[peers]] section".into())
+                })?;
+                if peers.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "listener requires at least one peer".into(),
+                    ));
+                }
                 if is_x509 {
-                    // X.509 listener: [[peers]] is optional — peers discovered by cert SAN.
-                } else {
-                    let peers = self.peers.as_ref().ok_or_else(|| {
-                        ConfigError::Invalid("listener mode requires [[peers]] section".into())
-                    })?;
-                    if peers.is_empty() {
-                        return Err(ConfigError::Invalid(
-                            "listener requires at least one peer".into(),
-                        ));
+                    for (i, peer) in peers.iter().enumerate() {
+                        if peer.cn.is_empty() {
+                            return Err(ConfigError::Invalid(format!(
+                                "X.509 listener peers[{i}] requires non-empty cn field"
+                            )));
+                        }
                     }
                 }
             }

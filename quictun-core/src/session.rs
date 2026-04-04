@@ -62,6 +62,7 @@ pub fn resolve_peers(
 
             Ok(peer::PeerConfig {
                 spki_der: spki_der.clone(),
+                cn: String::new(),
                 tunnel_ip,
                 allowed_ips,
                 keepalive: raw.keepalive.map(Duration::from_secs),
@@ -70,11 +71,11 @@ pub fn resolve_peers(
         .collect()
 }
 
-/// Parse and validate peer configs without cryptographic keys (X.509 mode).
+/// Parse and validate peer configs for X.509 mode.
 ///
-/// For X.509 connector: peer has endpoint + allowed_ips but no public_key.
-/// For X.509 listener with optional peers: same structure.
-pub fn resolve_peers_no_keys(config: &Config) -> Result<Vec<peer::PeerConfig>> {
+/// Populates the `cn` field from config for peer identification at handshake.
+/// SPKI DER is left empty — X.509 uses CN/SAN DNS matching instead.
+pub fn resolve_peers_x509(config: &Config) -> Result<Vec<peer::PeerConfig>> {
     let raw_peers = config.all_peers();
 
     raw_peers
@@ -99,7 +100,8 @@ pub fn resolve_peers_no_keys(config: &Config) -> Result<Vec<peer::PeerConfig>> {
             let tunnel_ip: Ipv4Addr = allowed_ips[0].addr();
 
             Ok(peer::PeerConfig {
-                spki_der: Vec::new(), // No SPKI for X.509 — identity from cert SAN
+                spki_der: Vec::new(),
+                cn: raw.cn.clone(),
                 tunnel_ip,
                 allowed_ips,
                 keepalive: raw.keepalive.map(Duration::from_secs),

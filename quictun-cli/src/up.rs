@@ -34,16 +34,10 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
     let addr = config.parse_address()?;
     let is_x509 = session::is_x509(config);
 
-    // Resolve peers (RPK: from config + public keys; X.509: from config if present, else empty).
+    // Resolve peers (RPK: from config + public keys; X.509: from config + cn).
     let peers = config.all_peers();
     let resolved_peers = if is_x509 {
-        // X.509: peers discovered at handshake via cert SAN. Config peers optional.
-        if peers.is_empty() {
-            Vec::new()
-        } else {
-            // Connector may still have a [peer] with allowed_ips for routing.
-            session::resolve_peers_no_keys(config)?
-        }
+        session::resolve_peers_x509(config)?
     } else {
         let peer_pubkeys: Vec<PublicKey> = peers
             .iter()

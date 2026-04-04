@@ -257,10 +257,12 @@ pub fn build_rustls_server_tls_config_x509(
 
     tls_config.alpn_protocols = vec![ALPN_QUICTUN_V1.to_vec()];
     tls_config.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
-    // QUIC mandates max_early_data_size be 0 or u32::MAX (RFC 9001 §4.6.1).
-    // Safe here: QUIC transport-layer anti-amplification limits apply, and
-    // we use RPK with pinned keys so replay risk is minimal.
-    tls_config.max_early_data_size = u32::MAX;
+    // Disable 0-RTT for X.509. Unlike RPK with pinned keys, X.509 relies on
+    // CA chain validation which has weaker replay protection guarantees.
+    // 0-RTT data can be replayed by a network attacker; with RPK the blast
+    // radius is limited to known peers, but with CA-signed certs the peer set
+    // is broader. Setting to 0 disables early data (RFC 9001 §4.6.1).
+    tls_config.max_early_data_size = 0;
 
     Ok(Arc::new(tls_config))
 }
@@ -292,7 +294,8 @@ pub fn build_rustls_client_tls_config_x509(
         tls_config.resumption = rustls::client::Resumption::store(Arc::new(
             rustls::client::ClientSessionMemoryCache::new(256),
         ));
-        tls_config.enable_early_data = true;
+        // Do NOT enable early_data for X.509 — server has max_early_data_size = 0,
+        // so 0-RTT would fail anyway. Keep client and server consistent.
     }
 
     Ok(Arc::new(tls_config))
