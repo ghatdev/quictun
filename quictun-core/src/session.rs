@@ -74,9 +74,12 @@ pub fn resolve_peers(
 /// Parse and validate peer configs for X.509 mode.
 ///
 /// Populates the `cn` field from config for peer identification at handshake.
+/// For connector mode, `cn` defaults to `server_name` if not explicitly set.
 /// SPKI DER is left empty — X.509 uses CN/SAN DNS matching instead.
 pub fn resolve_peers_x509(config: &Config) -> Result<Vec<peer::PeerConfig>> {
     let raw_peers = config.all_peers();
+    // For connector, default cn from server_name so identify_peer works.
+    let default_cn = config.interface.server_name.clone().unwrap_or_default();
 
     raw_peers
         .iter()
@@ -101,7 +104,7 @@ pub fn resolve_peers_x509(config: &Config) -> Result<Vec<peer::PeerConfig>> {
 
             Ok(peer::PeerConfig {
                 spki_der: Vec::new(),
-                cn: raw.cn.clone(),
+                cn: if raw.cn.is_empty() { default_cn.clone() } else { raw.cn.clone() },
                 tunnel_ip,
                 allowed_ips,
                 keepalive: raw.keepalive.map(Duration::from_secs),
