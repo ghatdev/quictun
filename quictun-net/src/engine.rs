@@ -246,11 +246,7 @@ struct ConnEntry {
 /// Routes to v2, pipeline, or single-thread based on config.
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
     if config.engine_v2 {
-        let result = crate::engine_v2::run_v2(local_addr, setup, config)?;
-        match result {
-            quictun_core::event_loop::RunResult::Shutdown => Ok(RunResult::Shutdown),
-            quictun_core::event_loop::RunResult::ConnectionLost => Ok(RunResult::ConnectionLost),
-        }
+        crate::engine_v2::run_v2(local_addr, setup, config)
     } else if config.threads > 1 {
         crate::pipeline::run_pipeline(local_addr, setup, config)
     } else {

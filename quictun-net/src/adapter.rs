@@ -197,7 +197,7 @@ impl KernelAdapter {
 
     /// Flush pending GSO batch via send_gso syscall.
     #[cfg(target_os = "linux")]
-    fn flush_gso_batch(&mut self) {
+    pub fn flush_gso_batch(&mut self) {
         if self.gso_count == 0 {
             return;
         }

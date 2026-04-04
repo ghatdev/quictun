@@ -34,7 +34,7 @@ use bytes::BytesMut;
 use crossbeam_channel::{self, Receiver, Sender};
 use parking_lot::RwLock;
 use quictun_core::data_plane::{DataPlaneIo, DataPlaneIoBatch, OuterRecvBatch};
-use quictun_core::event_loop::RunResult;
+use crate::engine::RunResult;
 use quictun_core::manager::{
     ConnEntry, ConnectionManager, ManagerAction,
 };
