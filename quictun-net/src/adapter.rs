@@ -69,6 +69,21 @@ pub struct KernelAdapter {
     #[cfg(target_os = "linux")]
     gro_tx_pool: crate::engine::GroTxPool,
 
+    // GSO TX batching: accumulate send_outer packets, flush on poll().
+    #[cfg(target_os = "linux")]
+    gso_buf: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    gso_pos: usize,
+    #[cfg(target_os = "linux")]
+    gso_segment_size: usize,
+    #[cfg(target_os = "linux")]
+    gso_remote: std::net::SocketAddr,
+    #[cfg(target_os = "linux")]
+    gso_count: usize,
+
+    // TUN write backpressure buffer.
+    tun_write_buf: std::collections::VecDeque<Vec<u8>>,
+
     // Cached readiness from last poll.
     outer_ready: bool,
     inner_ready: bool,
@@ -152,6 +167,17 @@ impl KernelAdapter {
             },
             #[cfg(target_os = "linux")]
             gro_tx_pool: crate::engine::GroTxPool::new(),
+            #[cfg(target_os = "linux")]
+            gso_buf: vec![0u8; 44 * 2048],
+            #[cfg(target_os = "linux")]
+            gso_pos: 0,
+            #[cfg(target_os = "linux")]
+            gso_segment_size: 0,
+            #[cfg(target_os = "linux")]
+            gso_remote: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            #[cfg(target_os = "linux")]
+            gso_count: 0,
+            tun_write_buf: std::collections::VecDeque::with_capacity(256),
             outer_ready: false,
             inner_ready: false,
         })
@@ -169,6 +195,44 @@ impl KernelAdapter {
         }
     }
 
+    /// Flush pending GSO batch via send_gso syscall.
+    #[cfg(target_os = "linux")]
+    fn flush_gso_batch(&mut self) {
+        if self.gso_count == 0 {
+            return;
+        }
+        let result = if self.gso_count == 1 {
+            self.udp_socket.send_to(&self.gso_buf[..self.gso_pos], self.gso_remote)
+                .map(|_| ())
+        } else {
+            quictun_core::batch_io::send_gso(
+                &self.udp_socket,
+                &self.gso_buf[..self.gso_pos],
+                self.gso_segment_size as u16,
+                self.gso_remote,
+            ).map(|_| ())
+        };
+        if let Err(e) = result {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                // Retry once after brief wait.
+                crate::engine::wait_writable(self.udp_socket.as_raw_fd());
+                let _ = if self.gso_count == 1 {
+                    self.udp_socket.send_to(&self.gso_buf[..self.gso_pos], self.gso_remote)
+                } else {
+                    quictun_core::batch_io::send_gso(
+                        &self.udp_socket,
+                        &self.gso_buf[..self.gso_pos],
+                        self.gso_segment_size as u16,
+                        self.gso_remote,
+                    )
+                };
+            }
+        }
+        self.gso_pos = 0;
+        self.gso_count = 0;
+        self.gso_segment_size = 0;
+    }
+
     /// Access the raw UDP socket (for use by event_loop helpers).
     pub fn udp_socket(&self) -> &std::net::UdpSocket {
         &self.udp_socket
@@ -184,6 +248,19 @@ impl KernelAdapter {
 
 impl DataPlaneIo for KernelAdapter {
     fn poll(&mut self, timeout: Duration) -> io::Result<Readiness> {
+        // Flush pending GSO batch before polling (accumulated by send_outer).
+        #[cfg(target_os = "linux")]
+        self.flush_gso_batch();
+
+        // Drain buffered TUN writes (backpressure from previous iteration).
+        while let Some(pkt) = self.tun_write_buf.front() {
+            match self.tun.send(pkt) {
+                Ok(_) => { self.tun_write_buf.pop_front(); }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => { self.tun_write_buf.pop_front(); }
+            }
+        }
+
         self.outer_ready = false;
         self.inner_ready = false;
         self.signal_received = false;
@@ -221,6 +298,33 @@ impl DataPlaneIo for KernelAdapter {
         self.udp_socket.recv_from(buf)
     }
 
+    #[cfg(target_os = "linux")]
+    fn send_outer(&mut self, pkt: &[u8], remote: SocketAddr) -> io::Result<()> {
+        const MAX_GSO_SEGMENTS: usize = 44;
+
+        // Flush if remote changed, segment size changed, or batch full.
+        if self.gso_count > 0
+            && (remote != self.gso_remote
+                || pkt.len() != self.gso_segment_size
+                || self.gso_count >= MAX_GSO_SEGMENTS
+                || self.gso_pos + pkt.len() > self.gso_buf.len())
+        {
+            self.flush_gso_batch();
+        }
+
+        // Accumulate into GSO buffer.
+        self.gso_buf[self.gso_pos..self.gso_pos + pkt.len()]
+            .copy_from_slice(pkt);
+        if self.gso_count == 0 {
+            self.gso_segment_size = pkt.len();
+            self.gso_remote = remote;
+        }
+        self.gso_pos += pkt.len();
+        self.gso_count += 1;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn send_outer(&mut self, pkt: &[u8], remote: SocketAddr) -> io::Result<()> {
         self.udp_socket.send_to(pkt, remote)?;
         Ok(())
@@ -231,8 +335,23 @@ impl DataPlaneIo for KernelAdapter {
     }
 
     fn send_inner(&mut self, pkt: &[u8]) -> io::Result<()> {
-        self.tun.send(pkt)?;
-        Ok(())
+        // Buffer if there's a backlog (preserve ordering).
+        if !self.tun_write_buf.is_empty() {
+            if self.tun_write_buf.len() < 256 {
+                self.tun_write_buf.push_back(pkt.to_vec());
+            }
+            return Ok(());
+        }
+        match self.tun.send(pkt) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if self.tun_write_buf.len() < 256 {
+                    self.tun_write_buf.push_back(pkt.to_vec());
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[cfg(target_os = "linux")]

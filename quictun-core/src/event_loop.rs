@@ -17,7 +17,7 @@ use quictun_proto::local::LocalConnectionState;
 use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
-use crate::data_plane::{DataPlaneIo, DataPlaneIoBatch, OuterRecvBatch};
+use crate::data_plane::{DataPlaneIoBatch, OuterRecvBatch};
 use crate::manager::{
     ConnEntry, ConnectionManager, ManagerAction, PromoteResult,
 };
@@ -51,10 +51,10 @@ const HANDSHAKE_BUF_SIZE: usize = 4096;
 
 /// Run the v2 engine event loop.
 ///
-/// Generic over `I: DataPlaneIo + DataPlaneIoBatch`. The adapter provides
-/// all platform-specific I/O; the loop handles connection management,
-/// crypto, and packet routing using [`ConnectionManager`].
-pub fn run_engine<I: DataPlaneIo + DataPlaneIoBatch>(
+/// Generic over `I: DataPlaneIoBatch`. The adapter provides all platform-
+/// specific I/O (batch recv, GSO, GRO, backpressure); the loop handles
+/// connection management, crypto, and packet routing using [`ConnectionManager`].
+pub fn run_engine<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     multi_state: &mut MultiQuicState,
@@ -66,8 +66,6 @@ pub fn run_engine<I: DataPlaneIo + DataPlaneIoBatch>(
     let mut response_buf = vec![0u8; HANDSHAKE_BUF_SIZE];
     let mut scratch = BytesMut::with_capacity(MAX_PACKET);
     let mut recv_batch = OuterRecvBatch::new(config.batch_size);
-    // GSO buffer for batching encrypted TUN→UDP packets (44 segments × 2048 bytes).
-    let mut gso_buf = vec![0u8; 44 * MAX_PACKET];
 
     // Timer state.
     let ack_interval = Duration::from_millis(config.ack_timer_ms);
@@ -102,7 +100,7 @@ pub fn run_engine<I: DataPlaneIo + DataPlaneIoBatch>(
 
         // ── Inner (TUN) RX ──────────────────────────────────────────
         if readiness.inner {
-            handle_inner_rx(io, manager, &mut encrypt_buf, &mut gso_buf)?;
+            handle_inner_rx(io, manager, &mut encrypt_buf)?;
         }
 
         // ── Timeouts ────────────────────────────────────────────────
@@ -151,7 +149,7 @@ pub fn run_engine<I: DataPlaneIo + DataPlaneIoBatch>(
 
 // ── Outer (UDP) RX ──────────────────────────────────────────────────────
 
-fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
+fn handle_outer_rx<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     multi_state: &mut MultiQuicState,
@@ -230,11 +228,8 @@ fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
                                         );
                                         continue;
                                     }
-                                    if let Err(e) = io.send_inner_gro(datagram) {
-                                        if e.kind() != io::ErrorKind::WouldBlock {
-                                            debug!(error = %e, "TUN write failed");
-                                        }
-                                    }
+                                    // Write to TUN. Adapter handles backpressure.
+                                    let _ = io.send_inner(datagram);
                                 }
                             }
                             decrypted.close_received
@@ -262,29 +257,17 @@ fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
             }
         }
 
-        // Flush GRO-coalesced TUN writes after each recvmmsg batch.
-        if let Err(e) = io.flush_inner_gro() {
-            debug!(error = %e, "flush_inner_gro failed");
-        }
     }
 }
 
 // ── Inner (TUN) RX ──────────────────────────────────────────────────────
 
-fn handle_inner_rx<I: DataPlaneIo + DataPlaneIoBatch>(
+fn handle_inner_rx<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     encrypt_buf: &mut [u8],
-    gso_buf: &mut Vec<u8>,
 ) -> Result<()> {
     let mut packet = [0u8; 1500];
-
-    // GSO batching state: accumulate encrypted packets for the same remote.
-    let mut gso_pos: usize = 0;
-    let mut gso_segment_size: usize = 0;
-    let mut gso_remote = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-    let mut gso_count: usize = 0;
-    const MAX_GSO_SEGMENTS: usize = 44;
 
     loop {
         match io.recv_inner(&mut packet) {
@@ -293,15 +276,13 @@ fn handle_inner_rx<I: DataPlaneIo + DataPlaneIoBatch>(
                     continue;
                 }
                 // Skip non-IPv4 packets (e.g., IPv6 neighbor discovery).
-                let ip_version = packet[0] >> 4;
-                if ip_version != 4 {
+                if packet[0] >> 4 != 4 {
                     continue;
                 }
 
                 let dest_ip =
                     Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                // Route lookup with single-peer fallback.
                 let cid = match manager.lookup_route(dest_ip) {
                     RouteAction::ForwardToPeer(cid) => cid,
                     _ if manager.len() == 1 => {
@@ -320,36 +301,12 @@ fn handle_inner_rx<I: DataPlaneIo + DataPlaneIoBatch>(
 
                 match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf) {
                     Ok(result) => {
-                        let remote = entry.remote_addr;
+                        // Adapter handles GSO batching internally.
+                        let _ = io.send_outer(
+                            &encrypt_buf[..result.len],
+                            entry.remote_addr,
+                        );
                         entry.last_tx = Instant::now();
-
-                        // Flush if remote changed or segment size changed or buffer full.
-                        if gso_count > 0
-                            && (remote != gso_remote
-                                || result.len != gso_segment_size
-                                || gso_count >= MAX_GSO_SEGMENTS
-                                || gso_pos + result.len > gso_buf.len())
-                        {
-                            if gso_count == 1 {
-                                let _ = io.send_outer(&gso_buf[..gso_pos], gso_remote);
-                            } else {
-                                let _ = io.send_outer_gso(
-                                    &gso_buf[..gso_pos],
-                                    gso_segment_size,
-                                    gso_remote,
-                                );
-                            }
-                            gso_pos = 0;
-                            gso_count = 0;
-                        }
-
-                        // Append to GSO buffer.
-                        gso_buf[gso_pos..gso_pos + result.len]
-                            .copy_from_slice(&encrypt_buf[..result.len]);
-                        gso_pos += result.len;
-                        gso_segment_size = result.len;
-                        gso_remote = remote;
-                        gso_count += 1;
                     }
                     Err(e) => {
                         warn!(error = %e, "encrypt failed, dropping");
@@ -360,22 +317,12 @@ fn handle_inner_rx<I: DataPlaneIo + DataPlaneIoBatch>(
             Err(e) => return Err(e).context("TUN recv failed"),
         }
     }
-
-    // Flush remaining GSO buffer.
-    if gso_count > 0 {
-        if gso_count == 1 {
-            let _ = io.send_outer(&gso_buf[..gso_pos], gso_remote);
-        } else {
-            let _ = io.send_outer_gso(&gso_buf[..gso_pos], gso_segment_size, gso_remote);
-        }
-    }
-
     Ok(())
 }
 
 // ── Timeouts ────────────────────────────────────────────────────────────
 
-fn handle_timeouts<I: DataPlaneIo>(
+fn handle_timeouts<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     encrypt_buf: &mut [u8],
@@ -426,7 +373,7 @@ fn handle_timeouts<I: DataPlaneIo>(
 
 // ── ACK timer ───────────────────────────────────────────────────────────
 
-fn handle_acks<I: DataPlaneIo>(
+fn handle_acks<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     encrypt_buf: &mut [u8],
@@ -452,7 +399,7 @@ fn handle_acks<I: DataPlaneIo>(
 
 // ── Handshake driving ───────────────────────────────────────────────────
 
-fn drive_handshakes<I: DataPlaneIo>(
+fn drive_handshakes<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     multi_state: &mut MultiQuicState,
@@ -560,7 +507,7 @@ fn drive_handshakes<I: DataPlaneIo>(
 
 // ── Drain transmits from MultiQuicState ─────────────────────────────────
 
-fn drain_transmits<I: DataPlaneIo>(
+fn drain_transmits<I: DataPlaneIoBatch>(
     io: &mut I,
     state: &mut MultiQuicState,
     buf: &mut Vec<u8>,
@@ -582,7 +529,7 @@ fn drain_transmits<I: DataPlaneIo>(
 
 // ── Graceful shutdown ───────────────────────────────────────────────────
 
-fn graceful_shutdown<I: DataPlaneIo>(
+fn graceful_shutdown<I: DataPlaneIoBatch>(
     io: &mut I,
     manager: &mut ConnectionManager<LocalConnectionState>,
     encrypt_buf: &mut [u8],

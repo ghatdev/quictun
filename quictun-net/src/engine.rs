@@ -1147,7 +1147,7 @@ pub(crate) fn flush_gso_sync(
 
 /// Block until fd is writable using poll(2). Short timeout to avoid stalling.
 #[cfg(target_os = "linux")]
-fn wait_writable(fd: i32) {
+pub(crate) fn wait_writable(fd: i32) {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLOUT,
