@@ -496,8 +496,8 @@ pub struct TransportTuning {
 impl Default for TransportTuning {
     fn default() -> Self {
         Self {
-            datagram_recv_buffer: 8 * 1024 * 1024, // 8 MB
-            datagram_send_buffer: 8 * 1024 * 1024, // 8 MB
+            datagram_recv_buffer: 2 * 1024 * 1024, // 2 MB
+            datagram_send_buffer: 2 * 1024 * 1024, // 2 MB
             initial_mtu: 1452,
             send_window: 0, // 0 = use default
             cc: CongestionControl::Bbr,

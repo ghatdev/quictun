@@ -246,8 +246,8 @@ impl Default for EngineConfig {
             backend: Backend::Kernel,
             threads: 1,
             cc: "bbr".to_owned(),
-            recv_buf: 8 * 1024 * 1024,
-            send_buf: 8 * 1024 * 1024,
+            recv_buf: 2 * 1024 * 1024,
+            send_buf: 2 * 1024 * 1024,
             send_window: 0,
             initial_rtt_ms: 0,
             pin_mtu: false,
@@ -320,7 +320,7 @@ fn default_cc() -> String {
 }
 
 fn default_buf_size() -> usize {
-    8 * 1024 * 1024
+    2 * 1024 * 1024 // 2 MB — balances throughput vs bufferbloat
 }
 
 fn default_dpdk_cores() -> usize {
@@ -997,7 +997,7 @@ allowed_ips = ["10.0.0.2/32"]
         assert_eq!(config.engine.backend, Backend::Kernel);
         assert_eq!(config.engine.threads, 1);
         assert_eq!(config.engine.cc, "bbr");
-        assert_eq!(config.engine.recv_buf, 8 * 1024 * 1024);
+        assert_eq!(config.engine.recv_buf, 2 * 1024 * 1024);
     }
 
     #[test]
