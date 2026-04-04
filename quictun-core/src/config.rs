@@ -238,6 +238,9 @@ pub struct EngineConfig {
     /// Maximum number of concurrent peer connections (listener mode).
     #[serde(default = "default_max_peers")]
     pub max_peers: usize,
+    /// Use the v2 engine (shared event loop + ConnectionManager).
+    #[serde(default)]
+    pub engine_v2: bool,
 }
 
 impl Default for EngineConfig {
@@ -267,6 +270,7 @@ impl Default for EngineConfig {
             channel_capacity: 4096,
             poll_events: 64,
             max_peers: 256,
+            engine_v2: false,
         }
     }
 }

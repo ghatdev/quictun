@@ -1,6 +1,9 @@
 pub mod config;
 pub mod connection;
+pub mod data_plane;
+pub mod event_loop;
 pub mod icmp;
+pub mod manager;
 pub mod mss;
 pub mod nat;
 pub mod peer;

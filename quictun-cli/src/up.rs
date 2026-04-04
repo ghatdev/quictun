@@ -104,6 +104,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
             .server_name
             .clone()
             .unwrap_or_else(|| "quictun".to_owned()),
+        engine_v2: config.engine.engine_v2,
     };
 
     // Resolve cipher suites.

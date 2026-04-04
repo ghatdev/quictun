@@ -220,6 +220,8 @@ pub struct NetConfig {
     /// Defaults to "quictun" for RPK mode. For X.509, should match the
     /// server certificate's SAN (DNS name or derive from endpoint).
     pub server_name: String,
+    /// Use the v2 engine (shared event loop + ConnectionManager).
+    pub engine_v2: bool,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -241,9 +243,15 @@ struct ConnEntry {
 
 /// Main entry point for the synchronous blocking engine.
 ///
-/// Routes to single-thread or multi-thread path based on `config.threads`.
+/// Routes to v2, pipeline, or single-thread based on config.
 pub fn run(local_addr: SocketAddr, setup: EndpointSetup, config: NetConfig) -> Result<RunResult> {
-    if config.threads > 1 {
+    if config.engine_v2 {
+        let result = crate::engine_v2::run_v2(local_addr, setup, config)?;
+        match result {
+            quictun_core::event_loop::RunResult::Shutdown => Ok(RunResult::Shutdown),
+            quictun_core::event_loop::RunResult::ConnectionLost => Ok(RunResult::ConnectionLost),
+        }
+    } else if config.threads > 1 {
         crate::pipeline::run_pipeline(local_addr, setup, config)
     } else {
         run_single(local_addr, setup, config)
