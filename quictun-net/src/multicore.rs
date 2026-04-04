@@ -202,6 +202,8 @@ pub fn run_multicore(
         let max_peers = config.max_peers;
         let ack_timer_ms = config.ack_timer_ms as u64;
         let cid_len = config.cid_len;
+        let offload = config.offload;
+        let gso_segs = config.gso_max_segments;
 
         // dup() the TUN fd for this worker.
         let worker_tun_fd = unsafe { libc::dup(tun_raw_fd) };
@@ -224,6 +226,8 @@ pub fn run_multicore(
                     max_peers,
                     ack_timer_ms,
                     cid_len,
+                    offload,
+                    gso_segs,
                     shutdown_flag,
                 );
                 // Close the dup'd fd.
@@ -562,6 +566,7 @@ fn drain_transmits_io(
 
 // ── Worker thread ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments, unused_variables)]
 fn run_worker(
     id: usize,
     rx: Receiver<WorkerPacket>,
@@ -573,6 +578,8 @@ fn run_worker(
     max_peers: usize,
     ack_timer_ms: u64,
     cid_len: usize,
+    offload_enabled: bool,
+    gso_max_segments: usize,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut manager = ConnectionManager::<LocalConnectionState>::new(
@@ -583,171 +590,260 @@ fn run_worker(
     let tick = Duration::from_millis(ack_timer_ms.max(10));
     let mut next_ack = Instant::now() + Duration::from_millis(ack_timer_ms);
 
+    // Linux-only batch state.
+    #[cfg(target_os = "linux")]
+    let mut gso_buf = vec![0u8; gso_max_segments * 2048];
+    #[cfg(target_os = "linux")]
+    let mut gso_pos: usize = 0;
+    #[cfg(target_os = "linux")]
+    let mut gso_segment_size: usize = 0;
+    #[cfg(target_os = "linux")]
+    let mut gso_count: usize = 0;
+    #[cfg(target_os = "linux")]
+    let mut gso_remote = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    #[cfg(target_os = "linux")]
+    let mut gso_current_cid: Option<u64> = None;
+    #[cfg(target_os = "linux")]
+    let mut gro_tx_pool = crate::engine::GroTxPool::new();
+
+    // Suppress unused-variable warnings on non-Linux.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (offload_enabled, gso_max_segments);
+
     debug!(worker = id, "worker started");
+
+    // ── Inline helpers (closures can't borrow everything, so use macros) ──
+
+    /// Process a single packet. Returns `true` if shutdown was requested.
+    macro_rules! process_packet {
+        ($pkt:expr) => {
+            match $pkt {
+                WorkerPacket::Shutdown => break,
+
+                WorkerPacket::NewConnection { cid_key, entry } => {
+                    info!(worker = id, tunnel_ip = %entry.tunnel_ip, "received new connection");
+                    manager.insert_connection(cid_key, entry);
+                }
+
+                WorkerPacket::Outer { data } => {
+                    if cid_len > 0 && data.len() >= 1 + cid_len {
+                        let mut data = data;
+                        let cid_key = cid_to_u64(&data[1..1 + cid_len]);
+                        let mut close_received = false;
+
+                        if let Some(entry) = manager.get_mut(&cid_key) {
+                            if let Ok(dec) = entry.conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
+                                entry.last_rx = Instant::now();
+                                if let Some(ref ack) = dec.ack {
+                                    entry.conn.process_ack(ack);
+                                }
+                                close_received = dec.close_received;
+                                if !close_received {
+                                    for dg in &dec.datagrams {
+                                        if dg.len() < 20 {
+                                            continue;
+                                        }
+                                        let src_ip = Ipv4Addr::new(dg[12], dg[13], dg[14], dg[15]);
+                                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                            continue;
+                                        }
+                                        #[cfg(target_os = "linux")]
+                                        if offload_enabled {
+                                            gro_tx_pool.push_datagram(dg);
+                                        } else {
+                                            tun_write(tun_fd, dg);
+                                        }
+                                        #[cfg(not(target_os = "linux"))]
+                                        tun_write(tun_fd, dg);
+                                    }
+                                }
+                            }
+                        }
+
+                        if close_received {
+                            if let Some(removed) = manager.remove_connection(cid_key) {
+                                let _ = notify_tx.send(WorkerNotification::ConnectionRemoved {
+                                    cid_key,
+                                    tunnel_ip: removed.tunnel_ip,
+                                    allowed_ips: removed.allowed_ips,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                WorkerPacket::Inner { data } => {
+                    if data.len() >= 20 && data[0] >> 4 == 4 {
+                        let dest_ip = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
+                        let cid = match manager.lookup_route(dest_ip) {
+                            RouteAction::ForwardToPeer(c) => c,
+                            _ if manager.len() == 1 => {
+                                match manager.keys().next() {
+                                    Some(&c) => c,
+                                    None => continue,
+                                }
+                            }
+                            _ => continue,
+                        };
+
+                        #[cfg(target_os = "linux")]
+                        {
+                            // Flush GSO batch if CID changed or batch full.
+                            if let Some(cur) = gso_current_cid {
+                                if cur != cid
+                                    || gso_count >= gso_buf.len() / 2048
+                                    || gso_pos + 2048 > gso_buf.len()
+                                {
+                                    if gso_count > 0 {
+                                        crate::engine_v2::flush_gso(
+                                            udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
+                                        );
+                                        if let Some(prev) = manager.get_mut(&cur) {
+                                            prev.last_tx = Instant::now();
+                                        }
+                                    }
+                                    gso_pos = 0;
+                                    gso_segment_size = 0;
+                                    gso_count = 0;
+                                }
+                            }
+                            if let Some(entry) = manager.get_mut(&cid) {
+                                gso_current_cid = Some(cid);
+                                gso_remote = entry.remote_addr;
+                                match entry.conn.encrypt_datagram(&data, &mut gso_buf[gso_pos..]) {
+                                    Ok(r) => {
+                                        if gso_count == 0 {
+                                            gso_segment_size = r.len;
+                                        }
+                                        gso_pos += r.len;
+                                        gso_count += 1;
+                                    }
+                                    Err(e) => { warn!(error = %e, "encrypt failed"); }
+                                }
+                            }
+                        }
+
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            if let Some(entry) = manager.get_mut(&cid) {
+                                match entry.conn.encrypt_datagram(&data, &mut encrypt_buf) {
+                                    Ok(r) => {
+                                        let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                                        entry.last_tx = Instant::now();
+                                    }
+                                    Err(e) => { warn!(error = %e, "encrypt failed"); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    // ── Main loop ────────────────────────────────────────────────────────
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        match rx.recv_timeout(tick) {
-            Ok(WorkerPacket::Shutdown) => break,
-
-            Ok(WorkerPacket::Outer { mut data }) => {
-                if data.is_empty() {
-                    continue;
-                }
-
-                // Short header — CID lookup + decrypt.
-                if cid_len == 0 || data.len() < 1 + cid_len {
-                    continue;
-                }
-                let cid_key = cid_to_u64(&data[1..1 + cid_len]);
-
-                let close_received = if let Some(entry) = manager.get_mut(&cid_key) {
-                    match entry.conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
-                        Ok(decrypted) => {
-                            entry.last_rx = Instant::now();
-                            if let Some(ref ack) = decrypted.ack {
-                                entry.conn.process_ack(ack);
-                            }
-                            if !decrypted.close_received {
-                                for datagram in &decrypted.datagrams {
-                                    if datagram.len() < 20 {
-                                        continue;
-                                    }
-                                    let src_ip = Ipv4Addr::new(
-                                        datagram[12], datagram[13],
-                                        datagram[14], datagram[15],
-                                    );
-                                    if !peer::is_allowed_source(
-                                        &entry.allowed_ips, src_ip,
-                                    ) {
-                                        continue;
-                                    }
-                                    tun_write(tun_fd, datagram);
+        // Block for first packet (with timeout for timer processing).
+        let first = match rx.recv_timeout(tick) {
+            Ok(pkt) => pkt,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Run timers on timeout, then retry.
+                let now = Instant::now();
+                for action in manager.sweep_timeouts() {
+                    match action {
+                        ManagerAction::SendKeepalive { cid_key } => {
+                            if let Some(entry) = manager.get_mut(&cid_key) {
+                                if let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf) {
+                                    let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                                    entry.last_tx = Instant::now();
                                 }
                             }
-                            decrypted.close_received
                         }
-                        Err(_) => false,
-                    }
-                } else {
-                    false
-                };
-
-                if close_received {
-                    if let Some(entry) = manager.remove_connection(cid_key) {
-                        info!(
-                            tunnel_ip = %entry.tunnel_ip,
-                            worker = id,
-                            "peer sent CONNECTION_CLOSE"
-                        );
-                        let _ = notify_tx.send(WorkerNotification::ConnectionRemoved {
-                            cid_key,
-                            tunnel_ip: entry.tunnel_ip,
-                            allowed_ips: entry.allowed_ips,
-                        });
-                    }
-                }
-            }
-
-            Ok(WorkerPacket::Inner { data }) => {
-                if data.len() < 20 {
-                    continue;
-                }
-
-                let dest_ip = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
-
-                // Route lookup with single-connection fallback.
-                let cid = match manager.lookup_route(dest_ip) {
-                    RouteAction::ForwardToPeer(cid) => cid,
-                    _ if manager.len() == 1 => {
-                        match manager.keys().next() {
-                            Some(&cid) => cid,
-                            None => continue,
-                        }
-                    }
-                    _ => continue,
-                };
-
-                if let Some(entry) = manager.get_mut(&cid) {
-                    match entry.conn.encrypt_datagram(&data, &mut encrypt_buf) {
-                        Ok(result) => {
-                            let _ = udp.send_to(
-                                &encrypt_buf[..result.len],
-                                entry.remote_addr,
-                            );
-                            entry.last_tx = Instant::now();
-                        }
-                        Err(e) => {
-                            warn!(error = %e, worker = id, "encrypt failed");
+                        ManagerAction::ConnectionRemoved { cid_key, tunnel_ip, allowed_ips, .. } => {
+                            let _ = notify_tx.send(WorkerNotification::ConnectionRemoved {
+                                cid_key, tunnel_ip, allowed_ips,
+                            });
                         }
                     }
                 }
+                if now >= next_ack {
+                    for cid_key in manager.connections_needing_ack() {
+                        if let Some(entry) = manager.get_mut(&cid_key) {
+                            if let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf) {
+                                let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                            }
+                        }
+                    }
+                    next_ack = now + Duration::from_millis(ack_timer_ms);
+                }
+                continue;
             }
-
-            Ok(WorkerPacket::NewConnection { cid_key, entry }) => {
-                info!(
-                    tunnel_ip = %entry.tunnel_ip,
-                    worker = id,
-                    "received new connection"
-                );
-                manager.insert_connection(cid_key, entry);
-            }
-
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Timer tick — handle timeouts, keepalives, ACKs.
-            }
-
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Process first packet.
+        process_packet!(first);
+
+        // Drain all queued packets.
+        while let Ok(pkt) = rx.try_recv() {
+            process_packet!(pkt);
         }
 
-        // ── Periodic work (on every iteration, not just timeout) ──
-        let now = Instant::now();
+        // ── Flush accumulated batches ──
+        #[cfg(target_os = "linux")]
+        {
+            if gso_count > 0 {
+                crate::engine_v2::flush_gso(
+                    udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
+                );
+                if let Some(cid) = gso_current_cid {
+                    if let Some(entry) = manager.get_mut(&cid) {
+                        entry.last_tx = Instant::now();
+                    }
+                }
+                gso_pos = 0;
+                gso_count = 0;
+                gso_segment_size = 0;
+                gso_current_cid = None;
+            }
 
-        // Timeout sweep.
-        let actions = manager.sweep_timeouts();
-        for action in actions {
+            if offload_enabled && !gro_tx_pool.is_empty() {
+                for buf in gro_tx_pool.iter() {
+                    tun_write(tun_fd, buf);
+                }
+                gro_tx_pool.reset();
+            }
+        }
+
+        // ── Timers (inline) ──
+        let now = Instant::now();
+        for action in manager.sweep_timeouts() {
             match action {
                 ManagerAction::SendKeepalive { cid_key } => {
                     if let Some(entry) = manager.get_mut(&cid_key) {
-                        if let Ok(result) =
-                            entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
-                        {
-                            let _ = udp.send_to(
-                                &encrypt_buf[..result.len],
-                                entry.remote_addr,
-                            );
+                        if let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf) {
+                            let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                             entry.last_tx = Instant::now();
                         }
                     }
                 }
-                ManagerAction::ConnectionRemoved {
-                    cid_key,
-                    tunnel_ip,
-                    allowed_ips,
-                    ..
-                } => {
+                ManagerAction::ConnectionRemoved { cid_key, tunnel_ip, allowed_ips, .. } => {
                     let _ = notify_tx.send(WorkerNotification::ConnectionRemoved {
-                        cid_key,
-                        tunnel_ip,
-                        allowed_ips,
+                        cid_key, tunnel_ip, allowed_ips,
                     });
                 }
             }
         }
-
-        // ACK timer.
         if now >= next_ack {
-            let needing_ack = manager.connections_needing_ack();
-            for cid_key in needing_ack {
+            for cid_key in manager.connections_needing_ack() {
                 if let Some(entry) = manager.get_mut(&cid_key) {
-                    if let Ok(result) = entry.conn.encrypt_ack(&mut encrypt_buf) {
-                        let _ = udp.send_to(
-                            &encrypt_buf[..result.len],
-                            entry.remote_addr,
-                        );
+                    if let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf) {
+                        let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                     }
                 }
             }
@@ -755,13 +851,12 @@ fn run_worker(
         }
     }
 
-    // Graceful shutdown: send CONNECTION_CLOSE to all connections.
+    // Graceful shutdown: send CONNECTION_CLOSE to all peers.
     for entry in manager.values_mut() {
-        if let Ok(result) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
-            let _ = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr);
+        if let Ok(r) = entry.conn.encrypt_connection_close(&mut encrypt_buf) {
+            let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
         }
     }
-
     debug!(worker = id, "worker stopped");
 }
 

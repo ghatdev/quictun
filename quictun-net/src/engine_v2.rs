@@ -568,7 +568,7 @@ fn handle_tun_rx_gso(
 }
 
 #[cfg(target_os = "linux")]
-fn flush_gso(
+pub(crate) fn flush_gso(
     udp: &std::net::UdpSocket,
     gso_buf: &[u8],
     gso_pos: usize,
