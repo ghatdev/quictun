@@ -1250,7 +1250,10 @@ fn pipeline_tun_rx(
                 let cid = match routing_table.lookup(dest_ip) {
                     RouteAction::ForwardToPeer(cid) => cid,
                     _ if connections.len() == 1 => {
-                        *connections.keys().next().expect("single connection")
+                        match connections.keys().next() {
+                            Some(&cid) => cid,
+                            None => continue,
+                        }
                     }
                     _ => {
                         debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
@@ -1505,7 +1508,9 @@ fn pipeline_drive_handshakes(
                 warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
                 let mut close_buf = vec![0u8; 128];
                 if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
-                    let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+                    if let Err(e) = udp.send_to(&close_buf[..result.len], hs.remote_addr) {
+                        warn!(error = %e, "failed to send CONNECTION_CLOSE for rejected peer");
+                    }
                 }
                 continue;
             }
@@ -1535,7 +1540,9 @@ fn pipeline_drive_handshakes(
             warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting");
             let mut close_buf = vec![0u8; 128];
             if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
-                let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+                if let Err(e) = udp.send_to(&close_buf[..result.len], hs.remote_addr) {
+                    warn!(error = %e, "failed to send CONNECTION_CLOSE for max_peers rejection");
+                }
             }
             continue;
         }

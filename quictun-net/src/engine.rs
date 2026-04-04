@@ -515,10 +515,11 @@ fn run_single(
             &mut encrypt_buf,
         )?;
 
-        // ── Standalone ACK timer ──────────────────────────────────────
-        if Instant::now() >= next_ack_deadline {
+        // ── Standalone ACK timer + stats (share single Instant::now()) ──
+        let now = Instant::now();
+        if now >= next_ack_deadline {
             send_acks(&udp_socket, &mut connections, &mut encrypt_buf);
-            next_ack_deadline = Instant::now() + ack_timer_interval;
+            next_ack_deadline = now + ack_timer_interval;
         }
 
         // ── Drive handshakes ────────────────────────────────────────────
@@ -531,8 +532,7 @@ fn run_single(
             config.max_peers,
         )?;
 
-        // ── Periodic stats ────────────────────────────────────────────
-        let now = Instant::now();
+        // ── Periodic stats (reuses `now` from ACK timer above) ──────────
         if now >= next_stats_deadline {
             info!(
                 connections = connections.len(),
@@ -1005,7 +1005,10 @@ fn handle_tun_rx_linux(
                 let cid = match routing_table.lookup(dest_ip) {
                     RouteAction::ForwardToPeer(cid) => cid,
                     _ if connections.len() == 1 => {
-                        *connections.keys().next().expect("single connection")
+                        match connections.keys().next() {
+                            Some(&cid) => cid,
+                            None => continue,
+                        }
                     }
                     _ => {
                         debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
@@ -1171,7 +1174,10 @@ fn handle_tun_rx(
                 let cid = match routing_table.lookup(dest_ip) {
                     RouteAction::ForwardToPeer(cid) => cid,
                     _ if connections.len() == 1 => {
-                        *connections.keys().next().expect("single connection")
+                        match connections.keys().next() {
+                            Some(&cid) => cid,
+                            None => continue,
+                        }
                     }
                     _ => continue,
                 };
@@ -1298,7 +1304,9 @@ fn drive_handshakes(
                 warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
                 let mut close_buf = vec![0u8; 128];
                 if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
-                    let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+                    if let Err(e) = udp.send_to(&close_buf[..result.len], hs.remote_addr) {
+                        warn!(error = %e, "failed to send CONNECTION_CLOSE for rejected peer");
+                    }
                 }
                 continue;
             }
@@ -1328,7 +1336,9 @@ fn drive_handshakes(
             warn!(max_peers, remote = %hs.remote_addr, "max_peers reached, rejecting");
             let mut close_buf = vec![0u8; 128];
             if let Ok(result) = conn_state.encrypt_connection_close(&mut close_buf) {
-                let _ = udp.send_to(&close_buf[..result.len], hs.remote_addr);
+                if let Err(e) = udp.send_to(&close_buf[..result.len], hs.remote_addr) {
+                    warn!(error = %e, "failed to send CONNECTION_CLOSE for max_peers rejection");
+                }
             }
             continue;
         }
