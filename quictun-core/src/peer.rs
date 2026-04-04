@@ -98,6 +98,10 @@ fn identify_peer_x509_inner<'a>(
     // by rustls). This is application-level config lookup — the admin sets
     // peer.cn to whatever name they want to match, regardless of where it
     // appears in the cert.
+    //
+    // Limitation: wildcard certs (e.g., *.example.com) require peer.cn to use
+    // the same wildcard pattern. Literal expansion is not supported — use
+    // cn = "*.example.com" in config to match a wildcard cert.
     let matched = peers.iter().find(|p| {
         if p.cn.is_empty() {
             return false;

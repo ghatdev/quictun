@@ -429,6 +429,15 @@ impl Config {
                         "listener requires at least one peer".into(),
                     ));
                 }
+                if !is_x509 {
+                    for (i, peer) in peers.iter().enumerate() {
+                        if peer.public_key.is_empty() {
+                            return Err(ConfigError::Invalid(format!(
+                                "RPK listener peers[{i}] requires non-empty public_key"
+                            )));
+                        }
+                    }
+                }
                 if is_x509 {
                     let mut seen_cns = std::collections::HashSet::new();
                     for (i, peer) in peers.iter().enumerate() {
