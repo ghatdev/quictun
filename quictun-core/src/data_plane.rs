@@ -54,29 +54,6 @@ impl OuterRecvBatch {
     }
 }
 
-/// Pre-allocated batch for inner (TUN) recv.
-///
-/// On Linux with GRO, one TUN read returns a coalesced packet (up to 64KB)
-/// that the adapter splits into individual packets in this batch.
-/// On macOS, each read returns one packet.
-pub struct InnerRecvBatch {
-    pub bufs: Vec<Vec<u8>>,
-    pub lens: Vec<usize>,
-}
-
-impl InnerRecvBatch {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            bufs: vec![vec![0u8; MAX_PACKET]; capacity],
-            lens: vec![0; capacity],
-        }
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.bufs.len()
-    }
-}
-
 // ── DataPlaneIo trait ───────────────────────────────────────────────────
 
 /// Layer 2 I/O adapter interface.
@@ -126,10 +103,10 @@ pub trait DataPlaneIo {
     fn remove_os_route(&mut self, dst: Ipv4Net) -> io::Result<()>;
 }
 
-/// Batch extension for high-throughput adapters.
+/// Batch receive extension for high-throughput adapters.
 ///
-/// Provides batched recv/send methods. Adapters that don't support batching
-/// can implement these by delegating to the single-packet methods.
+/// Provides batched recv methods. Send-side optimizations (GSO, GRO) are
+/// adapter-internal — the hot loop accesses buffers directly for zero-copy.
 pub trait DataPlaneIoBatch: DataPlaneIo {
     /// Batch receive outer (UDP) packets.
     ///
@@ -140,35 +117,4 @@ pub trait DataPlaneIoBatch: DataPlaneIo {
     /// Returns number of packets received. Packet `i` is in
     /// `batch.bufs[i][..batch.lens[i]]` from `batch.addrs[i]`.
     fn recv_outer_batch(&mut self, batch: &mut OuterRecvBatch) -> io::Result<usize>;
-
-    /// Batch receive inner (TUN) packets.
-    ///
-    /// On Linux with GRO: reads one coalesced packet and splits it into
-    /// individual IP packets in `batch.bufs`.
-    /// On macOS: loops `tun.recv` until WouldBlock.
-    fn recv_inner_batch(&mut self, batch: &mut InnerRecvBatch) -> io::Result<usize>;
-
-    /// GSO send: multiple equal-sized segments in a single syscall.
-    ///
-    /// `segments` contains all segments concatenated. `segment_size` is the
-    /// size of each individual segment.
-    ///
-    /// On Linux: `sendmsg` with `UDP_SEGMENT` cmsg.
-    /// On macOS: falls back to per-segment `send_outer`.
-    fn send_outer_gso(
-        &mut self,
-        segments: &[u8],
-        segment_size: usize,
-        remote: SocketAddr,
-    ) -> io::Result<()>;
-
-    /// Send an inner packet through the GRO coalescing table.
-    ///
-    /// On Linux with TUN offload: packets are coalesced and sent via
-    /// `send_multiple` when the table is flushed.
-    /// On macOS: immediate `send_inner`.
-    fn send_inner_gro(&mut self, pkt: &[u8]) -> io::Result<()>;
-
-    /// Flush any pending GRO-coalesced inner packets.
-    fn flush_inner_gro(&mut self) -> io::Result<()>;
 }

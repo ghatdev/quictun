@@ -154,10 +154,6 @@ pub fn run_v2(
 
     // ── Main poll loop ──────────────────────────────────────────────────
     loop {
-        // Flush GSO batch from previous TUN RX iteration.
-        #[cfg(target_os = "linux")]
-        adapter.flush_gso_batch();
-
         // Drain buffered TUN writes.
         while let Some(pkt) = tun_write_buf.front() {
             match adapter.tun().send(pkt) {
