@@ -105,6 +105,9 @@ pub fn build_rustls_server_tls_config(
     // Use stateful session storage so 0-RTT early data is allowed.
     // (Stateless Ticketer does not support 0-RTT per RFC 8446 §8.1.)
     tls_config.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+    // QUIC mandates max_early_data_size be 0 or u32::MAX (RFC 9001 §4.6.1).
+    // Safe here: QUIC transport-layer anti-amplification limits apply, and
+    // we use RPK with pinned keys so replay risk is minimal.
     tls_config.max_early_data_size = u32::MAX;
 
     Ok(Arc::new(tls_config))
@@ -254,6 +257,9 @@ pub fn build_rustls_server_tls_config_x509(
 
     tls_config.alpn_protocols = vec![ALPN_QUICTUN_V1.to_vec()];
     tls_config.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+    // QUIC mandates max_early_data_size be 0 or u32::MAX (RFC 9001 §4.6.1).
+    // Safe here: QUIC transport-layer anti-amplification limits apply, and
+    // we use RPK with pinned keys so replay risk is minimal.
     tls_config.max_early_data_size = u32::MAX;
 
     Ok(Arc::new(tls_config))
@@ -543,9 +549,10 @@ pub fn make_transport_config(
         transport.keep_alive_interval(Some(interval));
     }
     if tuning.max_idle_timeout_ms > 0 {
+        // Safety: value is pre-validated in session::build_transport_tuning().
         transport.max_idle_timeout(Some(
             quinn::IdleTimeout::try_from(Duration::from_millis(tuning.max_idle_timeout_ms))
-                .expect("idle timeout out of range"),
+                .expect("idle timeout pre-validated in session::build_transport_tuning"),
         ));
     }
     transport

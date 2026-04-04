@@ -77,6 +77,13 @@ impl RoutingTable {
         }
     }
 
+    /// Remove all routes associated with a peer CID key.
+    ///
+    /// Used when a connection is torn down (timeout, close, key exhaustion).
+    pub fn remove_peer_routes(&mut self, cid_key: u64) {
+        self.routes.retain(|(_, cid)| *cid != cid_key);
+    }
+
     /// Number of routes.
     pub fn len(&self) -> usize {
         self.routes.len()

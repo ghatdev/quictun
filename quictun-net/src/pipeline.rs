@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::MultiQuicState;
+use quictun_core::routing::{RouteAction, RoutingTable};
 use quictun_proto::frame::AckFrame;
 use quictun_proto::split::{KeyUpdateState, RxState, TxState};
 use quictun_proto::packet::ShortHeader;
@@ -329,9 +330,9 @@ pub fn run_pipeline(
         Interest::READABLE,
     )?;
 
-    // 6. Connection table.
+    // 6. Connection table + routing.
     let mut connections: FxHashMap<u64, PipelineConnEntry> = FxHashMap::default();
-    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
+    let mut routing_table = RoutingTable::new(config.tunnel_ip, false);
     let mut had_connection = false;
 
     // Buffers.
@@ -412,7 +413,7 @@ pub fn run_pipeline(
             &mut events,
             &mut multi_state,
             &mut connections,
-            &mut ip_to_cid,
+            &mut routing_table,
             &mut had_connection,
             &config,
             is_connector,
@@ -468,7 +469,7 @@ fn pipeline_io_loop(
     events: &mut Events,
     multi_state: &mut MultiQuicState,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
-    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
+    routing_table: &mut RoutingTable,
     had_connection: &mut bool,
     config: &NetConfig,
     is_connector: bool,
@@ -645,7 +646,7 @@ fn pipeline_io_loop(
                     pipeline_tun_rx_offload(
                         tun,
                         connections,
-                        ip_to_cid,
+                        routing_table,
                         job_tx,
                         in_flight_batches,
                         tun_original_buf,
@@ -656,7 +657,7 @@ fn pipeline_io_loop(
                     pipeline_tun_rx(
                         tun,
                         connections,
-                        ip_to_cid,
+                        routing_table,
                         job_tx,
                         in_flight_batches,
                     )?;
@@ -667,7 +668,7 @@ fn pipeline_io_loop(
                 pipeline_tun_rx(
                     tun,
                     connections,
-                    ip_to_cid,
+                    routing_table,
                     job_tx,
                     in_flight_batches,
                 )?;
@@ -691,7 +692,7 @@ fn pipeline_io_loop(
         )?;
 
         // ── Timeouts + keepalives ────────────────────────────────────
-        pipeline_timeouts(udp, connections, ip_to_cid, multi_state, config.idle_timeout, encrypt_buf)?;
+        pipeline_timeouts(udp, connections, routing_table, multi_state, config.idle_timeout, encrypt_buf)?;
 
         // ── Standalone ACK timer ─────────────────────────────────────
         if Instant::now() >= *next_ack_deadline {
@@ -704,8 +705,9 @@ fn pipeline_io_loop(
             udp,
             multi_state,
             connections,
-            ip_to_cid,
+            routing_table,
             &config.peers,
+            config.max_peers,
         )?;
 
         if !*had_connection && !connections.is_empty() {
@@ -1223,7 +1225,7 @@ fn submit_decrypt_batch(
 fn pipeline_tun_rx(
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
-    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
+    routing_table: &RoutingTable,
     job_tx: &Sender<CryptoJob>,
     in_flight: &mut usize,
 ) -> Result<()> {
@@ -1238,13 +1240,15 @@ fn pipeline_tun_rx(
                     continue;
                 }
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-                let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
-                    cid
-                } else if connections.len() == 1 {
-                    *connections.keys().next().expect("single connection")
-                } else {
-                    debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
-                    continue;
+                let cid = match routing_table.lookup(dest_ip) {
+                    RouteAction::ForwardToPeer(cid) => cid,
+                    _ if connections.len() == 1 => {
+                        *connections.keys().next().expect("single connection")
+                    }
+                    _ => {
+                        debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
+                        continue;
+                    }
                 };
                 if !connections.contains_key(&cid) {
                     continue;
@@ -1268,7 +1272,7 @@ fn pipeline_tun_rx(
 fn pipeline_tun_rx_offload(
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
-    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
+    routing_table: &RoutingTable,
     job_tx: &Sender<CryptoJob>,
     in_flight: &mut usize,
     original_buf: &mut [u8],
@@ -1292,13 +1296,15 @@ fn pipeline_tun_rx_offload(
             let packet = &split_bufs[i][..pkt_len];
             let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-            let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
-                cid
-            } else if connections.len() == 1 {
-                *connections.keys().next().expect("single connection")
-            } else {
-                debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
-                continue;
+            let cid = match routing_table.lookup(dest_ip) {
+                RouteAction::ForwardToPeer(cid) => cid,
+                _ if connections.len() == 1 => {
+                    *connections.keys().next().expect("single connection")
+                }
+                _ => {
+                    debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
+                    continue;
+                }
             };
             if !connections.contains_key(&cid) {
                 continue;
@@ -1372,25 +1378,33 @@ fn submit_encrypt_batch(
 fn pipeline_timeouts(
     udp: &std::net::UdpSocket,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
-    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
+    routing_table: &mut RoutingTable,
     multi_state: &mut MultiQuicState,
     idle_timeout: Duration,
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
-    // Remove idle connections.
-    let expired: Vec<u64> = connections
+    // Remove idle or key-exhausted connections.
+    let expired: Vec<(u64, &'static str)> = connections
         .iter()
-        .filter(|(_, e)| e.last_rx.elapsed() >= idle_timeout)
-        .map(|(&cid, _)| cid)
+        .filter_map(|(&cid, e)| {
+            if e.key_update.is_key_exhausted() {
+                Some((cid, "key exhausted"))
+            } else if e.last_rx.elapsed() >= idle_timeout {
+                Some((cid, "idle timeout"))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    for cid in expired {
+    for (cid, reason) in expired {
         if let Some(entry) = connections.remove(&cid) {
-            ip_to_cid.remove(&entry.tunnel_ip);
+            routing_table.remove_peer_routes(cid);
             info!(
                 tunnel_ip = %entry.tunnel_ip,
                 cid = %hex::encode(cid.to_ne_bytes()),
-                "connection idle timeout, removed"
+                reason,
+                "connection removed"
             );
         }
     }
@@ -1460,8 +1474,9 @@ fn pipeline_drive_handshakes(
     udp: &std::net::UdpSocket,
     multi_state: &mut MultiQuicState,
     connections: &mut FxHashMap<u64, PipelineConnEntry>,
-    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
+    routing_table: &mut RoutingTable,
     peers: &[PeerConfig],
+    max_peers: usize,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1472,6 +1487,10 @@ fn pipeline_drive_handshakes(
     drain_transmits(udp, multi_state)?;
 
     for ch in result.completed {
+        if connections.len() >= max_peers {
+            warn!(max_peers, "max_peers reached, rejecting new connection");
+            break;
+        }
         let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
             continue;
         };
@@ -1506,7 +1525,7 @@ fn pipeline_drive_handshakes(
             "connection established (pipeline)"
         );
 
-        ip_to_cid.insert(tunnel_ip, cid_key);
+        routing_table.add_peer_routes(cid_key, &allowed_ips);
         connections.insert(
             cid_key,
             PipelineConnEntry {

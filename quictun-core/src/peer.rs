@@ -15,7 +15,7 @@ use tracing::info;
 /// Peer configuration for identity matching after handshake.
 ///
 /// Replaces the backend-specific `ResolvedPeer` (tokio) and `PeerInfo` (DPDK).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PeerConfig {
     /// SPKI DER of the peer's public key.
     ///
@@ -32,8 +32,12 @@ pub struct PeerConfig {
 }
 
 /// Check if an IP is within any of the allowed_ips networks.
+///
+/// Fail-closed: returns `false` if `allowed_ips` is empty.
+/// Callers must validate that `allowed_ips` is non-empty at config time
+/// (see [`crate::session::resolve_peers`]).
 pub fn is_allowed_source(allowed_ips: &[Ipv4Net], src_ip: Ipv4Addr) -> bool {
-    allowed_ips.is_empty() || allowed_ips.iter().any(|net| net.contains(&src_ip))
+    allowed_ips.iter().any(|net| net.contains(&src_ip))
 }
 
 /// Identify which peer connected by matching their certificate against known peers.

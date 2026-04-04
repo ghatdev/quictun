@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::MultiQuicState;
+use quictun_core::routing::{RouteAction, RoutingTable};
 use quictun_proto::cid_to_u64;
 use quictun_proto::local::LocalConnectionState;
 #[cfg(target_os = "linux")]
@@ -214,6 +215,7 @@ pub struct NetConfig {
     pub tun_write_buf_capacity: usize,
     pub channel_capacity: usize,
     pub poll_events: usize,
+    pub max_peers: usize,
 }
 
 /// Result of the engine run — tells the CLI whether to reconnect.
@@ -314,9 +316,9 @@ fn run_single(
         drain_transmits(&udp_socket, &mut multi_state)?;
     }
 
-    // 6. Connection table.
+    // 6. Connection table + routing.
     let mut connections: FxHashMap<u64, ConnEntry> = FxHashMap::default();
-    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
+    let mut routing_table = RoutingTable::new(config.tunnel_ip, false);
     let mut had_connection = false;
 
     // Buffers.
@@ -380,6 +382,10 @@ fn run_single(
     // ACK timer state.
     let ack_timer_interval = Duration::from_millis(config.ack_timer_ms as u64);
     let mut next_ack_deadline = Instant::now() + ack_timer_interval;
+
+    // Stats timer.
+    let stats_interval = Duration::from_secs(30);
+    let mut next_stats_deadline = Instant::now() + stats_interval;
 
     // 7. Main poll loop.
     loop {
@@ -464,7 +470,7 @@ fn run_single(
                         &udp_socket,
                         &tun,
                         &mut connections,
-                        &ip_to_cid,
+                        &routing_table,
                         &mut gso_buf,
                         &mut tun_original_buf,
                         &mut tun_split_bufs,
@@ -475,7 +481,7 @@ fn run_single(
                         &udp_socket,
                         &tun,
                         &mut connections,
-                        &ip_to_cid,
+                        &routing_table,
                         &mut gso_buf,
                         &mut encrypt_buf,
                     )?;
@@ -487,7 +493,7 @@ fn run_single(
                     &udp_socket,
                     &tun,
                     &mut connections,
-                    &ip_to_cid,
+                    &routing_table,
                     &mut encrypt_buf,
                 )?;
             }
@@ -497,7 +503,7 @@ fn run_single(
         handle_timeouts(
             &udp_socket,
             &mut connections,
-            &mut ip_to_cid,
+            &mut routing_table,
             &mut multi_state,
             config.idle_timeout,
             &mut encrypt_buf,
@@ -514,9 +520,22 @@ fn run_single(
             &udp_socket,
             &mut multi_state,
             &mut connections,
-            &mut ip_to_cid,
+            &mut routing_table,
             &config.peers,
+            config.max_peers,
         )?;
+
+        // ── Periodic stats ────────────────────────────────────────────
+        let now = Instant::now();
+        if now >= next_stats_deadline {
+            info!(
+                connections = connections.len(),
+                routes = routing_table.len(),
+                handshakes = multi_state.handshakes.len(),
+                "periodic stats"
+            );
+            next_stats_deadline = now + stats_interval;
+        }
 
         // Track whether we ever had a connection (for ConnectionLost detection).
         if !had_connection && !connections.is_empty() {
@@ -952,7 +971,7 @@ fn handle_tun_rx_linux(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, ConnEntry>,
-    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
+    routing_table: &RoutingTable,
     gso_buf: &mut [u8],
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
@@ -973,16 +992,15 @@ fn handle_tun_rx_linux(
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
-                    cid
-                } else if connections.len() == 1 {
-                    *connections
-                        .keys()
-                        .next()
-                        .expect("single connection")
-                } else {
-                    debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
-                    continue;
+                let cid = match routing_table.lookup(dest_ip) {
+                    RouteAction::ForwardToPeer(cid) => cid,
+                    _ if connections.len() == 1 => {
+                        *connections.keys().next().expect("single connection")
+                    }
+                    _ => {
+                        debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
+                        continue;
+                    }
                 };
 
                 // Flush current GSO batch if connection changed or batch full.
@@ -1127,7 +1145,7 @@ fn handle_tun_rx(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, ConnEntry>,
-    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
+    routing_table: &RoutingTable,
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
     loop {
@@ -1140,15 +1158,12 @@ fn handle_tun_rx(
 
                 let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-                let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
-                    cid
-                } else if connections.len() == 1 {
-                    *connections
-                        .keys()
-                        .next()
-                        .expect("single connection")
-                } else {
-                    continue;
+                let cid = match routing_table.lookup(dest_ip) {
+                    RouteAction::ForwardToPeer(cid) => cid,
+                    _ if connections.len() == 1 => {
+                        *connections.keys().next().expect("single connection")
+                    }
+                    _ => continue,
                 };
 
                 let entry = match connections.get_mut(&cid) {
@@ -1181,25 +1196,33 @@ fn handle_tun_rx(
 fn handle_timeouts(
     udp: &std::net::UdpSocket,
     connections: &mut FxHashMap<u64, ConnEntry>,
-    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
+    routing_table: &mut RoutingTable,
     multi_state: &mut MultiQuicState,
     idle_timeout: Duration,
     encrypt_buf: &mut [u8],
 ) -> Result<()> {
-    // Remove idle connections.
-    let expired: Vec<u64> = connections
+    // Remove idle or key-exhausted connections.
+    let expired: Vec<(u64, &'static str)> = connections
         .iter()
-        .filter(|(_, e)| e.last_rx.elapsed() >= idle_timeout)
-        .map(|(&cid, _)| cid)
+        .filter_map(|(&cid, e)| {
+            if e.conn.is_key_exhausted() {
+                Some((cid, "key exhausted"))
+            } else if e.last_rx.elapsed() >= idle_timeout {
+                Some((cid, "idle timeout"))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    for cid in expired {
+    for (cid, reason) in expired {
         if let Some(entry) = connections.remove(&cid) {
-            ip_to_cid.remove(&entry.tunnel_ip);
+            routing_table.remove_peer_routes(cid);
             info!(
                 tunnel_ip = %entry.tunnel_ip,
                 cid = %hex::encode(cid.to_ne_bytes()),
-                "connection idle timeout, removed"
+                reason,
+                "connection removed"
             );
         }
     }
@@ -1235,8 +1258,9 @@ fn drive_handshakes(
     udp: &std::net::UdpSocket,
     multi_state: &mut MultiQuicState,
     connections: &mut FxHashMap<u64, ConnEntry>,
-    ip_to_cid: &mut FxHashMap<Ipv4Addr, u64>,
+    routing_table: &mut RoutingTable,
     peers: &[PeerConfig],
+    max_peers: usize,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1253,6 +1277,10 @@ fn drive_handshakes(
 
     // Promote completed handshakes.
     for ch in result.completed {
+        if connections.len() >= max_peers {
+            warn!(max_peers, "max_peers reached, rejecting new connection");
+            break;
+        }
         let Some((hs, conn_state)) = multi_state.extract_connection(ch) else {
             continue;
         };
@@ -1291,7 +1319,7 @@ fn drive_handshakes(
             "connection established"
         );
 
-        ip_to_cid.insert(tunnel_ip, primary_cid_key);
+        routing_table.add_peer_routes(primary_cid_key, &allowed_ips);
         connections.insert(
             primary_cid_key,
             ConnEntry {
@@ -1330,7 +1358,7 @@ fn handle_tun_rx_linux_offload(
     udp: &std::net::UdpSocket,
     tun: &tun_rs::SyncDevice,
     connections: &mut FxHashMap<u64, ConnEntry>,
-    ip_to_cid: &FxHashMap<Ipv4Addr, u64>,
+    routing_table: &RoutingTable,
     gso_buf: &mut [u8],
     original_buf: &mut [u8],
     split_bufs: &mut [Vec<u8>],
@@ -1358,13 +1386,15 @@ fn handle_tun_rx_linux_offload(
             let packet = &split_bufs[i][..pkt_len];
             let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-            let cid = if let Some(&cid) = ip_to_cid.get(&dest_ip) {
-                cid
-            } else if connections.len() == 1 {
-                *connections.keys().next().expect("single connection")
-            } else {
-                debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
-                continue;
+            let cid = match routing_table.lookup(dest_ip) {
+                RouteAction::ForwardToPeer(cid) => cid,
+                _ if connections.len() == 1 => {
+                    *connections.keys().next().expect("single connection")
+                }
+                _ => {
+                    debug!(dest = %dest_ip, "no route for dest IP, dropping TUN packet");
+                    continue;
+                }
             };
 
             // If CID changed, flush the current batch first.

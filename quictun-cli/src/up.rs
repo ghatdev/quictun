@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use quictun_core::config::{Backend, Config, Mode};
-use quictun_core::connection::{CongestionControl, TransportTuning};
 use quictun_core::proto_config;
+use quictun_core::session;
 use quictun_crypto::{PrivateKey, PublicKey};
 
 use crate::state;
@@ -46,29 +46,17 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
-    let cc: CongestionControl = config
-        .engine
-        .cc
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let spki_ders: Vec<Vec<u8>> = peer_pubkeys.iter().map(|pk| pk.spki_der().to_vec()).collect();
+    let resolved_peers = session::resolve_peers(config, &spki_ders)?;
 
-    let tuning = TransportTuning {
-        datagram_recv_buffer: config.engine.recv_buf,
-        datagram_send_buffer: config.engine.send_buf,
-        send_window: config.engine.send_window,
-        cc,
-        max_idle_timeout_ms: config.interface.max_idle_timeout_ms,
-        initial_rtt_ms: config.engine.initial_rtt_ms,
-        pin_mtu: config.engine.pin_mtu,
-        ..Default::default()
-    };
+    let tuning = session::build_transport_tuning(config)?;
 
     tracing::info!(
         mode = %mode,
         address = %addr,
         mtu = config.mtu(),
         peers = peers.len(),
-        cc = %cc,
+        cc = %config.engine.cc,
         "starting quictun (net engine)"
     );
 
@@ -77,41 +65,9 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
     state::write_pid_file(&iface_name)?;
     let _pid_guard = state::PidFileGuard::new(iface_name.clone());
 
-    let idle_timeout = if config.interface.max_idle_timeout_ms > 0 {
-        Duration::from_millis(config.interface.max_idle_timeout_ms)
-    } else {
-        Duration::from_secs(30)
-    };
-
+    let idle_timeout = session::idle_timeout(config);
     let cid_len = config.interface.cid_length as usize;
-
-    let resolved_peers: Vec<quictun_core::peer::PeerConfig> = peers
-        .iter()
-        .zip(peer_pubkeys.iter())
-        .map(|(peer_cfg, pubkey)| {
-            let tunnel_ip: std::net::Ipv4Addr = peer_cfg
-                .allowed_ips
-                .first()
-                .and_then(|s| s.parse::<ipnet::Ipv4Net>().ok())
-                .map(|net| net.addr())
-                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-
-            let allowed_ips: Vec<ipnet::Ipv4Net> = peer_cfg
-                .allowed_ips
-                .iter()
-                .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
-                .collect();
-
-            quictun_core::peer::PeerConfig {
-                spki_der: pubkey.spki_der().to_vec(),
-                tunnel_ip,
-                allowed_ips,
-                keepalive: peer_cfg.keepalive.map(Duration::from_secs),
-            }
-        })
-        .collect();
-
-    let reconnect = peers[0].reconnect_interval.is_some();
+    let reconnect = session::reconnect_enabled(config);
 
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
@@ -138,14 +94,16 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         tun_write_buf_capacity: config.engine.tun_write_buf,
         channel_capacity: config.engine.channel_capacity,
         poll_events: config.engine.poll_events,
+        max_peers: config.engine.max_peers,
     };
 
     // Resolve cipher suites.
     let server_ciphers = config.server_cipher_suites()?;
     let client_ciphers = config.client_cipher_suites()?;
 
-    let mut backoff_secs: u64 = 1;
-    const MAX_BACKOFF_SECS: u64 = 60;
+    let reconnect_base = session::reconnect_interval_secs(config);
+    let mut backoff_secs: u64 = reconnect_base;
+    let max_backoff_secs: u64 = reconnect_base.saturating_mul(60).min(300);
 
     loop {
         let setup = match mode {
@@ -194,7 +152,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
                     let delay = Duration::from_millis(backoff_secs * 1000 + jitter_ms);
                     tracing::info!(delay_ms = delay.as_millis(), "reconnecting after backoff");
                     std::thread::sleep(delay);
-                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    backoff_secs = (backoff_secs * 2).min(max_backoff_secs);
                     continue;
                 }
                 tracing::info!("connection lost, exiting (no reconnect configured)");
@@ -234,19 +192,7 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
 
     let keepalive = peer.keepalive.map(Duration::from_secs);
 
-    let cc: CongestionControl = config
-        .engine
-        .cc
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
-
-    let tuning = TransportTuning {
-        datagram_recv_buffer: config.engine.recv_buf,
-        datagram_send_buffer: config.engine.send_buf,
-        send_window: config.engine.send_window,
-        cc,
-        ..Default::default()
-    };
+    let tuning = session::build_transport_tuning(config)?;
 
     // Parse DPDK-specific IPs.
     let dpdk_local_ip: std::net::Ipv4Addr = config
@@ -292,7 +238,7 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
         dpdk_local_ip = %dpdk_local_ip,
         dpdk_port = config.engine.dpdk_port,
         dpdk_mode,
-        cc = %cc,
+        cc = %config.engine.cc,
         "starting quictun (DPDK)"
     );
 
@@ -350,30 +296,8 @@ fn run_dpdk(config_path: &str, config: &Config) -> Result<()> {
         }
     };
 
-    let dpdk_peers: Vec<quictun_core::peer::PeerConfig> = peers
-        .iter()
-        .zip(all_peer_pubkeys.iter())
-        .map(|(p, pubkey)| {
-            let tunnel_ip: std::net::Ipv4Addr = p
-                .allowed_ips
-                .first()
-                .and_then(|cidr| cidr.split('/').next())
-                .and_then(|ip| ip.parse().ok())
-                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-            let allowed_ips: Vec<ipnet::Ipv4Net> = p
-                .allowed_ips
-                .iter()
-                .filter_map(|s| s.parse::<ipnet::Ipv4Net>().ok())
-                .collect();
-
-            quictun_core::peer::PeerConfig {
-                spki_der: pubkey.spki_der().to_vec(),
-                tunnel_ip,
-                allowed_ips,
-                keepalive: None,
-            }
-        })
-        .collect();
+    let spki_ders: Vec<Vec<u8>> = all_peer_pubkeys.iter().map(|pk| pk.spki_der().to_vec()).collect();
+    let dpdk_peers = session::resolve_peers(config, &spki_ders)?;
 
     let is_router = config.engine.backend == Backend::DpdkRouter;
     let routing = config.routing.as_ref();

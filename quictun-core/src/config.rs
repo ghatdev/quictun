@@ -229,6 +229,9 @@ pub struct EngineConfig {
     /// mio Events capacity.
     #[serde(default = "default_poll_events")]
     pub poll_events: usize,
+    /// Maximum number of concurrent peer connections (listener mode).
+    #[serde(default = "default_max_peers")]
+    pub max_peers: usize,
 }
 
 impl Default for EngineConfig {
@@ -257,6 +260,7 @@ impl Default for EngineConfig {
             tun_write_buf: 256,
             channel_capacity: 4096,
             poll_events: 64,
+            max_peers: 256,
         }
     }
 }
@@ -345,6 +349,10 @@ fn default_channel_capacity() -> usize {
 
 fn default_poll_events() -> usize {
     64
+}
+
+fn default_max_peers() -> usize {
+    256
 }
 
 fn default_true() -> bool {
@@ -461,25 +469,13 @@ impl Config {
         match self.interface.auth_mode.as_str() {
             "rpk" => {}
             "x509" => {
-                if self.interface.cert_file.is_none() {
-                    return Err(ConfigError::Invalid(
-                        "auth_mode = \"x509\" requires cert_file".into(),
-                    ));
-                }
-                if self.interface.key_file.is_none() {
-                    return Err(ConfigError::Invalid(
-                        "auth_mode = \"x509\" requires key_file".into(),
-                    ));
-                }
-                if self.interface.ca_file.is_none() {
-                    return Err(ConfigError::Invalid(
-                        "auth_mode = \"x509\" requires ca_file".into(),
-                    ));
-                }
+                return Err(ConfigError::Invalid(
+                    "auth_mode = \"x509\" is not yet implemented; use \"rpk\"".into(),
+                ));
             }
             other => {
                 return Err(ConfigError::Invalid(format!(
-                    "auth_mode must be \"rpk\" or \"x509\" (got \"{other}\")"
+                    "auth_mode must be \"rpk\" (got \"{other}\")"
                 )));
             }
         }

@@ -218,7 +218,13 @@ impl SharedConnectionState {
 
         // Peer-initiated: peek next generation key.
         {
-            let keys = self.key_update.next_keys().expect("key mutex");
+            let keys = match self.key_update.next_keys() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.key_update.set_key_exhausted();
+                    return Err(ParseError::CryptoError);
+                }
+            };
             if let Some((next_rx, _)) = keys.front() {
                 if let Ok(result) = decrypt_payload_in_place(packet, hdr, &**next_rx) {
                     return Ok(result);
@@ -249,10 +255,13 @@ impl SharedConnectionState {
                 tracing::debug!("key update: RX rotated (peer responded to our initiation)");
             } else {
                 // Peer-initiated rotation: pop from key_update.
-                let mut keys = self
-                    .key_update
-                    .next_keys()
-                    .expect("key mutex");
+                let mut keys = match self.key_update.next_keys() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        self.key_update.set_key_exhausted();
+                        return;
+                    }
+                };
                 if let Some((new_rx, new_tx)) = keys.pop_front() {
                     self.rx_packet_key.store(Arc::new(new_rx));
                     self.tx.store_packet_key(Arc::new(new_tx));
@@ -323,7 +332,13 @@ impl SharedConnectionState {
             .packets_since_update()
             .fetch_add(count, Ordering::Relaxed);
         if prev + count >= crate::KEY_UPDATE_THRESHOLD && prev < crate::KEY_UPDATE_THRESHOLD {
-            let mut next_keys = self.key_update.next_keys().expect("key mutex");
+            let mut next_keys = match self.key_update.next_keys() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.key_update.set_key_exhausted();
+                    return;
+                }
+            };
             if let Some((new_rx, new_tx)) = next_keys.pop_front() {
                 let mut pending = self.pending_rx_key.lock();
                 *pending = Some(new_rx);
