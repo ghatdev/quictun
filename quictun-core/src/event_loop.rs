@@ -158,22 +158,20 @@ fn handle_outer_rx<I: DataPlaneIo + DataPlaneIoBatch>(
     response_buf: &mut Vec<u8>,
     cid_len: usize,
 ) -> Result<()> {
-    // Loop until no more packets (edge-triggered).
+    // Use single-packet recv in a loop (simpler, avoids batch borrow issues).
     loop {
-        let count = match io.recv_outer_batch(batch) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
+        let (n, from) = match io.recv_outer(&mut batch.bufs[0]) {
+            Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(e) => return Err(e).context("recv_outer_batch failed"),
+            Err(e) => return Err(e).context("recv_outer failed"),
         };
 
-        for i in 0..count {
-            let n = batch.lens[i];
+        {
+            let i = 0;
             if n == 0 {
                 continue;
             }
             let first_byte = batch.bufs[i][0];
-            let from = batch.addrs[i];
 
             if first_byte & 0x80 != 0 {
                 // Long header → handshake packet.
@@ -276,6 +274,11 @@ fn handle_inner_rx<I: DataPlaneIo>(
         match io.recv_inner(&mut packet) {
             Ok(n) => {
                 if n < 20 {
+                    continue;
+                }
+                // Skip non-IPv4 packets (e.g., IPv6 neighbor discovery).
+                let ip_version = packet[0] >> 4;
+                if ip_version != 4 {
                     continue;
                 }
 

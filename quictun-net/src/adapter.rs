@@ -119,6 +119,10 @@ impl KernelAdapter {
             Interest::READABLE,
         )?;
 
+        // Ensure UDP socket is non-blocking via fcntl (required for recv_from in event loop).
+        // socket2 uses FIONBIO which may not persist after conversion to std UdpSocket.
+        set_nonblocking(udp_socket.as_raw_fd())?;
+
         Ok(Self {
             poll,
             events,
@@ -243,12 +247,13 @@ impl DataPlaneIo for KernelAdapter {
 impl DataPlaneIoBatch for KernelAdapter {
     #[cfg(target_os = "linux")]
     fn recv_outer_batch(&mut self, batch: &mut OuterRecvBatch) -> io::Result<usize> {
+        let max_count = batch.bufs.len();
         quictun_core::batch_io::recvmmsg_batch(
             &self.udp_socket,
             &mut batch.bufs,
             &mut batch.lens,
             &mut batch.addrs,
-            batch.bufs.len(),
+            max_count,
             &mut self.recv_work,
         )
     }
@@ -291,7 +296,7 @@ impl DataPlaneIoBatch for KernelAdapter {
             &self.udp_socket,
             segments,
             segment_size as u16,
-            &remote,
+            remote,
         )?;
         Ok(())
     }

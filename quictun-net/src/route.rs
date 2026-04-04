@@ -117,11 +117,16 @@ fn netlink_route(fd: i32, msg_type: u16, dst: Ipv4Net, ifindex: u32) -> io::Resu
         return Err(io::Error::last_os_error());
     }
 
-    // Read response to check for errors.
+    // Read response to check for errors (non-blocking to avoid hanging).
     let mut resp = [0u8; 128];
-    let n = unsafe { libc::recv(fd, resp.as_mut_ptr() as *mut _, resp.len(), 0) };
+    let n = unsafe { libc::recv(fd, resp.as_mut_ptr() as *mut _, resp.len(), libc::MSG_DONTWAIT) };
     if n < 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        // EAGAIN is OK — no response yet (common for duplicate routes).
+        if err.kind() != io::ErrorKind::WouldBlock {
+            return Err(err);
+        }
+        return Ok(());
     }
 
     // Check nlmsghdr type — NLMSG_ERROR (2) with error=0 means success.
