@@ -708,6 +708,7 @@ fn pipeline_io_loop(
             routing_table,
             &config.peers,
             config.max_peers,
+            config.x509,
         )?;
 
         if !*had_connection && !connections.is_empty() {
@@ -1477,6 +1478,7 @@ fn pipeline_drive_handshakes(
     routing_table: &mut RoutingTable,
     peers: &[PeerConfig],
     max_peers: usize,
+    x509: bool,
 ) -> Result<()> {
     if multi_state.handshakes.is_empty() {
         return Ok(());
@@ -1495,21 +1497,36 @@ fn pipeline_drive_handshakes(
             continue;
         };
 
-        let matched_peer = if peers.len() == 1 {
-            &peers[0]
-        } else {
-            match peer::identify_peer(&hs.connection, peers) {
-                Some(p) => p,
+        let (tunnel_ip, allowed_ips, keepalive_interval) = if x509 {
+            match peer::identify_peer_x509(&hs.connection) {
+                Some(p) => (
+                    p.tunnel_ip,
+                    p.allowed_ips,
+                    p.keepalive.unwrap_or(Duration::from_secs(25)),
+                ),
                 None => {
-                    warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                    warn!(remote = %hs.remote_addr, "X.509 peer has no valid SAN IPs, rejecting");
                     continue;
                 }
             }
+        } else {
+            let matched_peer = if peers.len() == 1 {
+                &peers[0]
+            } else {
+                match peer::identify_peer(&hs.connection, peers) {
+                    Some(p) => p,
+                    None => {
+                        warn!(remote = %hs.remote_addr, "could not identify peer, rejecting");
+                        continue;
+                    }
+                }
+            };
+            (
+                matched_peer.tunnel_ip,
+                matched_peer.allowed_ips.clone(),
+                matched_peer.keepalive.unwrap_or(Duration::from_secs(25)),
+            )
         };
-
-        let tunnel_ip = matched_peer.tunnel_ip;
-        let allowed_ips = matched_peer.allowed_ips.clone();
-        let keepalive_interval = matched_peer.keepalive.unwrap_or(Duration::from_secs(25));
         let cid_bytes: Vec<u8> = conn_state.local_cid()[..].to_vec();
         let cid_key = cid_to_u64(&cid_bytes);
         let now_inst = Instant::now();

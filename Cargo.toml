@@ -59,8 +59,9 @@ socket2 = { version = "0.6", features = ["all"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# PEM parsing (for X.509 mode)
+# PEM / X.509 parsing
 rustls-pemfile = "2"
+x509-parser = "0.18"
 
 # Test utilities
 rcgen = "0.14"

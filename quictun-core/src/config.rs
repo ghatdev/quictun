@@ -149,6 +149,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
     pub mode: Mode,
+    /// Base64-encoded private key (RPK mode). Optional for X.509 mode.
+    #[serde(default)]
     pub private_key: String,
     pub address: String,
     pub listen_port: Option<u16>,
@@ -279,6 +281,8 @@ pub struct RoutingConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
+    /// Base64-encoded public key (RPK mode). Optional for X.509 mode.
+    #[serde(default)]
     pub public_key: String,
     pub allowed_ips: Vec<String>,
     pub endpoint: Option<SocketAddr>,
@@ -379,6 +383,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let mode = self.interface.mode;
+        let is_x509 = self.interface.auth_mode == "x509";
 
         // ── Peer validation ──
         match mode {
@@ -396,6 +401,11 @@ impl Config {
                         "connector peer requires endpoint".into(),
                     ));
                 }
+                if !is_x509 && peer.public_key.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "RPK mode requires peer public_key".into(),
+                    ));
+                }
             }
             Mode::Listener => {
                 if self.peer.is_some() {
@@ -403,13 +413,17 @@ impl Config {
                         "listener mode uses [[peers]], not [peer]".into(),
                     ));
                 }
-                let peers = self.peers.as_ref().ok_or_else(|| {
-                    ConfigError::Invalid("listener mode requires [[peers]] section".into())
-                })?;
-                if peers.is_empty() {
-                    return Err(ConfigError::Invalid(
-                        "listener requires at least one peer".into(),
-                    ));
+                if is_x509 {
+                    // X.509 listener: [[peers]] is optional — peers discovered by cert SAN.
+                } else {
+                    let peers = self.peers.as_ref().ok_or_else(|| {
+                        ConfigError::Invalid("listener mode requires [[peers]] section".into())
+                    })?;
+                    if peers.is_empty() {
+                        return Err(ConfigError::Invalid(
+                            "listener requires at least one peer".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -467,15 +481,33 @@ impl Config {
 
         // ── Auth mode ──
         match self.interface.auth_mode.as_str() {
-            "rpk" => {}
+            "rpk" => {
+                if self.interface.private_key.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "RPK mode requires private_key".into(),
+                    ));
+                }
+            }
             "x509" => {
-                return Err(ConfigError::Invalid(
-                    "auth_mode = \"x509\" is not yet implemented; use \"rpk\"".into(),
-                ));
+                if self.interface.cert_file.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "auth_mode = \"x509\" requires cert_file".into(),
+                    ));
+                }
+                if self.interface.key_file.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "auth_mode = \"x509\" requires key_file".into(),
+                    ));
+                }
+                if self.interface.ca_file.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "auth_mode = \"x509\" requires ca_file".into(),
+                    ));
+                }
             }
             other => {
                 return Err(ConfigError::Invalid(format!(
-                    "auth_mode must be \"rpk\" (got \"{other}\")"
+                    "auth_mode must be \"rpk\" or \"x509\" (got \"{other}\")"
                 )));
             }
         }

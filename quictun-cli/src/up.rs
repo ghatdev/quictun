@@ -32,22 +32,31 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
 
     let mode = config.mode();
     let addr = config.parse_address()?;
+    let is_x509 = session::is_x509(config);
 
-    let private_key = PrivateKey::from_base64(&config.interface.private_key)
-        .context("invalid interface private_key")?;
-
+    // Resolve peers (RPK: from config + public keys; X.509: from config if present, else empty).
     let peers = config.all_peers();
-    let peer_pubkeys: Vec<PublicKey> = peers
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            PublicKey::from_base64(&p.public_key)
-                .with_context(|| format!("invalid public_key for peer[{i}]"))
-        })
-        .collect::<Result<_>>()?;
-
-    let spki_ders: Vec<Vec<u8>> = peer_pubkeys.iter().map(|pk| pk.spki_der().to_vec()).collect();
-    let resolved_peers = session::resolve_peers(config, &spki_ders)?;
+    let resolved_peers = if is_x509 {
+        // X.509: peers discovered at handshake via cert SAN. Config peers optional.
+        if peers.is_empty() {
+            Vec::new()
+        } else {
+            // Connector may still have a [peer] with allowed_ips for routing.
+            session::resolve_peers_no_keys(config)?
+        }
+    } else {
+        let peer_pubkeys: Vec<PublicKey> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                PublicKey::from_base64(&p.public_key)
+                    .with_context(|| format!("invalid public_key for peer[{i}]"))
+            })
+            .collect::<Result<_>>()?;
+        let spki_ders: Vec<Vec<u8>> =
+            peer_pubkeys.iter().map(|pk| pk.spki_der().to_vec()).collect();
+        session::resolve_peers(config, &spki_ders)?
+    };
 
     let tuning = session::build_transport_tuning(config)?;
 
@@ -55,6 +64,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         mode = %mode,
         address = %addr,
         mtu = config.mtu(),
+        auth = %config.interface.auth_mode,
         peers = peers.len(),
         cc = %config.engine.cc,
         "starting quictun (net engine)"
@@ -72,7 +82,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
     let listen_port = config.interface.listen_port.unwrap_or(0);
     let local_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse()?;
 
-    let first_keepalive = peers[0].keepalive.map(Duration::from_secs);
+    let first_keepalive = peers.first().and_then(|p| p.keepalive.map(Duration::from_secs));
 
     let net_config = quictun_net::engine::NetConfig {
         tunnel_ip: addr.addr(),
@@ -95,6 +105,7 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
         channel_capacity: config.engine.channel_capacity,
         poll_events: config.engine.poll_events,
         max_peers: config.engine.max_peers,
+        x509: is_x509,
     };
 
     // Resolve cipher suites.
@@ -106,33 +117,82 @@ fn run_net(config_path: &str, config: &Config) -> Result<()> {
     let max_backoff_secs: u64 = reconnect_base.saturating_mul(60).min(300);
 
     loop {
-        let setup = match mode {
-            Mode::Listener => {
-                let server_config = proto_config::build_proto_server_config(
-                    &private_key,
-                    &peer_pubkeys,
-                    first_keepalive,
-                    &tuning,
-                    &server_ciphers,
-                )?;
-                quictun_net::engine::EndpointSetup::Listener { server_config }
+        let setup = if is_x509 {
+            let cert_file = Path::new(config.interface.cert_file.as_ref().unwrap());
+            let key_file = Path::new(config.interface.key_file.as_ref().unwrap());
+            let ca_file = Path::new(config.interface.ca_file.as_ref().unwrap());
+            match mode {
+                Mode::Listener => {
+                    let server_config = proto_config::build_proto_server_config_x509(
+                        cert_file,
+                        key_file,
+                        ca_file,
+                        first_keepalive,
+                        &tuning,
+                        &server_ciphers,
+                    )?;
+                    quictun_net::engine::EndpointSetup::Listener { server_config }
+                }
+                Mode::Connector => {
+                    let peer = &peers[0];
+                    let keepalive = peer.keepalive.map(Duration::from_secs);
+                    let client_config = proto_config::build_proto_client_config_x509(
+                        cert_file,
+                        key_file,
+                        ca_file,
+                        keepalive,
+                        &tuning,
+                        &client_ciphers,
+                        config.interface.zero_rtt,
+                    )?;
+                    let remote_addr =
+                        peer.endpoint.context("connector requires peer endpoint")?;
+                    quictun_net::engine::EndpointSetup::Connector {
+                        remote_addr,
+                        client_config,
+                    }
+                }
             }
-            Mode::Connector => {
-                let peer = &peers[0];
-                let peer_pubkey = &peer_pubkeys[0];
-                let keepalive = peer.keepalive.map(Duration::from_secs);
-                let client_config = proto_config::build_proto_client_config(
-                    &private_key,
-                    peer_pubkey,
-                    keepalive,
-                    &tuning,
-                    &client_ciphers,
-                    config.interface.zero_rtt,
-                )?;
-                let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
-                quictun_net::engine::EndpointSetup::Connector {
-                    remote_addr,
-                    client_config,
+        } else {
+            let private_key = PrivateKey::from_base64(&config.interface.private_key)
+                .context("invalid interface private_key")?;
+            let peer_pubkeys: Vec<PublicKey> = peers
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    PublicKey::from_base64(&p.public_key)
+                        .with_context(|| format!("invalid public_key for peer[{i}]"))
+                })
+                .collect::<Result<_>>()?;
+            match mode {
+                Mode::Listener => {
+                    let server_config = proto_config::build_proto_server_config(
+                        &private_key,
+                        &peer_pubkeys,
+                        first_keepalive,
+                        &tuning,
+                        &server_ciphers,
+                    )?;
+                    quictun_net::engine::EndpointSetup::Listener { server_config }
+                }
+                Mode::Connector => {
+                    let peer = &peers[0];
+                    let peer_pubkey = &peer_pubkeys[0];
+                    let keepalive = peer.keepalive.map(Duration::from_secs);
+                    let client_config = proto_config::build_proto_client_config(
+                        &private_key,
+                        peer_pubkey,
+                        keepalive,
+                        &tuning,
+                        &client_ciphers,
+                        config.interface.zero_rtt,
+                    )?;
+                    let remote_addr =
+                        peer.endpoint.context("connector requires peer endpoint")?;
+                    quictun_net::engine::EndpointSetup::Connector {
+                        remote_addr,
+                        client_config,
+                    }
                 }
             }
         };

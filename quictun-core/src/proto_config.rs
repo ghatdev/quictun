@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,4 +50,48 @@ pub fn build_proto_server_config(
     let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(quic_crypto));
     config.transport = Arc::new(connection::make_transport_config(keepalive, tuning));
     Ok(Arc::new(config))
+}
+
+// ── X.509 proto config builders ─────────────────────────────────────────────
+
+/// Build a `quinn_proto::ServerConfig` with X.509/CA authentication.
+pub fn build_proto_server_config_x509(
+    cert_file: &Path,
+    key_file: &Path,
+    ca_file: &Path,
+    keepalive: Option<Duration>,
+    tuning: &TransportTuning,
+    cipher_suites: &[CipherSuite],
+) -> Result<Arc<quinn_proto::ServerConfig>> {
+    let tls =
+        connection::build_rustls_server_tls_config_x509(cert_file, key_file, ca_file, cipher_suites)?;
+    let quic_crypto = connection::make_quic_server_config(tls, cipher_suites)?;
+    let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    config.transport = Arc::new(connection::make_transport_config(keepalive, tuning));
+    Ok(Arc::new(config))
+}
+
+/// Build a `quinn_proto::ClientConfig` with X.509/CA authentication.
+pub fn build_proto_client_config_x509(
+    cert_file: &Path,
+    key_file: &Path,
+    ca_file: &Path,
+    keepalive: Option<Duration>,
+    tuning: &TransportTuning,
+    cipher_suites: &[CipherSuite],
+    enable_session_resumption: bool,
+) -> Result<quinn_proto::ClientConfig> {
+    let tls = connection::build_rustls_client_tls_config_x509(
+        cert_file,
+        key_file,
+        ca_file,
+        cipher_suites,
+        enable_session_resumption,
+    )?;
+    let quic_crypto = connection::make_quic_client_config(tls, cipher_suites)?;
+    let mut config = quinn_proto::ClientConfig::new(Arc::new(quic_crypto));
+    config.transport_config(Arc::new(connection::make_transport_config(
+        keepalive, tuning,
+    )));
+    Ok(config)
 }

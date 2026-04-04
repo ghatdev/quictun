@@ -25,6 +25,7 @@ bytes = { workspace = true }
 smallvec = { workspace = true }
 aws-lc-rs = { workspace = true }
 rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
 libc = { workspace = true }
 hex = { workspace = true }
 rustc-hash = { workspace = true }

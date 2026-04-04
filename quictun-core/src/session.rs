@@ -70,6 +70,44 @@ pub fn resolve_peers(
         .collect()
 }
 
+/// Parse and validate peer configs without cryptographic keys (X.509 mode).
+///
+/// For X.509 connector: peer has endpoint + allowed_ips but no public_key.
+/// For X.509 listener with optional peers: same structure.
+pub fn resolve_peers_no_keys(config: &Config) -> Result<Vec<peer::PeerConfig>> {
+    let raw_peers = config.all_peers();
+
+    raw_peers
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            if raw.allowed_ips.is_empty() {
+                bail!("peer[{i}]: allowed_ips must not be empty");
+            }
+
+            let allowed_ips: Vec<Ipv4Net> = raw
+                .allowed_ips
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    s.parse::<Ipv4Net>().with_context(|| {
+                        format!("peer[{i}].allowed_ips[{j}]: invalid CIDR \"{s}\"")
+                    })
+                })
+                .collect::<Result<_>>()?;
+
+            let tunnel_ip: Ipv4Addr = allowed_ips[0].addr();
+
+            Ok(peer::PeerConfig {
+                spki_der: Vec::new(), // No SPKI for X.509 — identity from cert SAN
+                tunnel_ip,
+                allowed_ips,
+                keepalive: raw.keepalive.map(Duration::from_secs),
+            })
+        })
+        .collect()
+}
+
 /// Build [`TransportTuning`] from a loaded [`Config`], with validation.
 pub fn build_transport_tuning(config: &Config) -> Result<TransportTuning> {
     let cc: CongestionControl = config
@@ -118,6 +156,11 @@ pub fn idle_timeout(config: &Config) -> Duration {
     } else {
         Duration::from_secs(30)
     }
+}
+
+/// Whether this config uses X.509/CA authentication.
+pub fn is_x509(config: &Config) -> bool {
+    config.interface.auth_mode == "x509"
 }
 
 /// Whether reconnection is enabled for this config.

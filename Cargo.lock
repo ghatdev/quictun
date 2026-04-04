@@ -1206,6 +1206,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
