@@ -172,13 +172,14 @@ pub fn reconnect_enabled(config: &Config) -> bool {
         .is_some()
 }
 
-/// Get the reconnect interval in seconds (or default 1s).
+/// Get the reconnect interval in seconds (minimum 1s).
 pub fn reconnect_interval_secs(config: &Config) -> u64 {
     config
         .all_peers()
         .first()
         .and_then(|p| p.reconnect_interval)
         .unwrap_or(1)
+        .max(1) // Clamp to prevent busy-loop on reconnect_interval = 0
 }
 
 #[cfg(test)]

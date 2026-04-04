@@ -185,7 +185,7 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
     } = setup
     {
         multi_state
-            .connect(client_config, remote_addr)
+            .connect(client_config, remote_addr, "quictun")
             .context("failed to initiate QUIC connection")?;
     }
 
