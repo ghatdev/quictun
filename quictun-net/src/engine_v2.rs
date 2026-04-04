@@ -105,11 +105,43 @@ pub fn run_v2(
 
     // GSO buffer: encrypt TUN→UDP packets directly here (zero copy).
     #[cfg(target_os = "linux")]
-    let mut gso_buf = vec![0u8; 44 * MAX_PACKET];
+    let mut gso_buf = vec![0u8; config.gso_max_segments * MAX_PACKET];
 
-    // TUN write backpressure buffer.
+    // TUN write backpressure buffer (non-offload path).
     let mut tun_write_buf: std::collections::VecDeque<Vec<u8>> =
-        std::collections::VecDeque::with_capacity(256);
+        std::collections::VecDeque::with_capacity(config.tun_write_buf_capacity);
+
+    // GRO TX pool: batch TUN writes when offload is enabled (Linux).
+    #[cfg(target_os = "linux")]
+    let offload_enabled = config.offload;
+    #[cfg(target_os = "linux")]
+    let mut gro_tx_pool = crate::engine::GroTxPool::new();
+    #[cfg(target_os = "linux")]
+    let mut gro_table = if offload_enabled {
+        Some(quictun_tun::GROTable::default())
+    } else {
+        None
+    };
+
+    // TUN offload buffers for recv_multiple (Linux, offload=true).
+    #[cfg(target_os = "linux")]
+    let mut tun_original_buf = if offload_enabled {
+        vec![0u8; quictun_tun::VIRTIO_NET_HDR_LEN + 65535]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun_split_bufs = if offload_enabled {
+        vec![vec![0u8; 1500]; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun_split_sizes = if offload_enabled {
+        vec![0usize; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
 
     // Timer state.
     let ack_interval = Duration::from_millis(config.ack_timer_ms as u64);
@@ -214,22 +246,15 @@ pub fn run_v2(
                                             ) {
                                                 continue;
                                             }
-                                            // TUN write with backpressure.
-                                            if !tun_write_buf.is_empty() {
-                                                if tun_write_buf.len() < 256 {
-                                                    tun_write_buf.push_back(datagram.to_vec());
-                                                }
+                                            // TUN write: GRO batching (Linux offload) or per-packet.
+                                            #[cfg(target_os = "linux")]
+                                            if offload_enabled {
+                                                gro_tx_pool.push_datagram(datagram);
                                             } else {
-                                                match adapter.tun().send(datagram) {
-                                                    Ok(_) => {}
-                                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                                        if tun_write_buf.len() < 256 {
-                                                            tun_write_buf.push_back(datagram.to_vec());
-                                                        }
-                                                    }
-                                                    Err(_) => {}
-                                                }
+                                                tun_write_with_buf(adapter.tun(), datagram, &mut tun_write_buf);
                                             }
+                                            #[cfg(not(target_os = "linux"))]
+                                            tun_write_with_buf(adapter.tun(), datagram, &mut tun_write_buf);
                                         }
                                     }
                                     decrypted.close_received
@@ -256,15 +281,51 @@ pub fn run_v2(
             }
         }
 
+        // Flush GRO TX pool (batched TUN writes from UDP RX path).
+        #[cfg(target_os = "linux")]
+        if offload_enabled && !gro_tx_pool.is_empty() {
+            if let Some(ref mut gro) = gro_table {
+                match adapter.tun().send_multiple(
+                    gro,
+                    gro_tx_pool.as_mut_slice(),
+                    quictun_tun::VIRTIO_NET_HDR_LEN,
+                ) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Fallback: buffer for next iteration.
+                        for buf in gro_tx_pool.iter() {
+                            tun_write_buf.push_back(buf.to_vec());
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "TUN send_multiple failed");
+                    }
+                }
+                gro_tx_pool.reset();
+            }
+        }
+
         // ── TUN RX → encrypt → UDP send (GSO) ──────────────────────
         if readiness.inner {
             #[cfg(target_os = "linux")]
-            handle_tun_rx_gso(
-                &mut manager,
-                adapter.tun(),
-                adapter.udp_socket(),
-                &mut gso_buf,
-            );
+            if offload_enabled {
+                handle_tun_rx_offload(
+                    &mut manager,
+                    adapter.tun(),
+                    adapter.udp_socket(),
+                    &mut gso_buf,
+                    &mut tun_original_buf,
+                    &mut tun_split_bufs,
+                    &mut tun_split_sizes,
+                );
+            } else {
+                handle_tun_rx_gso(
+                    &mut manager,
+                    adapter.tun(),
+                    adapter.udp_socket(),
+                    &mut gso_buf,
+                );
+            }
 
             #[cfg(not(target_os = "linux"))]
             handle_tun_rx_simple(
@@ -585,6 +646,162 @@ fn handle_tun_rx_simple(
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
+    }
+}
+
+// ── TUN write with backpressure buffer ───────────────────────────────────
+
+fn tun_write_with_buf(
+    tun: &tun_rs::SyncDevice,
+    data: &[u8],
+    buf: &mut std::collections::VecDeque<Vec<u8>>,
+) {
+    if !buf.is_empty() {
+        if buf.len() < buf.capacity().max(256) {
+            buf.push_back(data.to_vec());
+        }
+        return;
+    }
+    match tun.send(data) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            buf.push_back(data.to_vec());
+        }
+        Err(_) => {}
+    }
+}
+
+// ── TUN RX with offload (recv_multiple → encrypt → GSO) ────────────────
+
+#[cfg(target_os = "linux")]
+fn handle_tun_rx_offload(
+    manager: &mut ConnectionManager<LocalConnectionState>,
+    tun: &tun_rs::SyncDevice,
+    udp: &std::net::UdpSocket,
+    gso_buf: &mut [u8],
+    original_buf: &mut [u8],
+    split_bufs: &mut [Vec<u8>],
+    split_sizes: &mut [usize],
+) {
+    use smallvec::SmallVec;
+
+    let max_segs = gso_buf.len() / MAX_PACKET;
+
+    loop {
+        let n_pkts = match tun.recv_multiple(original_buf, split_bufs, split_sizes, 0) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                debug!(error = %e, "TUN recv_multiple failed");
+                break;
+            }
+        };
+
+        // Collect valid payloads and group by CID (common case: all same).
+        let mut batch_indices: SmallVec<[usize; 64]> = SmallVec::new();
+        let mut batch_cid: Option<u64> = None;
+
+        for i in 0..n_pkts {
+            let pkt_len = split_sizes[i];
+            if pkt_len < 20 || split_bufs[i][0] >> 4 != 4 {
+                continue;
+            }
+            let packet = &split_bufs[i][..pkt_len];
+            let dest_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+
+            let cid = match manager.lookup_route(dest_ip) {
+                RouteAction::ForwardToPeer(cid) => cid,
+                _ if manager.len() == 1 => {
+                    *manager.keys().next().expect("single connection")
+                }
+                _ => continue,
+            };
+
+            // Flush if CID changed.
+            if let Some(prev_cid) = batch_cid {
+                if prev_cid != cid && !batch_indices.is_empty() {
+                    flush_offload_batch(
+                        udp, manager, gso_buf, split_bufs, split_sizes,
+                        &batch_indices, prev_cid, max_segs,
+                    );
+                    batch_indices.clear();
+                }
+            }
+            batch_cid = Some(cid);
+            batch_indices.push(i);
+
+            if batch_indices.len() >= max_segs {
+                flush_offload_batch(
+                    udp, manager, gso_buf, split_bufs, split_sizes,
+                    &batch_indices, cid, max_segs,
+                );
+                batch_indices.clear();
+            }
+        }
+
+        // Flush remaining.
+        if let Some(cid) = batch_cid {
+            if !batch_indices.is_empty() {
+                flush_offload_batch(
+                    udp, manager, gso_buf, split_bufs, split_sizes,
+                    &batch_indices, cid, max_segs,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn flush_offload_batch(
+    udp: &std::net::UdpSocket,
+    manager: &mut ConnectionManager<LocalConnectionState>,
+    gso_buf: &mut [u8],
+    split_bufs: &[Vec<u8>],
+    split_sizes: &[usize],
+    indices: &[usize],
+    cid: u64,
+    max_segs: usize,
+) {
+    let entry = match manager.get_mut(&cid) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let mut gso_pos = 0usize;
+    let mut gso_segment_size = 0usize;
+    let mut gso_count = 0usize;
+
+    for &idx in indices {
+        let pkt = &split_bufs[idx][..split_sizes[idx]];
+        match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..]) {
+            Ok(result) => {
+                if gso_count == 0 {
+                    gso_segment_size = result.len;
+                    gso_pos += result.len;
+                    gso_count += 1;
+                } else if result.len == gso_segment_size {
+                    gso_pos += result.len;
+                    gso_count += 1;
+                } else {
+                    // Odd-sized: flush then start new batch.
+                    if gso_count > 0 {
+                        flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr);
+                    }
+                    gso_buf.copy_within(gso_pos..gso_pos + result.len, 0);
+                    gso_segment_size = result.len;
+                    gso_pos = result.len;
+                    gso_count = 1;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "encrypt failed");
+            }
+        }
+    }
+
+    if gso_count > 0 {
+        flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr);
+        entry.last_tx = Instant::now();
     }
 }
 
