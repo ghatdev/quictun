@@ -9,6 +9,9 @@
 
 use std::io;
 
+#[cfg(target_os = "linux")]
+use tracing::warn;
+
 use ipnet::Ipv4Net;
 
 // ── Linux: netlink ──────────────────────────────────────────────────────
@@ -65,9 +68,9 @@ fn netlink_route(fd: i32, msg_type: u16, dst: Ipv4Net, ifindex: u32) -> io::Resu
     buf[4..6].copy_from_slice(&msg_type.to_ne_bytes());
 
     let flags: u16 = if msg_type == libc::RTM_NEWROUTE as u16 {
-        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16
+        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_EXCL | libc::NLM_F_ACK) as u16
     } else {
-        libc::NLM_F_REQUEST as u16
+        (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16
     };
     buf[6..8].copy_from_slice(&flags.to_ne_bytes());
 
@@ -117,16 +120,17 @@ fn netlink_route(fd: i32, msg_type: u16, dst: Ipv4Net, ifindex: u32) -> io::Resu
         return Err(io::Error::last_os_error());
     }
 
-    // Read response to check for errors (non-blocking to avoid hanging).
+    // Read response — NLM_F_ACK ensures the kernel always sends one.
+    // Use MSG_DONTWAIT; if the kernel hasn't replied yet, warn and proceed.
     let mut resp = [0u8; 128];
     let n = unsafe { libc::recv(fd, resp.as_mut_ptr() as *mut _, resp.len(), libc::MSG_DONTWAIT) };
     if n < 0 {
         let err = io::Error::last_os_error();
-        // EAGAIN is OK — no response yet (common for duplicate routes).
-        if err.kind() != io::ErrorKind::WouldBlock {
-            return Err(err);
+        if err.kind() == io::ErrorKind::WouldBlock {
+            warn!(route = %dst, "netlink route: EAGAIN on ACK recv, operation may not have completed");
+            return Ok(());
         }
-        return Ok(());
+        return Err(err);
     }
 
     // Check nlmsghdr type — NLMSG_ERROR (2) with error=0 means success.

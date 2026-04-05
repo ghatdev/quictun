@@ -67,6 +67,13 @@ impl DpdkDispatchTable {
         self.routes.insert(tunnel_ip, DispatchEntry { worker_id });
     }
 
+    /// Add routes for all IPs in a prefix (for allowed_ips subnet routing).
+    pub fn add_route_prefix(&mut self, prefix: ipnet::Ipv4Net, worker_id: usize) {
+        for ip in prefix.hosts() {
+            self.routes.insert(ip, DispatchEntry { worker_id });
+        }
+    }
+
     /// Look up worker by CID (raw bytes → u64 key).
     #[inline]
     pub fn lookup_cid(&self, cid: &[u8]) -> Option<usize> {

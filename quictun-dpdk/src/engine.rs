@@ -124,6 +124,14 @@ pub(crate) fn resolve_completed_handshake(
     };
     let remote_mac = arp_table.lookup(remote_ip).unwrap_or([0xff; 6]);
 
+    // DPDK fast-path hardcodes 8-byte CIDs throughout (CID_LEN, cid_to_u64, dispatch tables).
+    // A mismatch would silently misroute packets, so validate at connection time.
+    assert_eq!(
+        conn_state.local_cid_len(), 8,
+        "DPDK requires 8-byte CIDs, but connection has {}-byte CIDs",
+        conn_state.local_cid_len(),
+    );
+
     let cid_bytes = conn_state.local_cid().to_vec();
     let cid = cid_to_u64(&cid_bytes);
 
@@ -164,6 +172,10 @@ pub fn run(
     rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 ) -> Result<()> {
     const CID_LEN: usize = 8;
+
+    // DPDK fast-path hardcodes 8-byte CIDs. quinn's EndpointConfig::default() also
+    // uses 8 bytes. If this ever changes, the assertion in resolve_completed_handshake()
+    // will catch it at connection time.
 
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
@@ -1435,8 +1447,8 @@ pub fn run_dispatcher(
                     if first_byte & 0x80 == 0 {
                         // Short header → dispatch by CID.
                         let cid_offset = 1; // first byte of CID after header byte
-                        // CID length: use endpoint's expected CID length (default 8).
-                        let cid_len = 8usize; // TODO: make configurable
+                        // CID length: hardcoded 8 (validated by resolve_completed_handshake assertion).
+                        let cid_len = 8usize;
                         if udp.payload.len() >= 1 + cid_len {
                             let cid_bytes = &udp.payload[cid_offset..cid_offset + cid_len];
                             if let Some(worker_id) = dispatch_table.lookup_cid(cid_bytes) {
@@ -1895,8 +1907,8 @@ pub fn run_worker(
                 unsafe { udp.payload.as_ptr().offset_from(data.as_ptr()) as usize };
             let payload_len = udp.payload.len();
 
-            // Extract CID to find connection.
-            let cid_len = 8usize; // TODO: make configurable
+            // Extract CID to find connection (hardcoded 8, validated by resolve_completed_handshake assertion).
+            let cid_len = 8usize;
             if payload_len < 1 + cid_len {
                 continue;
             }
@@ -2695,6 +2707,7 @@ pub fn run_pipeline_worker(
     checksum_mode: ChecksumMode,
     core_id: usize,
 ) -> Result<()> {
+    // Hardcoded 8-byte CIDs (validated by resolve_completed_handshake assertion).
     const CID_LEN: usize = 8;
 
     // All connections (shared state): CID (as u64) → pipeline connection entry.

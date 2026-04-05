@@ -109,6 +109,7 @@ const MIN_DELAY_US: u32 = 1;
 /// Maximum sleep duration in microseconds during adaptive backoff.
 const MAX_DELAY_US: u32 = 100;
 
+/// Hardcoded 8-byte CIDs (validated by resolve_completed_handshake assertion).
 const CID_LEN: usize = 8;
 const ETH_HLEN: usize = 14;
 
