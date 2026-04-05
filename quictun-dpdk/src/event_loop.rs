@@ -13,18 +13,8 @@ use crate::mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity};
 use crate::port;
 use crate::shared::MultiQuicState;
+use quictun_core::engine::{EndpointSetup, RunResult};
 use quictun_core::peer::PeerConfig;
-
-/// QUIC endpoint setup (connector or listener).
-pub enum EndpointSetup {
-    Connector {
-        remote_addr: SocketAddr,
-        client_config: quinn_proto::ClientConfig,
-    },
-    Listener {
-        server_config: Arc<quinn_proto::ServerConfig>,
-    },
-}
 
 /// Wrapper around `*mut T` that implements `Send`.
 ///
@@ -77,6 +67,70 @@ pub struct DpdkConfig {
     pub enable_nat: bool,
     /// MSS clamp value for router mode (0 = auto from tunnel_mtu - 40).
     pub mss_clamp: u16,
+}
+
+/// DPDK engine backend.
+pub struct DpdkEngine;
+
+impl quictun_core::engine::Engine for DpdkEngine {
+    fn run(
+        &self,
+        local_addr: SocketAddr,
+        setup: EndpointSetup,
+        config: &quictun_core::config::Config,
+        peers: Vec<PeerConfig>,
+    ) -> Result<RunResult> {
+        let dpdk_local_ip: Ipv4Addr = config.engine
+            .dpdk_local_ip.as_ref()
+            .context("dpdk_local_ip is required for DPDK backends")?
+            .parse().context("invalid dpdk_local_ip")?;
+
+        let dpdk_remote_ip: Option<Ipv4Addr> = if config.mode() == quictun_core::config::Mode::Connector {
+            let endpoint = config.all_peers()[0].endpoint
+                .context("connector requires peer endpoint")?;
+            match endpoint.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                _ => anyhow::bail!("DPDK requires IPv4 endpoint"),
+            }
+        } else {
+            None
+        };
+
+        let dpdk_mode = match config.engine.backend {
+            quictun_core::config::Backend::DpdkVirtio => "virtio",
+            quictun_core::config::Backend::DpdkRouter => "router",
+            _ => unreachable!(),
+        };
+
+        let is_router = config.engine.backend == quictun_core::config::Backend::DpdkRouter;
+        let routing = config.routing.as_ref();
+        let addr = config.parse_address()?;
+        let iface_name = config.interface.name.clone()
+            .unwrap_or_else(|| "tunnel".to_owned());
+
+        let dpdk_config = DpdkConfig {
+            mode: dpdk_mode.to_string(),
+            eal_args: config.engine.dpdk_eal_args.split(';').map(|s| s.to_string()).collect(),
+            port_id: config.engine.dpdk_port,
+            local_ip: dpdk_local_ip,
+            remote_ip: dpdk_remote_ip,
+            local_port: config.engine.dpdk_local_port,
+            tunnel_ip: addr.addr(),
+            tunnel_prefix: addr.prefix_len(),
+            tunnel_mtu: config.mtu(),
+            tunnel_iface: iface_name,
+            adaptive_poll: config.engine.adaptive_poll,
+            n_cores: config.engine.dpdk_cores,
+            no_udp_checksum: config.engine.no_udp_checksum,
+            peers,
+            router: is_router,
+            enable_nat: routing.map(|r| r.nat).unwrap_or(true),
+            mss_clamp: routing.map(|r| r.mss_clamp).unwrap_or(0),
+        };
+
+        run(local_addr, setup, dpdk_config)?;
+        Ok(RunResult::Shutdown)
+    }
 }
 
 /// Run the DPDK data plane.

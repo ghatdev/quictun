@@ -1,6 +1,7 @@
 pub mod config;
 pub mod connection;
 pub mod data_plane;
+pub mod engine;
 pub mod icmp;
 pub mod manager;
 pub mod mss;

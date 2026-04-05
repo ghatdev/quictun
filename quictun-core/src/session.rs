@@ -5,14 +5,17 @@
 //! DPDK) and embedding quictun-net as a library.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ipnet::Ipv4Net;
 
-use crate::config::{Config, CipherSuite};
+use crate::config::{Config, CipherSuite, Mode};
 use crate::connection::{CongestionControl, TransportTuning};
+use crate::engine::EndpointSetup;
 use crate::peer;
+use crate::proto_config;
 
 /// Resolved peer ready for engine use.
 ///
@@ -185,6 +188,102 @@ pub fn reconnect_interval_secs(config: &Config) -> u64 {
         .and_then(|p| p.reconnect_interval)
         .unwrap_or(1)
         .max(1) // Clamp to prevent busy-loop on reconnect_interval = 0
+}
+
+/// Resolve all peers from config (handles both RPK and X.509).
+pub fn resolve_all_peers(config: &Config) -> Result<Vec<peer::PeerConfig>> {
+    if is_x509(config) {
+        resolve_peers_x509(config)
+    } else {
+        let raw_peers = config.all_peers();
+        let peer_pubkeys: Vec<quictun_crypto::PublicKey> = raw_peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                quictun_crypto::PublicKey::from_base64(&p.public_key)
+                    .with_context(|| format!("invalid public_key for peer[{i}]"))
+            })
+            .collect::<Result<_>>()?;
+        let spki_ders: Vec<Vec<u8>> =
+            peer_pubkeys.iter().map(|pk| pk.spki_der().to_vec()).collect();
+        resolve_peers(config, &spki_ders)
+    }
+}
+
+/// Build the QUIC endpoint setup from config (handles both RPK and X.509).
+///
+/// Resolves crypto keys, builds quinn-proto ClientConfig/ServerConfig,
+/// and returns a ready-to-use `EndpointSetup`.
+pub fn build_endpoint_setup(config: &Config) -> Result<EndpointSetup> {
+    let mode = config.mode();
+    let peers = config.all_peers();
+    let tuning = build_transport_tuning(config)?;
+    let (server_ciphers, client_ciphers) = resolve_cipher_suites(config)?;
+    let first_keepalive = peers.first().and_then(|p| p.keepalive.map(Duration::from_secs));
+
+    if is_x509(config) {
+        let cert_file = Path::new(
+            config.interface.cert_file.as_ref().context("x509 mode requires cert_file")?,
+        );
+        let key_file = Path::new(
+            config.interface.key_file.as_ref().context("x509 mode requires key_file")?,
+        );
+        let ca_file = Path::new(
+            config.interface.ca_file.as_ref().context("x509 mode requires ca_file")?,
+        );
+
+        match mode {
+            Mode::Listener => {
+                let server_config = proto_config::build_proto_server_config_x509(
+                    cert_file, key_file, ca_file, first_keepalive,
+                    &tuning, &server_ciphers,
+                )?;
+                Ok(EndpointSetup::Listener { server_config })
+            }
+            Mode::Connector => {
+                let peer = &peers[0];
+                let keepalive = peer.keepalive.map(Duration::from_secs);
+                let client_config = proto_config::build_proto_client_config_x509(
+                    cert_file, key_file, ca_file, keepalive,
+                    &tuning, &client_ciphers, config.interface.zero_rtt,
+                )?;
+                let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+                Ok(EndpointSetup::Connector { remote_addr, client_config })
+            }
+        }
+    } else {
+        let private_key = quictun_crypto::PrivateKey::from_base64(&config.interface.private_key)
+            .context("invalid interface private_key")?;
+        let peer_pubkeys: Vec<quictun_crypto::PublicKey> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                quictun_crypto::PublicKey::from_base64(&p.public_key)
+                    .with_context(|| format!("invalid public_key for peer[{i}]"))
+            })
+            .collect::<Result<_>>()?;
+
+        match mode {
+            Mode::Listener => {
+                let server_config = proto_config::build_proto_server_config(
+                    &private_key, &peer_pubkeys, first_keepalive,
+                    &tuning, &server_ciphers,
+                )?;
+                Ok(EndpointSetup::Listener { server_config })
+            }
+            Mode::Connector => {
+                let peer = &peers[0];
+                let peer_pubkey = &peer_pubkeys[0];
+                let keepalive = peer.keepalive.map(Duration::from_secs);
+                let client_config = proto_config::build_proto_client_config(
+                    &private_key, peer_pubkey, keepalive,
+                    &tuning, &client_ciphers, config.interface.zero_rtt,
+                )?;
+                let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
+                Ok(EndpointSetup::Connector { remote_addr, client_config })
+            }
+        }
+    }
 }
 
 #[cfg(test)]

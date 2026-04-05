@@ -14,22 +14,23 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use mio::Token;
-use quinn_proto::ServerConfig;
 #[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
+use quictun_core::config::Config;
 use quictun_core::data_plane::{DataPlaneIo, DataPlaneIoBatch, OuterRecvBatch};
+pub use quictun_core::engine::{EndpointSetup, Engine, RunResult};
 use quictun_core::manager::{ConnEntry, ConnectionManager, ManagerAction, PromoteResult};
 use quictun_core::peer::{self, PeerConfig};
 use quictun_core::quic_state::MultiQuicState;
 use quictun_core::routing::RouteAction;
+use quictun_core::session;
 use quictun_proto::cid_to_u64;
 use quictun_proto::local::LocalConnectionState;
 
@@ -113,17 +114,6 @@ pub(crate) const TOKEN_UDP: Token = Token(0);
 pub(crate) const TOKEN_TUN: Token = Token(1);
 pub(crate) const TOKEN_SIGNAL: Token = Token(2);
 
-/// Endpoint setup: connector or listener.
-pub enum EndpointSetup {
-    Connector {
-        remote_addr: SocketAddr,
-        client_config: quinn_proto::ClientConfig,
-    },
-    Listener {
-        server_config: Arc<ServerConfig>,
-    },
-}
-
 /// Configuration for the net engine.
 #[derive(Clone)]
 pub struct NetConfig {
@@ -151,14 +141,57 @@ pub struct NetConfig {
     pub server_name: String,
 }
 
-/// Result of the engine run — tells the CLI whether to reconnect.
-pub enum RunResult {
-    Shutdown,
-    ConnectionLost,
+
+/// Kernel-mode engine backend.
+pub struct NetEngine;
+
+impl Engine for NetEngine {
+    fn run(
+        &self,
+        local_addr: SocketAddr,
+        setup: EndpointSetup,
+        config: &Config,
+        peers: Vec<PeerConfig>,
+    ) -> Result<RunResult> {
+        let net_config = NetConfig {
+            tunnel_ip: config.parse_address()?.addr(),
+            tunnel_prefix: config.parse_address()?.prefix_len(),
+            tunnel_mtu: config.mtu(),
+            tunnel_name: None, // set by CLI caller if needed
+            idle_timeout: session::idle_timeout(config),
+            cid_len: config.interface.cid_length as usize,
+            peers,
+            reconnect: session::reconnect_enabled(config),
+            recv_buf: config.engine.recv_buf,
+            send_buf: config.engine.send_buf,
+            threads: config.engine.threads,
+            offload: config.engine.offload,
+            batch_size: config.engine.batch_size,
+            gso_max_segments: config.engine.gso_max_segments,
+            ack_interval: config.engine.ack_interval,
+            ack_timer_ms: config.engine.ack_timer_ms,
+            tun_write_buf_capacity: config.engine.tun_write_buf,
+            channel_capacity: config.engine.channel_capacity,
+            poll_events: config.engine.poll_events,
+            max_peers: config.engine.max_peers,
+            server_name: config.interface.server_name.clone()
+                .unwrap_or_else(|| "quictun".to_owned()),
+        };
+        run_engine(local_addr, setup, net_config)
+    }
 }
 
-/// Main entry point for the kernel-mode engine.
+/// Direct entry point (for backwards compatibility or testing).
 pub fn run(
+    local_addr: SocketAddr,
+    setup: EndpointSetup,
+    config: NetConfig,
+) -> Result<RunResult> {
+    run_engine(local_addr, setup, config)
+}
+
+/// Internal engine entry point.
+fn run_engine(
     local_addr: SocketAddr,
     setup: EndpointSetup,
     config: NetConfig,
