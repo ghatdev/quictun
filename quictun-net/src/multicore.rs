@@ -820,7 +820,7 @@ fn run_worker(
                                     || gso_pos + 2048 > gso_buf.len()
                                 {
                                     if gso_count > 0 {
-                                        crate::engine_v2::flush_gso(
+                                        crate::engine::flush_gso(
                                             udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
                                         );
                                         if let Some(prev) = manager.get_mut(&cur) {
@@ -846,7 +846,7 @@ fn run_worker(
                                             gso_count += 1;
                                         } else {
                                             // Size changed — flush current batch, start new.
-                                            crate::engine_v2::flush_gso(
+                                            crate::engine::flush_gso(
                                                 udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
                                             );
                                             entry.last_tx = Instant::now();
@@ -936,7 +936,7 @@ fn run_worker(
         #[cfg(target_os = "linux")]
         {
             if gso_count > 0 {
-                crate::engine_v2::flush_gso(
+                crate::engine::flush_gso(
                     udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
                 );
                 if let Some(cid) = gso_current_cid {
