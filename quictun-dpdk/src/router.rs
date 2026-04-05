@@ -2261,17 +2261,6 @@ fn rebuild_routing_table(
 
 /// ACK generation interval for router pipeline I/O.
 const ROUTER_ACK_INTERVAL: Duration = Duration::from_millis(25);
-/// Keepalive interval for router pipeline I/O.
-const ROUTER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Per-connection metadata held by router pipeline I/O (core 0).
-struct RouterPipelineIoConnection {
-    conn: Arc<SharedConnectionState>,
-    tunnel_ip: Ipv4Addr,
-    remote_addr: SocketAddr,
-    remote_mac: [u8; 6],
-    cid: u64,
-}
 
 /// Run the router pipeline I/O thread on core 0.
 ///
@@ -2294,6 +2283,8 @@ pub fn run_router_pipeline_io(
     enable_nat: bool,
     tunnel_ip: Ipv4Addr,
     n_workers: usize,
+    max_peers: usize,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let mut response_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut transmit_buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
@@ -2304,7 +2295,12 @@ pub fn run_router_pipeline_io(
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
 
     // Connection table on core 0 (for ACK/keepalive/key rotation).
-    let mut connections: Vec<RouterPipelineIoConnection> = Vec::new();
+    let mut manager = ConnectionManager::<Arc<SharedConnectionState>>::new(
+        tunnel_ip,
+        enable_nat,
+        max_peers,
+        idle_timeout,
+    );
 
     // Round-robin counter for worker dispatch.
     let mut rr_decrypt: usize = 0;
@@ -2320,7 +2316,6 @@ pub fn run_router_pipeline_io(
 
     // Timer state.
     let mut last_ack = Instant::now();
-    let mut last_keepalive = Instant::now();
 
     // Adaptive polling.
     let mut empty_polls: u32 = 0;
@@ -2496,12 +2491,7 @@ pub fn run_router_pipeline_io(
 
             for ch in drive_result.completed {
                 if let Some((mut hs, conn_state)) = multi_state.extract_connection(ch) {
-                    let Some(resolved) =
-                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
-                    else {
-                        continue;
-                    };
-
+                    // Drain final handshake transmits.
                     drain_handshake_transmits(
                         &mut hs.connection,
                         now,
@@ -2516,40 +2506,76 @@ pub fn run_router_pipeline_io(
                         checksum_mode,
                     );
 
-                    // Convert to SharedConnectionState for pipeline workers.
-                    let shared = Arc::new(resolved.conn.into_shared());
-                    let cid = resolved.cid;
+                    match manager.promote_handshake(&hs, conn_state, peers) {
+                        PromoteResult::Accepted {
+                            cid_key, cid_bytes, tunnel_ip: peer_ip,
+                            allowed_ips, remote_addr, keepalive_interval,
+                            conn_state, evicted,
+                        } => {
+                            if let Some(evicted) = evicted {
+                                tracing::info!(
+                                    tunnel_ip = %evicted.tunnel_ip,
+                                    "router pipeline: evicted stale connection"
+                                );
+                                // Notify workers to remove evicted connection.
+                                for worker in workers.iter() {
+                                    if let Ok(mut ctrl) = worker.control.lock() {
+                                        ctrl.push(RouterPipelineControlMessage::RemoveConnection {
+                                            cid: evicted.cid_key,
+                                        });
+                                    }
+                                }
+                            }
 
-                    // Broadcast to ALL workers.
-                    for worker in workers.iter() {
-                        if let Ok(mut ctrl) = worker.control.lock() {
-                            ctrl.push(RouterPipelineControlMessage::AddConnection {
-                                conn: Arc::clone(&shared),
-                                tunnel_ip: resolved.tunnel_ip,
-                                remote_addr: resolved.remote_addr,
-                                remote_mac: resolved.remote_mac,
-                                cid,
-                                allowed_ips: resolved.allowed_ips.clone(),
+                            // Convert to SharedConnectionState for pipeline workers.
+                            let shared = Arc::new(conn_state.into_shared());
+
+                            // Broadcast to ALL workers.
+                            for worker in workers.iter() {
+                                if let Ok(mut ctrl) = worker.control.lock() {
+                                    ctrl.push(RouterPipelineControlMessage::AddConnection {
+                                        conn: Arc::clone(&shared),
+                                        tunnel_ip: peer_ip,
+                                        remote_addr,
+                                        remote_mac: arp_table.lookup(
+                                            match remote_addr.ip() {
+                                                std::net::IpAddr::V4(ip) => ip,
+                                                _ => Ipv4Addr::UNSPECIFIED,
+                                            }
+                                        ).unwrap_or([0xff; 6]),
+                                        cid: cid_key,
+                                        allowed_ips: allowed_ips.clone(),
+                                    });
+                                }
+                            }
+
+                            // Track on core 0 via ConnectionManager.
+                            manager.insert_connection(cid_key, ConnEntry {
+                                conn: shared,
+                                tunnel_ip: peer_ip,
+                                allowed_ips,
+                                remote_addr,
+                                keepalive_interval,
+                                last_tx: now,
+                                last_rx: now,
                             });
+
+                            tracing::info!(
+                                tunnel_ip = %peer_ip,
+                                remote = %remote_addr,
+                                cid = %hex::encode(&cid_bytes),
+                                n_workers,
+                                "router pipeline: connection broadcast to all workers"
+                            );
+                        }
+                        PromoteResult::Rejected { remote_addr, reason, .. } => {
+                            tracing::warn!(
+                                remote = %remote_addr,
+                                reason = ?reason,
+                                "router pipeline: handshake rejected"
+                            );
                         }
                     }
-
-                    // Track on core 0 for ACK/keepalive/key rotation.
-                    connections.push(RouterPipelineIoConnection {
-                        conn: shared,
-                        tunnel_ip: resolved.tunnel_ip,
-                        remote_addr: resolved.remote_addr,
-                        remote_mac: resolved.remote_mac,
-                        cid,
-                    });
-
-                    tracing::info!(
-                        tunnel_ip = %resolved.tunnel_ip,
-                        remote = %resolved.remote_addr,
-                        cid = %hex::encode(&resolved.cid_bytes),
-                        n_workers,
-                        "router pipeline: connection broadcast to all workers"
-                    );
                 }
             }
 
@@ -2605,25 +2631,27 @@ pub fn run_router_pipeline_io(
         // ── 4. Timer-driven ACK generation (every ~25ms) ──
 
         if now.duration_since(last_ack) >= ROUTER_ACK_INTERVAL {
-            for io_conn in &connections {
-                if io_conn.conn.replay.needs_ack() {
-                    match io_conn.conn.encrypt_ack(&mut ack_buf) {
+            for (_, entry) in manager.iter() {
+                if entry.conn.replay.needs_ack() {
+                    match entry.conn.encrypt_ack(&mut ack_buf) {
                         Ok(result) => {
-                            let remote_ip = match io_conn.remote_addr.ip() {
+                            let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,
                                 _ => Ipv4Addr::UNSPECIFIED,
                             };
+                            let remote_mac = arp_table.lookup(remote_ip)
+                                .unwrap_or([0xff; 6]);
                             ip_id = ip_id.wrapping_add(1);
                             let frame_len = net::HEADER_SIZE + result.len;
                             if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
                                 if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
                                     net::build_udp_packet(
                                         &identity.local_mac,
-                                        &io_conn.remote_mac,
+                                        &remote_mac,
                                         identity.local_ip,
                                         remote_ip,
                                         identity.local_port,
-                                        io_conn.remote_addr.port(),
+                                        entry.remote_addr.port(),
                                         &ack_buf[..result.len],
                                         buf,
                                         0,
@@ -2658,63 +2686,87 @@ pub fn run_router_pipeline_io(
             last_ack = now;
         }
 
-        // ── 5. Keepalive (every ~10s) ──
+        // ── 5. Sweep timeouts (idle, key exhaustion, keepalive) ──
 
-        if now.duration_since(last_keepalive) >= ROUTER_KEEPALIVE_INTERVAL {
-            for io_conn in &connections {
-                let mut keepalive_buf = [0u8; 256];
-                if let Ok(result) = io_conn.conn.tx.encrypt_datagram(&[], &mut keepalive_buf) {
-                    let remote_ip = match io_conn.remote_addr.ip() {
-                        std::net::IpAddr::V4(ip) => ip,
-                        _ => Ipv4Addr::UNSPECIFIED,
-                    };
-                    ip_id = ip_id.wrapping_add(1);
-                    let frame_len = net::HEADER_SIZE + result.len;
-                    if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
-                        if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
-                            net::build_udp_packet(
-                                &identity.local_mac,
-                                &io_conn.remote_mac,
-                                identity.local_ip,
-                                remote_ip,
-                                identity.local_port,
-                                io_conn.remote_addr.port(),
-                                &keepalive_buf[..result.len],
-                                buf,
-                                0,
-                                ip_id,
-                                checksum_mode,
-                            );
-                            match checksum_mode {
-                                ChecksumMode::HardwareUdpOnly => {
-                                    mbuf.set_tx_udp_checksum_offload()
+        {
+            let actions = manager.sweep_timeouts();
+            for action in actions {
+                match action {
+                    ManagerAction::SendKeepalive { cid_key } => {
+                        if let Some(entry) = manager.get_mut(&cid_key) {
+                            let mut ka_buf = [0u8; 256];
+                            if let Ok(result) = entry.conn.tx.encrypt_datagram(&[], &mut ka_buf) {
+                                let remote_ip = match entry.remote_addr.ip() {
+                                    std::net::IpAddr::V4(ip) => ip,
+                                    _ => Ipv4Addr::UNSPECIFIED,
+                                };
+                                let ka_mac = arp_table.lookup(remote_ip)
+                                    .unwrap_or([0xff; 6]);
+                                ip_id = ip_id.wrapping_add(1);
+                                let frame_len = net::HEADER_SIZE + result.len;
+                                if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                                    if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                                        net::build_udp_packet(
+                                            &identity.local_mac,
+                                            &ka_mac,
+                                            identity.local_ip,
+                                            remote_ip,
+                                            identity.local_port,
+                                            entry.remote_addr.port(),
+                                            &ka_buf[..result.len],
+                                            buf,
+                                            0,
+                                            ip_id,
+                                            checksum_mode,
+                                        );
+                                        match checksum_mode {
+                                            ChecksumMode::HardwareUdpOnly => {
+                                                mbuf.set_tx_udp_checksum_offload()
+                                            }
+                                            ChecksumMode::HardwareFull => {
+                                                mbuf.set_tx_full_checksum_offload()
+                                            }
+                                            _ => {}
+                                        }
+                                        let raw = mbuf.into_raw();
+                                        let mut burst = [raw];
+                                        let sent = port::tx_burst(outer_port_id, 0, &mut burst, 1);
+                                        tx_pkts += sent as u64;
+                                        if sent == 0 {
+                                            unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                                        }
+                                    }
                                 }
-                                ChecksumMode::HardwareFull => {
-                                    mbuf.set_tx_full_checksum_offload()
-                                }
-                                _ => {}
+                                entry.last_tx = now;
                             }
-                            let raw = mbuf.into_raw();
-                            let mut tx = [raw];
-                            let sent = port::tx_burst(outer_port_id, 0, &mut tx, 1);
-                            tx_pkts += sent as u64;
-                            if sent == 0 {
-                                unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                        }
+                    }
+                    ManagerAction::ConnectionRemoved { cid_key, tunnel_ip: tip, reason, .. } => {
+                        tracing::info!(
+                            tunnel_ip = %tip,
+                            reason = ?reason,
+                            "router pipeline: connection removed by sweep"
+                        );
+                        // Notify workers to remove the connection.
+                        for worker in workers.iter() {
+                            if let Ok(mut ctrl) = worker.control.lock() {
+                                ctrl.push(RouterPipelineControlMessage::RemoveConnection {
+                                    cid: cid_key,
+                                });
                             }
                         }
                     }
                 }
             }
-            last_keepalive = now;
         }
 
         // ── 6. Key rotation ──
 
-        if nb_rx > 0 && !connections.is_empty() {
-            let per_conn = nb_rx as u64 / connections.len() as u64;
+        if nb_rx > 0 && !manager.is_empty() {
+            let per_conn = nb_rx as u64 / manager.len() as u64;
             if per_conn > 0 {
-                for io_conn in &connections {
-                    io_conn.conn.maybe_initiate_key_update(per_conn);
+                for (_, entry) in manager.iter() {
+                    entry.conn.maybe_initiate_key_update(per_conn);
                 }
             }
         }
@@ -2741,7 +2793,7 @@ pub fn run_router_pipeline_io(
                 dispatch_drop,
                 return_dispatch,
                 arp_refresh = arp_refresh_count,
-                connections = connections.len(),
+                connections = manager.len(),
                 handshakes = multi_state.handshakes.len(),
                 "router pipeline I/O stats"
             );

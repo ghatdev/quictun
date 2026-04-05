@@ -460,6 +460,8 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 enable_nat,
                 tunnel_ip,
                 n_workers,
+                dpdk_config.max_peers,
+                dpdk_config.idle_timeout,
             );
 
             // Signal shutdown and wait for workers.
@@ -686,6 +688,9 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 &shutdown,
                 adaptive_poll,
                 checksum_mode,
+                dpdk_config.tunnel_ip,
+                dpdk_config.max_peers,
+                dpdk_config.idle_timeout,
             );
 
             // Signal shutdown and wait for workers.
