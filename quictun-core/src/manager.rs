@@ -11,11 +11,13 @@
 //! - `SharedConnectionState` for DPDK pipeline (future)
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipnet::Ipv4Net;
 use quictun_proto::cid_to_u64;
 use quictun_proto::local::LocalConnectionState;
+use quictun_proto::shared::SharedConnectionState;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use tracing::{info, warn};
@@ -45,6 +47,26 @@ impl ConnectionState for LocalConnectionState {
     }
 }
 
+impl ConnectionState for SharedConnectionState {
+    fn is_key_exhausted(&self) -> bool {
+        self.is_key_exhausted()
+    }
+
+    fn needs_ack(&self) -> bool {
+        self.replay.needs_ack()
+    }
+}
+
+impl<S: ConnectionState> ConnectionState for Arc<S> {
+    fn is_key_exhausted(&self) -> bool {
+        (**self).is_key_exhausted()
+    }
+
+    fn needs_ack(&self) -> bool {
+        (**self).needs_ack()
+    }
+}
+
 // ── ConnEntry ───────────────────────────────────────────────────────────
 
 /// Per-connection state in the connection table.
@@ -59,6 +81,9 @@ pub struct ConnEntry<S: ConnectionState> {
     pub keepalive_interval: Duration,
     pub last_tx: Instant,
     pub last_rx: Instant,
+    /// Destination MAC for raw Ethernet frame construction (DPDK only).
+    /// Kernel backend sets this to `[0; 6]` and ignores it.
+    pub remote_mac: [u8; 6],
 }
 
 // ── Manager actions ─────────────────────────────────────────────────────
@@ -506,6 +531,7 @@ mod tests {
             keepalive_interval: Duration::from_secs(25),
             last_tx: Instant::now(),
             last_rx: Instant::now(),
+            remote_mac: [0; 6],
         }
     }
 

@@ -651,6 +651,7 @@ fn io_thread_drive_handshakes(
             keepalive_interval,
             last_tx: now_inst,
             last_rx: now_inst,
+            remote_mac: [0; 6],
         };
 
         let _ = worker_txs[worker_id].send(WorkerPacket::NewConnection {

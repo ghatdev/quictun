@@ -67,6 +67,10 @@ pub struct DpdkConfig {
     pub enable_nat: bool,
     /// MSS clamp value for router mode (0 = auto from tunnel_mtu - 40).
     pub mss_clamp: u16,
+    /// Maximum concurrent peer connections (0 = unlimited).
+    pub max_peers: usize,
+    /// Idle timeout for connections (from config or default 180s).
+    pub idle_timeout: Duration,
 }
 
 /// DPDK engine backend.
@@ -126,6 +130,8 @@ impl quictun_core::engine::Engine for DpdkEngine {
             router: is_router,
             enable_nat: routing.map(|r| r.nat).unwrap_or(true),
             mss_clamp: routing.map(|r| r.mss_clamp).unwrap_or(0),
+            max_peers: config.engine.max_peers,
+            idle_timeout: quictun_core::session::idle_timeout(config),
         };
 
         run(local_addr, setup, dpdk_config)?;
@@ -323,6 +329,8 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
                 mss_clamp,
                 dpdk_config.tunnel_ip,
                 dpdk_config.tunnel_mtu,
+                dpdk_config.max_peers,
+                dpdk_config.idle_timeout,
             );
 
             shutdown.store(true, Ordering::Release);
@@ -589,6 +597,9 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
             dpdk_config.adaptive_poll,
             checksum_mode,
             &dpdk_config.peers,
+            dpdk_config.tunnel_ip,
+            dpdk_config.max_peers,
+            dpdk_config.idle_timeout,
         )
     } else {
         // Multi-core: pipeline architecture (SharedConnectionState).

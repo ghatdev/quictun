@@ -532,6 +532,7 @@ fn run_engine(
                             conn: conn_state, tunnel_ip, allowed_ips,
                             remote_addr, keepalive_interval,
                             last_tx: now_inst, last_rx: now_inst,
+                            remote_mac: [0; 6],
                         });
                     }
                     PromoteResult::Rejected { mut conn_state, remote_addr, reason } => {

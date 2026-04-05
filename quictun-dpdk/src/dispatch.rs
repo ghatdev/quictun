@@ -171,12 +171,11 @@ pub enum ControlMessage {
 }
 
 /// Per-connection state held by a worker core.
-pub struct ConnectionEntry {
-    pub conn: LocalConnectionState,
-    pub tunnel_ip: Ipv4Addr,
-    pub remote_addr: std::net::SocketAddr,
-    pub remote_mac: [u8; 6],
-}
+///
+/// Type alias to [`quictun_core::manager::ConnEntry`] — eliminates the
+/// DPDK-specific duplicate struct. Workers use this for both single-core
+/// (via ConnectionManager) and multi-core (via FxHashMap) paths.
+pub type ConnectionEntry = quictun_core::manager::ConnEntry<LocalConnectionState>;
 
 // ── Pipeline architecture (SharedConnectionState) ──────────────────────
 

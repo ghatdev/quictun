@@ -13,7 +13,9 @@ use crate::mbuf::Mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
 use crate::port;
 use crate::shared::{self, BUF_SIZE, DriveResult, MultiQuicState, QuicState};
+use quictun_core::manager::{ConnEntry, ConnectionManager, ManagerAction, PromoteResult};
 use quictun_core::peer::{self, PeerConfig};
+use quictun_core::routing::RouteAction;
 use quictun_proto::cid_to_u64;
 use quictun_proto::local::LocalConnectionState;
 
@@ -155,6 +157,9 @@ pub fn run(
     adaptive_poll: bool,
     checksum_mode: ChecksumMode,
     peers: &[PeerConfig],
+    tunnel_ip: Ipv4Addr,
+    max_peers: usize,
+    idle_timeout: Duration,
 ) -> Result<()> {
     const CID_LEN: usize = 8;
 
@@ -168,10 +173,13 @@ pub fn run(
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
 
-    // Connection table: CID (as u64) → connection entry.
-    let mut connections: FxHashMap<u64, ConnectionEntry> = FxHashMap::default();
-    // Tunnel IP → CID (as u64) for inner RX routing.
-    let mut ip_to_cid: FxHashMap<Ipv4Addr, u64> = FxHashMap::default();
+    // Connection lifecycle manager: connection table + routing table + sweep.
+    let mut manager = ConnectionManager::<LocalConnectionState>::new(
+        tunnel_ip,
+        false, // default_external
+        max_peers,
+        idle_timeout,
+    );
 
     // Stats.
     let mut rx_pkts: u64 = 0;
@@ -325,7 +333,7 @@ pub fn run(
                     }
                     let cid_key = cid_to_u64(&data[payload_offset + 1..payload_offset + 1 + CID_LEN]);
 
-                    let Some(entry) = connections.get_mut(&cid_key) else {
+                    let Some(entry) = manager.get_mut(&cid_key) else {
                         decrypt_fail += 1;
                         continue;
                     };
@@ -338,6 +346,7 @@ pub fn run(
                             Ok(decrypted) => {
                                 entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
                                 entry.remote_mac = src_mac;
+                                entry.last_rx = now;
 
                                 if let Some(ref ack) = decrypted.ack {
                                     entry.conn.process_ack(ack);
@@ -476,7 +485,7 @@ pub fn run(
 
         let mut inner_rx_mbufs: [*mut ffi::rte_mbuf; BURST_SIZE] =
             [std::ptr::null_mut(); BURST_SIZE];
-        let inner_burst = if !connections.is_empty() {
+        let inner_burst = if !manager.is_empty() {
             INNER_BURST_SIZE
         } else {
             BURST_SIZE as u16
@@ -524,12 +533,10 @@ pub fn run(
                     inner_rx += 1;
 
                     // Look up connection by dest IP, with single-connection default route.
-                    let entry = if let Some(&cid) = ip_to_cid.get(&dst_ip) {
-                        connections.get_mut(&cid)
-                    } else if connections.len() == 1 {
-                        connections.values_mut().next()
-                    } else {
-                        None
+                    let entry = match manager.lookup_route(dst_ip) {
+                        RouteAction::ForwardToPeer(cid) => manager.get_mut(&cid),
+                        _ if manager.len() == 1 => manager.values_mut().next(),
+                        _ => None,
                     };
 
                     let Some(entry) = entry else {
@@ -592,6 +599,7 @@ pub fn run(
                                 }
                                 _ => {}
                             }
+                            entry.last_tx = now;
                             outer_tx_mbufs.push(mbuf.into_raw());
                         }
                         Err(e) => {
@@ -686,30 +694,52 @@ pub fn run(
                         checksum_mode,
                     );
 
-                    let Some(resolved) =
-                        resolve_completed_handshake(&hs, conn_state, peers, identity, arp_table)
-                    else {
-                        continue;
-                    };
+                    match manager.promote_handshake(&hs, conn_state, peers) {
+                        PromoteResult::Accepted {
+                            cid_key, cid_bytes, tunnel_ip: peer_ip,
+                            allowed_ips, remote_addr, keepalive_interval,
+                            conn_state, evicted,
+                        } => {
+                            if let Some(evicted) = evicted {
+                                tracing::info!(
+                                    tunnel_ip = %evicted.tunnel_ip,
+                                    "evicted stale connection"
+                                );
+                            }
+                            // Resolve remote MAC (DPDK-specific).
+                            let remote_ip = match remote_addr.ip() {
+                                std::net::IpAddr::V4(ip) => ip,
+                                _ => Ipv4Addr::UNSPECIFIED,
+                            };
+                            let remote_mac = arp_table.lookup(remote_ip)
+                                .unwrap_or([0xff; 6]);
 
-                    // Insert into connection table.
-                    ip_to_cid.insert(resolved.tunnel_ip, resolved.cid);
-                    connections.insert(
-                        resolved.cid,
-                        ConnectionEntry {
-                            conn: resolved.conn,
-                            tunnel_ip: resolved.tunnel_ip,
-                            remote_addr: resolved.remote_addr,
-                            remote_mac: resolved.remote_mac,
-                        },
-                    );
+                            manager.insert_connection(cid_key, ConnEntry {
+                                conn: conn_state,
+                                tunnel_ip: peer_ip,
+                                allowed_ips,
+                                remote_addr,
+                                keepalive_interval,
+                                last_tx: now,
+                                last_rx: now,
+                                remote_mac,
+                            });
 
-                    tracing::info!(
-                        tunnel_ip = %resolved.tunnel_ip,
-                        remote = %resolved.remote_addr,
-                        cid = %hex::encode(&resolved.cid_bytes),
-                        "connection established"
-                    );
+                            tracing::info!(
+                                tunnel_ip = %peer_ip,
+                                remote = %remote_addr,
+                                cid = %hex::encode(&cid_bytes),
+                                "connection established"
+                            );
+                        }
+                        PromoteResult::Rejected { remote_addr, reason, .. } => {
+                            tracing::warn!(
+                                remote = %remote_addr,
+                                reason = ?reason,
+                                "handshake rejected"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -750,6 +780,68 @@ pub fn run(
                 if multi_state.handshakes.is_empty() {
                     now = Instant::now();
                 }
+                // Sweep idle/exhausted connections (piggyback on clock refresh).
+                if !manager.is_empty() {
+                    let actions = manager.sweep_timeouts();
+                    for action in actions {
+                        match action {
+                            ManagerAction::SendKeepalive { cid_key } => {
+                                if let Some(entry) = manager.get_mut(&cid_key) {
+                                    let mut ka_buf = [0u8; 256];
+                                    if let Ok(result) = entry.conn.encrypt_datagram(&[], &mut ka_buf) {
+                                        let remote_ip = match entry.remote_addr.ip() {
+                                            std::net::IpAddr::V4(ip) => ip,
+                                            _ => Ipv4Addr::UNSPECIFIED,
+                                        };
+                                        ip_id = ip_id.wrapping_add(1);
+                                        let frame_len = net::HEADER_SIZE + result.len;
+                                        if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                                            if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                                                net::build_udp_packet(
+                                                    &identity.local_mac,
+                                                    &entry.remote_mac,
+                                                    identity.local_ip,
+                                                    remote_ip,
+                                                    identity.local_port,
+                                                    entry.remote_addr.port(),
+                                                    &ka_buf[..result.len],
+                                                    buf,
+                                                    0,
+                                                    ip_id,
+                                                    checksum_mode,
+                                                );
+                                                match checksum_mode {
+                                                    ChecksumMode::HardwareUdpOnly => {
+                                                        mbuf.set_tx_udp_checksum_offload()
+                                                    }
+                                                    ChecksumMode::HardwareFull => {
+                                                        mbuf.set_tx_full_checksum_offload()
+                                                    }
+                                                    _ => {}
+                                                }
+                                                let raw = mbuf.into_raw();
+                                                let mut burst = [raw];
+                                                let sent = port::tx_burst(outer_port_id, queue_id, &mut burst, 1);
+                                                if sent == 0 {
+                                                    unsafe { ffi::shim_rte_pktmbuf_free(raw) };
+                                                }
+                                            }
+                                        }
+                                        entry.last_tx = now;
+                                    }
+                                }
+                            }
+                            ManagerAction::ConnectionRemoved { tunnel_ip: tip, reason, .. } => {
+                                tracing::info!(
+                                    tunnel_ip = %tip,
+                                    reason = ?reason,
+                                    "connection removed by sweep"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 if now.duration_since(last_stats).as_secs() >= 2 {
                     tracing::info!(
                         rx_pkts,
@@ -760,7 +852,7 @@ pub fn run(
                         inner_tx_drop,
                         outer_tx_drop,
                         decrypt_fail,
-                        connections = connections.len(),
+                        connections = manager.len(),
                         handshakes = multi_state.handshakes.len(),
                         "dpdk engine stats"
                     );
@@ -1641,7 +1733,11 @@ pub fn run_worker(
                             ConnectionEntry {
                                 conn,
                                 tunnel_ip,
+                                allowed_ips: vec![],
                                 remote_addr,
+                                keepalive_interval: Duration::from_secs(25),
+                                last_tx: Instant::now(),
+                                last_rx: Instant::now(),
                                 remote_mac,
                             },
                         );
