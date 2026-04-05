@@ -846,11 +846,15 @@ fn run_worker(
                                     || gso_pos + MAX_PACKET > gso_buf.len()
                                 {
                                     if gso_count > 0 {
-                                        crate::engine::flush_gso(
+                                        match crate::engine::flush_gso(
                                             udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
-                                        );
-                                        if let Some(prev) = manager.get_mut(&cur) {
-                                            prev.last_tx = Instant::now();
+                                        ) {
+                                            Ok(_) => {
+                                                if let Some(prev) = manager.get_mut(&cur) {
+                                                    prev.last_tx = Instant::now();
+                                                }
+                                            }
+                                            Err(e) => { warn!(error = %e, "GSO send failed"); }
                                         }
                                     }
                                     gso_pos = 0;
@@ -878,10 +882,12 @@ fn run_worker(
                                             gso_count += 1;
                                         } else {
                                             // Size changed — flush current batch, start new.
-                                            crate::engine::flush_gso(
+                                            match crate::engine::flush_gso(
                                                 udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
-                                            );
-                                            entry.last_tx = Instant::now();
+                                            ) {
+                                                Ok(_) => { entry.last_tx = Instant::now(); }
+                                                Err(e) => { warn!(error = %e, "GSO send failed"); }
+                                            }
                                             gso_buf.copy_within(gso_pos..gso_pos + r.len, 0);
                                             gso_segment_size = r.len;
                                             gso_pos = r.len;
@@ -976,13 +982,17 @@ fn run_worker(
         #[cfg(target_os = "linux")]
         {
             if gso_count > 0 {
-                crate::engine::flush_gso(
+                match crate::engine::flush_gso(
                     udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
-                );
-                if let Some(cid) = gso_current_cid {
-                    if let Some(entry) = manager.get_mut(&cid) {
-                        entry.last_tx = Instant::now();
+                ) {
+                    Ok(_) => {
+                        if let Some(cid) = gso_current_cid {
+                            if let Some(entry) = manager.get_mut(&cid) {
+                                entry.last_tx = Instant::now();
+                            }
+                        }
                     }
+                    Err(e) => { warn!(error = %e, "GSO send failed"); }
                 }
                 gso_pos = 0;
                 gso_count = 0;

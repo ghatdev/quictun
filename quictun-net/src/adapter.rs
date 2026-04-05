@@ -68,6 +68,18 @@ pub struct KernelAdapter {
     udp_gro_enabled: bool,
     #[cfg(target_os = "linux")]
     gro_recv_buf: Vec<u8>,
+    /// Leftover GRO state: when a coalesced datagram has more segments than
+    /// fit in one OuterRecvBatch, we save the remainder here and drain it on
+    /// the next call. Without this, EPOLLET won't re-fire because the kernel
+    /// already delivered the data — we just didn't consume all of it.
+    #[cfg(target_os = "linux")]
+    gro_remainder_offset: usize,
+    #[cfg(target_os = "linux")]
+    gro_remainder_total: usize,
+    #[cfg(target_os = "linux")]
+    gro_remainder_seg_size: usize,
+    #[cfg(target_os = "linux")]
+    gro_remainder_addr: std::net::SocketAddr,
 
     // Cached readiness from last poll.
     outer_ready: bool,
@@ -168,6 +180,14 @@ impl KernelAdapter {
             udp_gro_enabled,
             #[cfg(target_os = "linux")]
             gro_recv_buf: vec![0u8; quictun_core::batch_io::GRO_RECV_BUF_SIZE],
+            #[cfg(target_os = "linux")]
+            gro_remainder_offset: 0,
+            #[cfg(target_os = "linux")]
+            gro_remainder_total: 0,
+            #[cfg(target_os = "linux")]
+            gro_remainder_seg_size: 0,
+            #[cfg(target_os = "linux")]
+            gro_remainder_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             outer_ready: false,
             inner_ready: false,
         })
@@ -190,6 +210,14 @@ impl KernelAdapter {
         &self.udp_socket
     }
 
+    /// Returns true if there are leftover GRO segments from a previous recv.
+    /// The engine must call recv_outer_batch again to drain them, even if
+    /// EPOLLET hasn't re-fired.
+    #[cfg(target_os = "linux")]
+    pub fn has_gro_remainder(&self) -> bool {
+        self.gro_remainder_offset < self.gro_remainder_total
+    }
+
     /// Access the raw TUN device (for use by event_loop helpers).
     pub fn tun(&self) -> &tun_rs::SyncDevice {
         &self.tun
@@ -197,6 +225,11 @@ impl KernelAdapter {
 
     /// GRO-aware batch recv: each recvmsg returns a coalesced buffer that we
     /// split into individual QUIC packets for the engine.
+    ///
+    /// Preserves remainder state: if a coalesced datagram has more segments
+    /// than fit in one batch, leftover segments are saved and drained on the
+    /// next call. This is critical for EPOLLET correctness — without it, the
+    /// kernel considers the data delivered and won't re-notify.
     #[cfg(target_os = "linux")]
     fn recv_outer_batch_gro(
         &mut self,
@@ -205,6 +238,27 @@ impl KernelAdapter {
         let max_count = batch.bufs.len();
         let mut batch_idx = 0;
 
+        // 1. Drain leftover segments from previous call.
+        if self.gro_remainder_offset < self.gro_remainder_total {
+            let seg_size = self.gro_remainder_seg_size;
+            let addr = self.gro_remainder_addr;
+            while self.gro_remainder_offset < self.gro_remainder_total && batch_idx < max_count {
+                let end = (self.gro_remainder_offset + seg_size).min(self.gro_remainder_total);
+                let seg_len = end - self.gro_remainder_offset;
+                batch.bufs[batch_idx][..seg_len]
+                    .copy_from_slice(&self.gro_recv_buf[self.gro_remainder_offset..end]);
+                batch.lens[batch_idx] = seg_len;
+                batch.addrs[batch_idx] = addr;
+                batch_idx += 1;
+                self.gro_remainder_offset = end;
+            }
+            // If we drained everything, clear the remainder state.
+            if self.gro_remainder_offset >= self.gro_remainder_total {
+                self.gro_remainder_total = 0;
+            }
+        }
+
+        // 2. Read new coalesced datagrams from the socket.
         loop {
             if batch_idx >= max_count {
                 break;
@@ -232,6 +286,15 @@ impl KernelAdapter {
                 batch.addrs[batch_idx] = addr;
                 batch_idx += 1;
                 offset = end;
+            }
+
+            // Save remainder if we couldn't fit all segments.
+            if offset < total {
+                self.gro_remainder_offset = offset;
+                self.gro_remainder_total = total;
+                self.gro_remainder_seg_size = seg_size;
+                self.gro_remainder_addr = addr;
+                break;
             }
         }
 

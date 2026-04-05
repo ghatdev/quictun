@@ -338,7 +338,13 @@ fn run_engine(
         }
 
         // ── UDP RX → decrypt → TUN write ────────────────────────────
-        if readiness.outer {
+        // Also process when there are leftover GRO segments from the
+        // previous iteration — EPOLLET won't re-fire for those.
+        #[cfg(target_os = "linux")]
+        let has_gro_pending = adapter.has_gro_remainder();
+        #[cfg(not(target_os = "linux"))]
+        let has_gro_pending = false;
+        if readiness.outer || has_gro_pending {
             loop {
                 let count = match adapter.recv_outer_batch(&mut recv_batch) {
                     Ok(0) => break,
@@ -624,8 +630,12 @@ fn handle_tun_rx_gso(
                 if let Some(cur_cid) = current_cid {
                     if cur_cid != cid || gso_count >= max_segs || gso_pos + MAX_PACKET > gso_buf.len() {
                         if gso_count > 0 {
-                            flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"));
-                            if let Some(entry) = manager.get_mut(&cur_cid) { entry.last_tx = Instant::now(); }
+                            match flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set")) {
+                                Ok(_) => {
+                                    if let Some(entry) = manager.get_mut(&cur_cid) { entry.last_tx = Instant::now(); }
+                                }
+                                Err(e) => { warn!(error = %e, "GSO send failed"); }
+                            }
                         }
                         gso_pos = 0; gso_segment_size = 0; gso_count = 0;
                     }
@@ -634,9 +644,13 @@ fn handle_tun_rx_gso(
                 // Rate control: check before mutable borrow.
                 if !manager.get(&cid).map_or(true, |e| e.can_send()) {
                     if gso_count > 0 {
-                        flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"));
-                        if let Some(cur_cid) = current_cid {
-                            if let Some(e) = manager.get_mut(&cur_cid) { e.last_tx = Instant::now(); }
+                        match flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set")) {
+                            Ok(_) => {
+                                if let Some(cur_cid) = current_cid {
+                                    if let Some(e) = manager.get_mut(&cur_cid) { e.last_tx = Instant::now(); }
+                                }
+                            }
+                            Err(e) => { warn!(error = %e, "GSO send failed"); }
                         }
                     }
                     break;
@@ -660,7 +674,9 @@ fn handle_tun_rx_gso(
                             gso_pos += result.len; gso_count += 1;
                         } else {
                             if gso_count > 0 {
-                                flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr);
+                                if let Err(e) = flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr) {
+                                    warn!(error = %e, "GSO send failed");
+                                }
                             }
                             gso_buf.copy_within(gso_pos..gso_pos + result.len, 0);
                             gso_segment_size = result.len; gso_pos = result.len; gso_count = 1;
@@ -675,9 +691,13 @@ fn handle_tun_rx_gso(
     }
 
     if gso_count > 0 {
-        flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"));
-        if let Some(cur_cid) = current_cid {
-            if let Some(entry) = manager.get_mut(&cur_cid) { entry.last_tx = Instant::now(); }
+        match flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set")) {
+            Ok(_) => {
+                if let Some(cur_cid) = current_cid {
+                    if let Some(entry) = manager.get_mut(&cur_cid) { entry.last_tx = Instant::now(); }
+                }
+            }
+            Err(e) => { warn!(error = %e, "GSO send failed"); }
         }
     }
 }
@@ -689,15 +709,15 @@ pub(crate) fn flush_gso(
     gso_pos: usize,
     segment_size: usize,
     remote: SocketAddr,
-) {
+) -> io::Result<usize> {
     loop {
         let result = quictun_core::batch_io::send_gso(
             udp, &gso_buf[..gso_pos], segment_size as u16, remote,
         );
         match result {
-            Ok(_) => return,
+            Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => { wait_writable(udp.as_raw_fd()); }
-            Err(e) => { debug!(error = %e, "GSO send failed"); return; }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -849,6 +869,7 @@ fn flush_offload_batch(
     let mut gso_pos = 0usize;
     let mut gso_segment_size = 0usize;
     let mut gso_count = 0usize;
+    let mut batch_bytes = 0usize;
 
     for &idx in indices {
         let pkt = &split_bufs[idx][..split_sizes[idx]];
@@ -859,15 +880,22 @@ fn flush_offload_batch(
         };
         match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..], tx_ts) {
             Ok(result) => {
-                entry.on_bytes_sent(result.len);
                 if gso_count == 0 {
                     gso_segment_size = result.len; gso_pos += result.len; gso_count += 1;
+                    batch_bytes += result.len;
                 } else if result.len == gso_segment_size {
                     gso_pos += result.len; gso_count += 1;
+                    batch_bytes += result.len;
                 } else {
-                    if gso_count > 0 { flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr); }
+                    if gso_count > 0 {
+                        match flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr) {
+                            Ok(_) => { entry.on_bytes_sent(batch_bytes); }
+                            Err(e) => { warn!(error = %e, "GSO send failed"); }
+                        }
+                    }
                     gso_buf.copy_within(gso_pos..gso_pos + result.len, 0);
                     gso_segment_size = result.len; gso_pos = result.len; gso_count = 1;
+                    batch_bytes = result.len;
                 }
             }
             Err(e) => { warn!(error = %e, "encrypt failed"); }
@@ -875,8 +903,13 @@ fn flush_offload_batch(
     }
 
     if gso_count > 0 {
-        flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr);
-        entry.last_tx = Instant::now();
+        match flush_gso(udp, gso_buf, gso_pos, gso_segment_size, entry.remote_addr) {
+            Ok(_) => {
+                entry.on_bytes_sent(batch_bytes);
+                entry.last_tx = Instant::now();
+            }
+            Err(e) => { warn!(error = %e, "GSO send failed"); }
+        }
     }
 }
 

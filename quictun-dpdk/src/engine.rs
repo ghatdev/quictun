@@ -509,7 +509,7 @@ pub fn run(
         };
         // Rate-limit backpressure: skip inner RX when CC says stop.
         let cc_blocked = cc_enabled
-            && manager.values().next().map_or(false, |e| !e.can_send());
+            && manager.iter().next().map_or(false, |(_, e)| !e.can_send());
         let nb = if !pending_outer_tx.is_empty() || cc_blocked {
             0 // back-pressure: drain pending mbufs / wait for CC budget
         } else {
