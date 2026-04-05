@@ -690,6 +690,7 @@ pub fn run(
             if sent < nb_tx {
                 pending_outer_tx.extend_from_slice(&outer_tx_mbufs[sent as usize..]);
             }
+            outer_tx_mbufs.clear();
         }
 
         // ── Phase 2: Drive handshakes ────────────────────────────────
