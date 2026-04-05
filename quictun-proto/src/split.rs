@@ -252,33 +252,14 @@ impl RxState {
             self.largest_rx_pn,
         )?;
 
-        if self.received.test(hdr.pn) {
-            return Err(ParseError::DuplicatePacket);
+        // Key phase rotation (old pattern — TODO: fix decrypt-before-commit).
+        if hdr.key_phase != self.peer_key_phase {
+            self.peer_key_phase = hdr.key_phase;
+            self.handle_key_update_rx(hdr.key_phase, key_update, tx_state);
         }
 
-        // Key phase rotation: try decrypt FIRST, commit only on success
-        // (RFC 9001 §6.2 — must not commit key phase from unauthenticated packets).
-        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
-        if key_phase_changed {
-            // Take candidate key, try decrypt, rollback on failure.
-            let candidate = self.take_next_rx_key(key_update)
-                .ok_or(ParseError::NoKeysAvailable)?;
-            match decrypt_payload(packet, &hdr, &*candidate, scratch) {
-                Ok(result) => {
-                    // Decryption succeeded — install the new key and commit phase.
-                    self.rx_packet_key = Arc::new(candidate);
-                    self.peer_key_phase = hdr.key_phase;
-                    self.finalize_key_update(hdr.key_phase, key_update, tx_state);
-                    self.received.set(hdr.pn);
-                    if hdr.pn > self.largest_rx_pn { self.largest_rx_pn = hdr.pn; }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    // Decryption failed — put the key back.
-                    self.put_back_rx_key(candidate, key_update);
-                    return Err(e);
-                }
-            }
+        if self.received.test(hdr.pn) {
+            return Err(ParseError::DuplicatePacket);
         }
 
         let result = decrypt_payload(packet, &hdr, &**self.rx_packet_key, scratch)?;
@@ -307,29 +288,13 @@ impl RxState {
             self.largest_rx_pn,
         )?;
 
-        if self.received.test(hdr.pn) {
-            return Err(ParseError::DuplicatePacket);
+        if hdr.key_phase != self.peer_key_phase {
+            self.peer_key_phase = hdr.key_phase;
+            self.handle_key_update_rx(hdr.key_phase, key_update, tx_state);
         }
 
-        // Key phase rotation: try decrypt FIRST, commit only on success.
-        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
-        if key_phase_changed {
-            let candidate = self.take_next_rx_key(key_update)
-                .ok_or(ParseError::NoKeysAvailable)?;
-            match decrypt_payload_in_place(packet, &hdr, &*candidate) {
-                Ok(result) => {
-                    self.rx_packet_key = Arc::new(candidate);
-                    self.peer_key_phase = hdr.key_phase;
-                    self.finalize_key_update(hdr.key_phase, key_update, tx_state);
-                    self.received.set(hdr.pn);
-                    if hdr.pn > self.largest_rx_pn { self.largest_rx_pn = hdr.pn; }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    self.put_back_rx_key(candidate, key_update);
-                    return Err(e);
-                }
-            }
+        if self.received.test(hdr.pn) {
+            return Err(ParseError::DuplicatePacket);
         }
 
         let result = decrypt_payload_in_place(packet, &hdr, &**self.rx_packet_key)?;

@@ -134,33 +134,30 @@ impl LocalConnectionState {
             self.largest_rx_pn,
         )?;
 
+        // Key phase rotation.
+        // TODO: this commits before AEAD verification (RFC 9001 §6.2 violation).
+        // A proper fix must peek/try decrypt first, but the current peek approach
+        // has a subtle bug causing connection death at key rotation (~7M packets).
+        // Keeping the old (insecure) pattern until the fix is corrected.
+        if hdr.key_phase != self.peer_key_phase {
+            self.peer_key_phase = hdr.key_phase;
+            self.handle_key_update_rx(hdr.key_phase);
+        }
+
         // Reject duplicate packet numbers.
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
 
-        // Key phase rotation: try decrypt FIRST, commit only on success
-        // (RFC 9001 §6.2 — must not commit key phase from unauthenticated packets).
-        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
-        if key_phase_changed {
-            let candidate_key = self.peek_next_rx_key()
-                .ok_or(ParseError::NoKeysAvailable)?;
-            let result = decrypt_payload(packet, &hdr, &*candidate_key, scratch)?;
-            // Decryption succeeded — now safe to commit the key rotation.
-            self.handle_key_update_rx(hdr.key_phase);
-            self.received.set(hdr.pn);
-            if hdr.pn > self.largest_rx_pn {
-                self.largest_rx_pn = hdr.pn;
-            }
-            Ok(result)
-        } else {
-            let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
-            self.received.set(hdr.pn);
-            if hdr.pn > self.largest_rx_pn {
-                self.largest_rx_pn = hdr.pn;
-            }
-            Ok(result)
+        let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
+
+        // Update RX state.
+        self.received.set(hdr.pn);
+        if hdr.pn > self.largest_rx_pn {
+            self.largest_rx_pn = hdr.pn;
         }
+
+        Ok(result)
     }
 
     /// Decrypt an incoming 1-RTT packet fully in-place (zero heap allocation).
@@ -179,32 +176,24 @@ impl LocalConnectionState {
             self.largest_rx_pn,
         )?;
 
-        // Reject duplicate packet numbers.
+        // Key phase rotation (see TODO above).
+        if hdr.key_phase != self.peer_key_phase {
+            self.peer_key_phase = hdr.key_phase;
+            self.handle_key_update_rx(hdr.key_phase);
+        }
+
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
 
-        // Key phase rotation: try decrypt FIRST, commit only on success
-        // (RFC 9001 §6.2).
-        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
-        if key_phase_changed {
-            let candidate_key = self.peek_next_rx_key()
-                .ok_or(ParseError::NoKeysAvailable)?;
-            let result = decrypt_payload_in_place(packet, &hdr, &*candidate_key)?;
-            self.handle_key_update_rx(hdr.key_phase);
-            self.received.set(hdr.pn);
-            if hdr.pn > self.largest_rx_pn {
-                self.largest_rx_pn = hdr.pn;
-            }
-            Ok(result)
-        } else {
-            let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
-            self.received.set(hdr.pn);
-            if hdr.pn > self.largest_rx_pn {
-                self.largest_rx_pn = hdr.pn;
-            }
-            Ok(result)
+        let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
+
+        self.received.set(hdr.pn);
+        if hdr.pn > self.largest_rx_pn {
+            self.largest_rx_pn = hdr.pn;
         }
+
+        Ok(result)
     }
 
     /// Encrypt a datagram payload into a complete 1-RTT QUIC packet.
