@@ -63,6 +63,12 @@ pub struct KernelAdapter {
     #[cfg(target_os = "linux")]
     offload_enabled: bool,
 
+    // UDP GRO receive buffer (Linux only).
+    #[cfg(target_os = "linux")]
+    udp_gro_enabled: bool,
+    #[cfg(target_os = "linux")]
+    gro_recv_buf: Vec<u8>,
+
     // Cached readiness from last poll.
     outer_ready: bool,
     inner_ready: bool,
@@ -123,6 +129,26 @@ impl KernelAdapter {
         // socket2 uses FIONBIO which may not persist after conversion to std UdpSocket.
         set_nonblocking(udp_socket.as_raw_fd())?;
 
+        // Enable UDP GRO on the receive side to match GSO on the send side.
+        // Without GRO, each packet is delivered individually — at high rates the
+        // recv side can't keep up with GSO-accelerated sends, causing socket
+        // buffer overflow and retransmits.
+        #[cfg(target_os = "linux")]
+        let udp_gro_enabled = match quictun_core::batch_io::enable_udp_gro(&udp_socket) {
+            Ok(true) => {
+                info!("UDP GRO enabled on recv socket");
+                true
+            }
+            Ok(false) => {
+                info!("UDP GRO not supported by kernel, using recvmmsg fallback");
+                false
+            }
+            Err(e) => {
+                info!(error = %e, "failed to enable UDP GRO, using recvmmsg fallback");
+                false
+            }
+        };
+
         Ok(Self {
             poll,
             events,
@@ -138,6 +164,10 @@ impl KernelAdapter {
             recv_work: quictun_core::batch_io::RecvMmsgWork::new(config.batch_size),
             #[cfg(target_os = "linux")]
             offload_enabled: config.offload,
+            #[cfg(target_os = "linux")]
+            udp_gro_enabled,
+            #[cfg(target_os = "linux")]
+            gro_recv_buf: vec![0u8; quictun_core::batch_io::GRO_RECV_BUF_SIZE],
             outer_ready: false,
             inner_ready: false,
         })
@@ -163,6 +193,49 @@ impl KernelAdapter {
     /// Access the raw TUN device (for use by event_loop helpers).
     pub fn tun(&self) -> &tun_rs::SyncDevice {
         &self.tun
+    }
+
+    /// GRO-aware batch recv: each recvmsg returns a coalesced buffer that we
+    /// split into individual QUIC packets for the engine.
+    #[cfg(target_os = "linux")]
+    fn recv_outer_batch_gro(
+        &mut self,
+        batch: &mut OuterRecvBatch,
+    ) -> io::Result<usize> {
+        let max_count = batch.bufs.len();
+        let mut batch_idx = 0;
+
+        loop {
+            if batch_idx >= max_count {
+                break;
+            }
+            let (total, seg_size, addr) = match quictun_core::batch_io::recv_gro_from(
+                &self.udp_socket,
+                &mut self.gro_recv_buf,
+            ) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            };
+            if total == 0 || seg_size == 0 {
+                break;
+            }
+
+            // Split coalesced buffer into individual segments.
+            let mut offset = 0;
+            while offset < total && batch_idx < max_count {
+                let end = (offset + seg_size).min(total);
+                let seg_len = end - offset;
+                batch.bufs[batch_idx][..seg_len]
+                    .copy_from_slice(&self.gro_recv_buf[offset..end]);
+                batch.lens[batch_idx] = seg_len;
+                batch.addrs[batch_idx] = addr;
+                batch_idx += 1;
+                offset = end;
+            }
+        }
+
+        Ok(batch_idx)
     }
 }
 
@@ -247,15 +320,19 @@ impl DataPlaneIo for KernelAdapter {
 impl DataPlaneIoBatch for KernelAdapter {
     #[cfg(target_os = "linux")]
     fn recv_outer_batch(&mut self, batch: &mut OuterRecvBatch) -> io::Result<usize> {
-        let max_count = batch.bufs.len();
-        quictun_core::batch_io::recvmmsg_batch(
-            &self.udp_socket,
-            &mut batch.bufs,
-            &mut batch.lens,
-            &mut batch.addrs,
-            max_count,
-            &mut self.recv_work,
-        )
+        if self.udp_gro_enabled {
+            self.recv_outer_batch_gro(batch)
+        } else {
+            let max_count = batch.bufs.len();
+            quictun_core::batch_io::recvmmsg_batch(
+                &self.udp_socket,
+                &mut batch.bufs,
+                &mut batch.lens,
+                &mut batch.addrs,
+                max_count,
+                &mut self.recv_work,
+            )
+        }
     }
 
     #[cfg(not(target_os = "linux"))]

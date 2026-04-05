@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use bytes::BytesMut;
 use crossbeam_channel::{self, Receiver, Sender};
 use parking_lot::RwLock;
-use quictun_core::data_plane::{DataPlaneIo, DataPlaneIoBatch, OuterRecvBatch};
+use quictun_core::data_plane::{DataPlaneIo, DataPlaneIoBatch, OuterRecvBatch, MAX_PACKET};
 use crate::engine::RunResult;
 use quictun_core::manager::{
     ConnEntry, ConnectionManager, ManagerAction,
@@ -284,7 +284,7 @@ fn run_io_thread(
     };
     #[cfg(target_os = "linux")]
     let mut tun_split_bufs = if config.offload {
-        vec![vec![0u8; 1500]; quictun_tun::IDEAL_BATCH_SIZE]
+        vec![vec![0u8; MAX_PACKET]; quictun_tun::IDEAL_BATCH_SIZE]
     } else {
         Vec::new()
     };
@@ -294,7 +294,7 @@ fn run_io_thread(
     } else {
         Vec::new()
     };
-    let mut tun_pkt_buf = [0u8; 1500];
+    let mut tun_pkt_buf = [0u8; MAX_PACKET];
 
     loop {
         let timeout = Duration::from_millis(100); // 100ms poll tick
@@ -717,7 +717,7 @@ fn run_worker(
 
     // Linux-only batch state.
     #[cfg(target_os = "linux")]
-    let mut gso_buf = vec![0u8; gso_max_segments * 2048];
+    let mut gso_buf = vec![0u8; gso_max_segments * MAX_PACKET];
     #[cfg(target_os = "linux")]
     let mut gso_pos: usize = 0;
     #[cfg(target_os = "linux")]
@@ -829,8 +829,8 @@ fn run_worker(
                             // Flush GSO batch if CID changed or batch full.
                             if let Some(cur) = gso_current_cid {
                                 if cur != cid
-                                    || gso_count >= gso_buf.len() / 2048
-                                    || gso_pos + 2048 > gso_buf.len()
+                                    || gso_count >= gso_buf.len() / MAX_PACKET
+                                    || gso_pos + MAX_PACKET > gso_buf.len()
                                 {
                                     if gso_count > 0 {
                                         crate::engine::flush_gso(

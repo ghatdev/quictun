@@ -17,6 +17,15 @@ pub const GSO_MAX_SEGMENTS: usize = 44;
 /// GSO buffer size: enough for max segments.
 pub const GSO_BUF_SIZE: usize = GSO_MAX_SEGMENTS * 2048;
 
+/// Maximum segments that kernel UDP GRO can coalesce
+/// (UDP_GRO_CNT_MAX = 64 in net/ipv4/udp_offload.c).
+pub const GRO_MAX_SEGMENTS: usize = 64;
+
+/// Buffer size for a single GRO recv: must hold the largest coalesced
+/// datagram the kernel can produce (GRO_MAX_SEGMENTS × max UDP payload).
+/// Using 2048 per segment to match MAX_PACKET.
+pub const GRO_RECV_BUF_SIZE: usize = GRO_MAX_SEGMENTS * 2048;
+
 /// Pre-allocated workspace for recvmmsg syscalls.
 /// Avoids heap allocation per call in the hot path.
 pub struct RecvMmsgWork {
@@ -288,4 +297,56 @@ pub fn recv_gro(fd: &impl AsRawFd, buf: &mut [u8]) -> io::Result<(usize, usize)>
     }
 
     Ok((total, segment_size))
+}
+
+/// Like [`recv_gro`] but also captures the source address.
+///
+/// Returns `(total_bytes, segment_size, source_addr)`.
+/// Uses MSG_DONTWAIT — call after ensuring readability.
+pub fn recv_gro_from(
+    fd: &impl AsRawFd,
+    buf: &mut [u8],
+) -> io::Result<(usize, usize, SocketAddr)> {
+    let mut iovec = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &mut sockaddr as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    msg.msg_iov = &mut iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space as _;
+
+    let ret = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let total = ret as usize;
+
+    // Parse cmsg to find GRO segment size.
+    let mut segment_size = total; // default: single packet (no coalescing)
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_UDP && (*cmsg).cmsg_type == libc::UDP_GRO {
+                let data = libc::CMSG_DATA(cmsg) as *const u16;
+                segment_size = (*data) as usize;
+                break;
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+
+    let ip = std::net::Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr));
+    let port = u16::from_be(sockaddr.sin_port);
+    let addr = SocketAddr::new(ip.into(), port);
+
+    Ok((total, segment_size, addr))
 }

@@ -161,6 +161,7 @@ pub fn run(
     tunnel_ip: Ipv4Addr,
     max_peers: usize,
     idle_timeout: Duration,
+    rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 ) -> Result<()> {
     const CID_LEN: usize = 8;
 
@@ -173,6 +174,10 @@ pub fn run(
 
     // Pending packets to transmit (raw Ethernet frames for ARP replies, etc.).
     let mut pending_frames: Vec<Vec<u8>> = Vec::new();
+
+    // Monotonic epoch for CC timestamps (wrapping u32 microseconds).
+    let cc_epoch = Instant::now();
+    let cc_enabled = rate_control_config.is_some();
 
     // Connection lifecycle manager: connection table + routing table + sweep.
     let mut manager = ConnectionManager::<LocalConnectionState>::new(
@@ -201,6 +206,12 @@ pub fn run(
     // Rate-limited stats timer: only call Instant::now() every 32768 busy iterations.
     // clock_gettime + duration_since was ~12% CPU at 13 Gbps for a 2-second stats timer.
     let mut stats_poll_counter: u32 = 0;
+
+    // ACK timer: generate explicit ACK frames with queuing delay for CC feedback.
+    // Check every 1024 busy iterations (~25ms at high rates).
+    let mut ack_poll_counter: u32 = 0;
+    let mut last_ack = Instant::now();
+    let mut ack_buf = [0u8; 256];
 
     // Pre-allocated mbuf vectors for batched TX (reused across loop iterations).
     let mut inner_tx_mbufs: Vec<*mut ffi::rte_mbuf> = Vec::with_capacity(BURST_SIZE);
@@ -350,6 +361,12 @@ pub fn run(
 
                                 if let Some(ref ack) = decrypted.ack {
                                     entry.conn.process_ack(ack);
+                                    entry.on_ack(ack);
+                                }
+                                // OWD sample from sender's timestamp.
+                                if let Some(tx_us) = decrypted.tx_timestamp {
+                                    let rx_us = (cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32;
+                                    entry.on_owd_sample(tx_us, rx_us);
                                 }
 
                                 if decrypted.datagrams.len() == 1 {
@@ -543,6 +560,11 @@ pub fn run(
                         continue;
                     };
 
+                    // CC: check rate controller before sending.
+                    if !entry.can_send() {
+                        continue;
+                    }
+
                     // Zero-copy encrypt: reuse the inner RX mbuf.
                     //
                     // Inner mbuf layout: [inner ETH(14)][IP payload(N)]
@@ -568,7 +590,12 @@ pub fn run(
                     // buf layout: [42 bytes for outer hdrs][old inner ETH(14)][IP payload(N)][tag space]
                     let quic_buf = &mut buf[net::HEADER_SIZE..];
 
-                    match entry.conn.encrypt_datagram_in_place(ip_payload_len, quic_buf, None) {
+                    let tx_ts = if cc_enabled {
+                        Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
+                    } else {
+                        None
+                    };
+                    match entry.conn.encrypt_datagram_in_place(ip_payload_len, quic_buf, tx_ts) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,
@@ -601,6 +628,7 @@ pub fn run(
                                 }
                                 _ => {}
                             }
+                            entry.on_bytes_sent(result.len);
                             entry.last_tx = now;
                             outer_tx_mbufs.push(mbuf.into_raw());
                         }
@@ -717,13 +745,16 @@ pub fn run(
                                 last_tx: now,
                                 last_rx: now,
                                 owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
-                                rate_controller: None,
+                                rate_controller: rate_control_config.map(
+                                    quictun_proto::rate_control::RateController::new,
+                                ),
                             });
 
                             tracing::info!(
                                 tunnel_ip = %peer_ip,
                                 remote = %remote_addr,
                                 cid = %hex::encode(&cid_bytes),
+                                cc = if rate_control_config.is_some() { "delay" } else { "none" },
                                 "connection established"
                             );
                         }
@@ -855,6 +886,72 @@ pub fn run(
                         "dpdk engine stats"
                     );
                     last_stats = now;
+                }
+            }
+        }
+
+        // ── Timer-driven ACK generation ─────────────────────────────
+        // Rate-limited to avoid calling Instant::now() on every iteration.
+        if nb_rx > 0 || nb > 0 {
+            ack_poll_counter = ack_poll_counter.wrapping_add(1);
+            if ack_poll_counter & 0x3FF == 0 {
+                let ack_now = Instant::now();
+                if ack_now.duration_since(last_ack) >= ACK_INTERVAL {
+                    for entry in manager.values_mut() {
+                        if entry.conn.needs_ack() {
+                            let ack_delay = entry.queuing_delay_us();
+                            if let Ok(result) = entry.conn.encrypt_ack(ack_delay, &mut ack_buf) {
+                                let remote_ip = match entry.remote_addr.ip() {
+                                    std::net::IpAddr::V4(ip) => ip,
+                                    _ => Ipv4Addr::UNSPECIFIED,
+                                };
+                                let remote_mac = arp_table.lookup(remote_ip).unwrap_or([0xff; 6]);
+                                ip_id = ip_id.wrapping_add(1);
+                                let frame_len = net::HEADER_SIZE + result.len;
+                                if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
+                                    if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
+                                        net::build_udp_packet(
+                                            &identity.local_mac,
+                                            &remote_mac,
+                                            identity.local_ip,
+                                            remote_ip,
+                                            identity.local_port,
+                                            entry.remote_addr.port(),
+                                            result.len,
+                                            buf,
+                                            0,
+                                            ip_id,
+                                            checksum_mode,
+                                        );
+                                        buf[net::HEADER_SIZE..frame_len]
+                                            .copy_from_slice(&ack_buf[..result.len]);
+                                        match checksum_mode {
+                                            ChecksumMode::HardwareUdpOnly => {
+                                                mbuf.set_tx_udp_checksum_offload()
+                                            }
+                                            ChecksumMode::HardwareFull => {
+                                                mbuf.set_tx_full_checksum_offload()
+                                            }
+                                            _ => {}
+                                        }
+                                        outer_tx_mbufs.push(mbuf.into_raw());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Flush ACK mbufs.
+                    if !outer_tx_mbufs.is_empty() {
+                        let sent = port::tx_burst(
+                            outer_port_id, queue_id, &mut outer_tx_mbufs,
+                        );
+                        for &ptr in &outer_tx_mbufs[sent..] {
+                            unsafe { ffi::rte_pktmbuf_free(ptr) };
+                        }
+                        tx_pkts += sent as u64;
+                        outer_tx_mbufs.clear();
+                    }
+                    last_ack = ack_now;
                 }
             }
         }
@@ -1811,6 +1908,7 @@ pub fn run_worker(
 
                     if let Some(ref ack) = decrypted.ack {
                         entry.conn.process_ack(ack);
+                        entry.on_ack(ack);
                     }
                     for range in &decrypted.datagrams {
                         let abs_start = payload_offset + range.start;
@@ -2019,6 +2117,7 @@ pub fn run_pipeline_io(
     tunnel_ip: Ipv4Addr,
     max_peers: usize,
     idle_timeout: Duration,
+    rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 ) -> Result<()> {
     let n_workers = workers.len();
 
@@ -2335,7 +2434,9 @@ pub fn run_pipeline_io(
                                 last_tx: now,
                                 last_rx: now,
                                 owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
-                                rate_controller: None,
+                                rate_controller: rate_control_config.map(
+                                    quictun_proto::rate_control::RateController::new,
+                                ),
                             });
 
                             tracing::info!(
@@ -2392,7 +2493,7 @@ pub fn run_pipeline_io(
         if now.duration_since(last_ack) >= ACK_INTERVAL {
             for (_, entry) in manager.iter() {
                 if entry.conn.replay.needs_ack() {
-                    match entry.conn.encrypt_ack(0, &mut ack_buf) {
+                    match entry.conn.encrypt_ack(entry.queuing_delay_us(), &mut ack_buf) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,
@@ -2910,6 +3011,7 @@ pub fn entry(
             dpdk_config.tunnel_ip,
             dpdk_config.max_peers,
             dpdk_config.idle_timeout,
+            dpdk_config.rate_control_config,
         );
     }
 
@@ -2997,6 +3099,7 @@ pub fn entry(
             dpdk_config.tunnel_ip,
             dpdk_config.max_peers,
             dpdk_config.idle_timeout,
+            dpdk_config.rate_control_config,
         );
 
         // Signal shutdown and wait for workers.

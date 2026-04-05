@@ -216,6 +216,9 @@ fn run_engine(
     };
     let mut adapter = KernelAdapter::new(&adapter_config)?;
 
+    // Buffer size validation: warn if sizes don't match GRO/GSO expectations.
+    validate_buffer_config(&config);
+
     // 2. Connection manager (shared state).
     let mut manager = ConnectionManager::<LocalConnectionState>::new(
         config.tunnel_ip,
@@ -286,7 +289,7 @@ fn run_engine(
     };
     #[cfg(target_os = "linux")]
     let mut tun_split_bufs = if offload_enabled {
-        vec![vec![0u8; 1500]; quictun_tun::IDEAL_BATCH_SIZE]
+        vec![vec![0u8; MAX_PACKET]; quictun_tun::IDEAL_BATCH_SIZE]
     } else {
         Vec::new()
     };
@@ -585,7 +588,7 @@ fn handle_tun_rx_gso(
     let mut gso_count: usize = 0;
     let mut current_cid: Option<u64> = None;
     let mut current_remote: Option<SocketAddr> = None;
-    let mut packet = [0u8; 1500];
+    let mut packet = [0u8; MAX_PACKET];
 
     loop {
         match tun.recv(&mut packet) {
@@ -687,7 +690,7 @@ fn handle_tun_rx_simple(
     udp: &std::net::UdpSocket,
     encrypt_buf: &mut [u8],
 ) {
-    let mut packet = [0u8; 1500];
+    let mut packet = [0u8; MAX_PACKET];
     loop {
         match tun.recv(&mut packet) {
             Ok(n) => {
@@ -902,6 +905,60 @@ pub(crate) fn create_udp_socket(
         .with_context(|| format!("failed to bind UDP to {addr}"))?;
 
     Ok(sock.into())
+}
+
+/// Validate buffer configuration and warn about mismatches that can cause
+/// retransmits or silent data loss.
+fn validate_buffer_config(config: &NetConfig) {
+    // GSO send buffer must fit gso_max_segments × MAX_PACKET.
+    let gso_buf_needed = config.gso_max_segments * MAX_PACKET;
+    if config.send_buf < gso_buf_needed {
+        warn!(
+            send_buf = config.send_buf,
+            gso_buf_needed,
+            gso_max_segments = config.gso_max_segments,
+            "send_buf < gso_max_segments × {} — GSO batches may be dropped by kernel",
+            MAX_PACKET,
+        );
+    }
+
+    // Recv buffer should hold at least GRO_MAX_SEGMENTS × MAX_PACKET worth of
+    // queued data to avoid drops during GRO coalescing.
+    #[cfg(target_os = "linux")]
+    {
+        let gro_burst = quictun_core::batch_io::GRO_MAX_SEGMENTS * MAX_PACKET;
+        // The recv_buf should hold many GRO bursts — at high rates, the
+        // kernel can queue multiple GRO-coalesced datagrams.
+        if config.recv_buf < gro_burst * 4 {
+            warn!(
+                recv_buf = config.recv_buf,
+                min_recommended = gro_burst * 4,
+                "recv_buf may be too small for UDP GRO — risk of packet drops at high rates. \
+                 Set recv_buf >= {} or increase net.core.rmem_max",
+                gro_burst * 4,
+            );
+        }
+    }
+
+    // TUN write buffer should be large enough to absorb bursts when TUN
+    // blocks (WouldBlock). At 10 Gbps with ~1400-byte packets, that's
+    // ~890K pps → ~89 packets per 100μs poll cycle.
+    if config.tun_write_buf_capacity < 64 {
+        warn!(
+            tun_write_buf = config.tun_write_buf_capacity,
+            "tun_write_buf < 64 — may cause packet drops when TUN blocks",
+        );
+    }
+
+    info!(
+        recv_buf = config.recv_buf,
+        send_buf = config.send_buf,
+        batch_size = config.batch_size,
+        gso_max_segments = config.gso_max_segments,
+        tun_write_buf = config.tun_write_buf_capacity,
+        offload = config.offload,
+        "buffer config validated",
+    );
 }
 
 pub(crate) fn set_nonblocking(fd: i32) -> Result<()> {

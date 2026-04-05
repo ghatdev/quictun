@@ -72,6 +72,8 @@ pub struct DpdkConfig {
     pub idle_timeout: Duration,
     /// Override MAC for the outer DPDK port (None = use NIC's current MAC).
     pub dpdk_mac: Option<[u8; 6]>,
+    /// Data-plane rate control config. `None` = no CC.
+    pub rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 }
 
 /// DPDK engine backend.
@@ -134,6 +136,7 @@ impl quictun_core::engine::Engine for DpdkEngine {
             max_peers: config.engine.max_peers,
             idle_timeout: quictun_core::session::idle_timeout(config),
             dpdk_mac: config.engine.dpdk_mac.as_ref().map(|s| parse_mac(s)).transpose()?,
+            rate_control_config: config.engine.rate_control_config(),
         };
 
         run(local_addr, setup, dpdk_config)?;
