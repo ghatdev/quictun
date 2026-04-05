@@ -45,6 +45,16 @@ pub(crate) struct ConnView<'a> {
     pub remote_mac: [u8; 6],
 }
 
+impl<'a> From<&'a mut ConnectionEntry> for ConnView<'a> {
+    fn from(e: &'a mut ConnectionEntry) -> Self {
+        ConnView {
+            conn: &mut e.conn,
+            remote_addr: e.remote_addr,
+            remote_mac: e.remote_mac,
+        }
+    }
+}
+
 /// Connection table lookup trait for router helper functions.
 ///
 /// Returns a [`ConnView`] that provides the fields needed to build TX frames.
@@ -1012,7 +1022,7 @@ fn encrypt_return_to_peer(
 #[allow(clippy::too_many_arguments)]
 fn encrypt_and_send(
     inner_pkt: &[u8],
-    entry: &mut ConnView<'_>,
+    mut entry: ConnView<'_>,
     identity: &NetIdentity,
     mempool: *mut ffi::rte_mempool,
     outer_tx_mbufs: &mut Vec<*mut ffi::rte_mbuf>,
@@ -1692,11 +1702,7 @@ pub fn run_router_worker(
                             ConnectionEntry {
                                 conn,
                                 tunnel_ip: peer_tunnel_ip,
-                                allowed_ips: allowed_ips.clone(),
                                 remote_addr,
-                                keepalive_interval: Duration::from_secs(25),
-                                last_tx: Instant::now(),
-                                last_rx: Instant::now(),
                                 remote_mac,
                             },
                         );
@@ -1831,7 +1837,7 @@ pub fn run_router_worker(
                                             if let Some(entry) = connections.get_mut(&src_cid) {
                                                 encrypt_and_send(
                                                     &icmp_pkt,
-                                                    entry,
+                                                    entry.into(),
                                                     identity,
                                                     mempool,
                                                     &mut outer_tx_mbufs,
@@ -1869,7 +1875,7 @@ pub fn run_router_worker(
                                                 hub_spoke += 1;
                                                 encrypt_and_send(
                                                     inner_pkt,
-                                                    peer_entry,
+                                                    peer_entry.into(),
                                                     identity,
                                                     mempool,
                                                     &mut outer_tx_mbufs,
@@ -1965,7 +1971,7 @@ pub fn run_router_worker(
                                                 if let Some(entry) = connections.get_mut(&src_cid) {
                                                     encrypt_and_send(
                                                         &icmp_pkt,
-                                                        entry,
+                                                        entry.into(),
                                                         identity,
                                                         mempool,
                                                         &mut outer_tx_mbufs,
@@ -1997,7 +2003,7 @@ pub fn run_router_worker(
                                             {
                                                 encrypt_and_send(
                                                     &reply,
-                                                    entry,
+                                                    entry.into(),
                                                     identity,
                                                     mempool,
                                                     &mut outer_tx_mbufs,
@@ -2014,7 +2020,7 @@ pub fn run_router_worker(
                                             if let Some(entry) = connections.get_mut(&src_cid) {
                                                 encrypt_and_send(
                                                     &icmp_pkt,
-                                                    entry,
+                                                    entry.into(),
                                                     identity,
                                                     mempool,
                                                     &mut outer_tx_mbufs,
@@ -2148,7 +2154,7 @@ pub fn run_router_worker(
                 if let Some(entry) = connections.get_mut(&cid) {
                     encrypt_and_send(
                         data,
-                        entry,
+                        entry.into(),
                         identity,
                         mempool,
                         &mut outer_tx_mbufs,

@@ -1728,11 +1728,7 @@ pub fn run_worker(
                             ConnectionEntry {
                                 conn,
                                 tunnel_ip,
-                                allowed_ips: vec![],
                                 remote_addr,
-                                keepalive_interval: Duration::from_secs(25),
-                                last_tx: Instant::now(),
-                                last_rx: Instant::now(),
                                 remote_mac,
                             },
                         );
