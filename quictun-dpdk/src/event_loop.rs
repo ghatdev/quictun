@@ -70,6 +70,8 @@ pub struct DpdkConfig {
     pub max_peers: usize,
     /// Idle timeout for connections (from config or default 180s).
     pub idle_timeout: Duration,
+    /// Override MAC for the outer DPDK port (None = use NIC's current MAC).
+    pub dpdk_mac: Option<[u8; 6]>,
 }
 
 /// DPDK engine backend.
@@ -131,11 +133,26 @@ impl quictun_core::engine::Engine for DpdkEngine {
             mss_clamp: routing.map(|r| r.mss_clamp).unwrap_or(0),
             max_peers: config.engine.max_peers,
             idle_timeout: quictun_core::session::idle_timeout(config),
+            dpdk_mac: config.engine.dpdk_mac.as_ref().map(|s| parse_mac(s)).transpose()?,
         };
 
         run(local_addr, setup, dpdk_config)?;
         Ok(RunResult::Shutdown)
     }
+}
+
+/// Parse a MAC address string like "aa:bb:cc:dd:ee:ff" into 6 bytes.
+fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        bail!("invalid dpdk_mac format: expected aa:bb:cc:dd:ee:ff, got {s:?}");
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)
+            .with_context(|| format!("invalid hex byte in dpdk_mac: {part:?}"))?;
+    }
+    Ok(mac)
 }
 
 /// Run the DPDK data plane.
@@ -192,8 +209,15 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
     // Configure outer port with single TX queue. Virtio NICs silently drop
     // packets on TX queues > 0 (confirmed on Proxmox virtio-pci), so all TX
     // goes through queue 0 on core 0. Workers return packets via rings.
-    let (local_mac, hw_udp_cksum, hw_ip_cksum) =
+    let (mut local_mac, hw_udp_cksum, hw_ip_cksum) =
         port::configure_port(dpdk_config.port_id, mempool)?;
+
+    // Override outer port MAC if configured (e.g., restore original NIC MAC
+    // after vfio-pci binding assigns a random one).
+    if let Some(mac) = dpdk_config.dpdk_mac {
+        port::set_mac(dpdk_config.port_id, mac)?;
+        local_mac = mac;
+    }
 
     // Determine checksum mode: CLI flag > HW offload > software.
     let checksum_mode = if dpdk_config.no_udp_checksum {

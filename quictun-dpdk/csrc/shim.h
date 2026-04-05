@@ -55,6 +55,12 @@ struct rte_eth_conf shim_create_rss_port_conf(uint64_t rss_hf);
 uint64_t shim_rss_ip_udp_flags(void);
 
 /*
+ * Set the default MAC address of a DPDK port.
+ */
+int shim_rte_eth_dev_default_mac_addr_set(uint16_t port_id,
+                                           struct rte_ether_addr *mac_addr);
+
+/*
  * rte_ring SPSC wrappers (inline functions not visible to bindgen/FFI).
  */
 struct rte_ring *shim_rte_ring_create(const char *name, unsigned count,

@@ -761,6 +761,7 @@ pub fn run(
             mempool,
             &mut pending_frames,
             &mut tx_pkts,
+            checksum_mode,
         )?;
 
         // ── Periodic stats (rate-limited clock) ─────────────────────
@@ -973,6 +974,7 @@ fn send_raw_frames(
     mempool: *mut ffi::rte_mempool,
     frames: &mut Vec<Vec<u8>>,
     tx_count: &mut u64,
+    checksum_mode: ChecksumMode,
 ) -> Result<()> {
     if frames.is_empty() {
         return Ok(());
@@ -983,6 +985,11 @@ fn send_raw_frames(
     for frame in frames.iter() {
         let mut mbuf = Mbuf::alloc(mempool)?;
         mbuf.write_packet(frame)?;
+        match checksum_mode {
+            ChecksumMode::HardwareUdpOnly => mbuf.set_tx_udp_checksum_offload(),
+            ChecksumMode::HardwareFull => mbuf.set_tx_full_checksum_offload(),
+            _ => {}
+        }
         tx_mbufs.push(mbuf.into_raw());
     }
 
@@ -1194,6 +1201,7 @@ pub fn run_handshake_only(
                     mempool,
                     &mut pending_frames,
                     &mut tx_pkts,
+                    checksum_mode,
                 )?;
                 return Ok(HandshakeResult {
                     conn_state: cs,
@@ -1228,6 +1236,7 @@ pub fn run_handshake_only(
             mempool,
             &mut pending_frames,
             &mut tx_pkts,
+            checksum_mode,
         )?;
 
         deadline = if let Some(conn) = state.connection.as_mut() {
@@ -1551,7 +1560,7 @@ pub fn run_dispatcher(
         }
 
         // ── 5. Send pending raw frames ──
-        send_raw_frames(outer_port_id, 0, mempool, &mut pending_frames, &mut tx_pkts)?;
+        send_raw_frames(outer_port_id, 0, mempool, &mut pending_frames, &mut tx_pkts, checksum_mode)?;
 
         // ── Stats ──
         if now.duration_since(last_stats).as_secs() >= 2 {
@@ -2371,7 +2380,7 @@ pub fn run_pipeline_io(
         }
 
         // ── 5. Send pending raw frames ──
-        send_raw_frames(outer_port_id, 0, mempool, &mut pending_frames, &mut tx_pkts)?;
+        send_raw_frames(outer_port_id, 0, mempool, &mut pending_frames, &mut tx_pkts, checksum_mode)?;
 
         // ── 6. Timer-driven ACK generation (every ~25ms) ──
 

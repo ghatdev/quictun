@@ -47,6 +47,11 @@ void shim_rte_pktmbuf_reset(struct rte_mbuf *m) {
     rte_pktmbuf_reset(m);
 }
 
+int shim_rte_eth_dev_default_mac_addr_set(uint16_t port_id,
+                                           struct rte_ether_addr *mac_addr) {
+    return rte_eth_dev_default_mac_addr_set(port_id, mac_addr);
+}
+
 int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *pool,
                                  struct rte_mbuf **mbufs, unsigned count) {
     return rte_pktmbuf_alloc_bulk(pool, mbufs, count);

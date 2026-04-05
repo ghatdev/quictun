@@ -130,6 +130,26 @@ pub fn configure_port(
     Ok((mac.addr_bytes, hw_udp_cksum, hw_ip_cksum))
 }
 
+/// Override the MAC address of a running DPDK port.
+///
+/// Used when the NIC gets a random MAC after vfio-pci binding (e.g., virtio on
+/// Proxmox). Setting the original NIC MAC ensures the bridge/switch forwards
+/// frames correctly, especially for cross-subnet traffic.
+pub fn set_mac(port_id: u16, mac: [u8; 6]) -> Result<()> {
+    let mut addr = ffi::rte_ether_addr { addr_bytes: mac };
+    let ret = unsafe { ffi::shim_rte_eth_dev_default_mac_addr_set(port_id, &mut addr) };
+    if ret != 0 {
+        bail!("rte_eth_dev_default_mac_addr_set failed: {}", dpdk_strerror(-ret));
+    }
+    tracing::info!(
+        port = port_id,
+        mac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]),
+        "overrode port MAC address"
+    );
+    Ok(())
+}
+
 /// Configure and start a DPDK Ethernet port with N RX/TX queues and RSS.
 ///
 /// Returns `(mac_address, hw_udp_cksum, hw_ip_cksum)` on success.

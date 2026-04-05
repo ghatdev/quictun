@@ -206,6 +206,11 @@ pub struct EngineConfig {
     pub dpdk_cores: usize,
     pub dpdk_local_ip: Option<String>,
     pub dpdk_local_port: Option<u16>,
+    /// Override MAC address for the DPDK outer port.
+    /// Format: "aa:bb:cc:dd:ee:ff". If unset, uses the NIC's current MAC.
+    /// Set this to the NIC's original MAC when DPDK assigns a random one
+    /// (e.g., virtio-pci on Proxmox with MAC filtering).
+    pub dpdk_mac: Option<String>,
     #[serde(default = "default_dpdk_eal_args")]
     pub dpdk_eal_args: String,
     #[serde(default)]
@@ -258,6 +263,7 @@ impl Default for EngineConfig {
             dpdk_cores: 1,
             dpdk_local_ip: None,
             dpdk_local_port: None,
+            dpdk_mac: None,
             dpdk_eal_args: "-l;0;-n;4".to_owned(),
             dpdk_port: 0,
             no_udp_checksum: false,
