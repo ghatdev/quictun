@@ -126,8 +126,7 @@ listen_port = 443
 [engine]
 threads = 2                # 1 = single-thread, >1 = multi-core
 offload = true             # GRO/GSO (Linux)
-cc = "none"                # handshake CC (quinn)
-data_cc = "delay"          # data-plane CC: "none" or "delay"
+data_cc = "delay"          # data-plane CC: "none" (default) or "delay"
 
 [[peers]]
 public_key = "base64-encoded-public-key"
@@ -170,7 +169,6 @@ ciphers = ["aes-128-gcm"]
 backend = "dpdk-virtio"    # or "dpdk-router"
 dpdk_local_ip = "10.23.30.100"
 dpdk_cores = 1
-cc = "none"
 
 [[peers]]
 public_key = "base64-encoded-public-key"
