@@ -826,8 +826,7 @@ mod tests {
 
         // max_peers == 0 means connections.len() (0) >= max_peers (0) is always true,
         // so promote_handshake will reject. We can't test promote_handshake directly
-        // without a real HandshakeState, but we can verify the invariant:
-        assert!(mgr.len() >= 0); // 0 >= 0 triggers rejection
+        // without a real HandshakeState, but we verify the manager was created empty.
         assert_eq!(mgr.len(), 0);
     }
 }
