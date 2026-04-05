@@ -2,7 +2,7 @@
 
 > **Status: Experimental** — Under active development. APIs and config format may change.
 
-A high-performance VPN tunnel over QUIC + TLS 1.3 with Raw Public Keys (RFC 7250). P-256 ECDSA pinned identities, no certificate authorities.
+A high-performance VPN tunnel over QUIC + TLS 1.3
 
 ## Why
 
@@ -45,6 +45,7 @@ format (short header, AEAD encryption, header protection) and is wire-compatible
 RFC 9000 and RFC 9001 for the subset it implements.
 
 **What quictun-proto implements (RFC-compliant):**
+
 - Short header format, header protection, AEAD encrypt/decrypt (RFC 9000/9001)
 - DATAGRAM frames (RFC 9221), ACK frames, PING, PADDING, CONNECTION_CLOSE
 - Key update via key_phase bit rotation with pre-computed key generations
@@ -52,11 +53,13 @@ RFC 9000 and RFC 9001 for the subset it implements.
 - Fixed 4-byte packet number encoding for lock-free parallel encrypt
 
 **Intentionally omitted (by design):**
+
 - Streams, flow control — tunnel is DATAGRAM-only, fire-and-forget
 - Loss detection, retransmission — inner TCP handles its own recovery
 - Congestion control — avoids double-CC with inner TCP (delay-based CC planned)
 
 **Not yet implemented (planned):**
+
 - Connection migration + PATH_CHALLENGE/RESPONSE — tunnel drops on network change today
 - CID rotation — fixed CIDs allow observer tracking; rotation preserves privacy
 - Spin bit — passive RTT measurement for operators
