@@ -335,7 +335,6 @@ impl EngineConfig {
                 target_delay: Duration::from_millis(self.target_delay_ms),
                 initial_rate: self.initial_rate_mbps as f64 * 125_000.0,
                 min_rate: self.min_rate_mbps as f64 * 125_000.0,
-                rtt_window: Duration::from_secs(self.rtt_window_secs),
             }),
             _ => None,
         }

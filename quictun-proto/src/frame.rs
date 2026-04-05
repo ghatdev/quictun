@@ -244,6 +244,29 @@ pub fn build_ack(ranges: &[Range<u64>], ack_delay: u64, buf: &mut [u8]) -> usize
     pos
 }
 
+// ── OWD Timestamp frame (custom, type 0xFE) ────────────────────────────────
+
+/// Custom frame type for one-way delay measurement.
+/// Carries the sender's tx_timestamp (u32 microseconds, wrapping).
+pub const TIMESTAMP_TYPE: u8 = 0xFE;
+
+/// Build a TIMESTAMP frame: 1 byte type + 4 bytes big-endian u32.
+/// Returns bytes written (always 5).
+pub fn build_timestamp(tx_us: u32, buf: &mut [u8]) -> usize {
+    buf[0] = TIMESTAMP_TYPE;
+    buf[1..5].copy_from_slice(&tx_us.to_be_bytes());
+    5
+}
+
+/// Parse a TIMESTAMP frame. Returns `(tx_us, remaining)`.
+pub fn parse_timestamp(payload: &[u8]) -> Result<(u32, &[u8]), ParseError> {
+    if payload.len() < 5 || payload[0] != TIMESTAMP_TYPE {
+        return Err(ParseError::BufferTooShort);
+    }
+    let tx_us = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    Ok((tx_us, &payload[5..]))
+}
+
 // ── CONNECTION_CLOSE frame (RFC 9000 §19.19) ─────────────────────────────
 
 /// Build a CONNECTION_CLOSE frame (type 0x1c) into `buf`.

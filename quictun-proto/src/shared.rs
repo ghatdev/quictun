@@ -304,6 +304,7 @@ impl SharedConnectionState {
         let key_guard = self.tx.load_packet_key();
         crate::encrypt_ack_packet(
             &ack_ranges,
+            0, // TODO: track ack_delay in SharedConnectionState
             self.tx.remote_cid(),
             pn,
             self.tx.largest_acked(),

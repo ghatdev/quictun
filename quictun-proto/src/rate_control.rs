@@ -1,6 +1,9 @@
 //! Delay-based rate controller for the quictun data plane.
 //!
-//! Reacts to queuing delay only (not loss), avoiding double-CC with inner TCP.
+//! Uses one-way delay (OWD) measurement for queuing detection.
+//! The peer computes OWD from embedded timestamps and reports queuing delay
+//! in the ACK frame's ack_delay field. This avoids ACK timer jitter entirely.
+//!
 //! Rate-based with batch-level pacing — one comparison per TUN read iteration.
 
 use std::time::{Duration, Instant};
@@ -9,42 +12,79 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy)]
 pub struct RateControlConfig {
     /// Target queuing delay tolerance. The controller backs off when
-    /// `smoothed_rtt - min_rtt` exceeds this value.
+    /// the peer reports queuing delay exceeding this value.
     pub target_delay: Duration,
     /// Initial sending rate in bytes/sec.
     pub initial_rate: f64,
     /// Minimum sending rate floor in bytes/sec.
     pub min_rate: f64,
-    /// Window for the windowed minimum RTT. After this duration without a
-    /// new minimum, the stored `min_rtt` expires and resets to the next sample.
-    pub rtt_window: Duration,
 }
 
-/// Delay-based rate controller state.
+/// OWD tracking state (receiver side — tracks delay of packets we receive).
+///
+/// Embedded in `LocalConnectionState`. Computes queuing delay from sender
+/// timestamps and reports it in ACK frames.
+pub struct OwdTracker {
+    /// Windowed minimum OWD (wrapping microseconds, includes clock offset).
+    owd_min: i32,
+    /// When `owd_min` was last updated (for windowed expiry).
+    owd_min_ts: Instant,
+    /// Whether we have received at least one OWD sample.
+    initialized: bool,
+    /// Latest computed queuing delay to report in the next ACK.
+    pub queuing_delay_us: u64,
+}
+
+/// OWD minimum window — how long before owd_min expires and resets.
+const OWD_MIN_WINDOW: Duration = Duration::from_secs(10);
+
+impl Default for OwdTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OwdTracker {
+    pub fn new() -> Self {
+        Self {
+            owd_min: i32::MAX,
+            owd_min_ts: Instant::now(),
+            initialized: false,
+            queuing_delay_us: 0,
+        }
+    }
+
+    /// Process an incoming data packet's tx_timestamp.
+    /// Computes OWD and updates the queuing delay for the next ACK.
+    pub fn on_data_received(&mut self, tx_us: u32) {
+        let rx_us = (crate::coarse_now_ns() / 1000) as u32;
+        let owd = rx_us.wrapping_sub(tx_us) as i32;
+
+        if !self.initialized || owd < self.owd_min || self.owd_min_ts.elapsed() > OWD_MIN_WINDOW {
+            self.owd_min = owd;
+            self.owd_min_ts = Instant::now();
+            self.initialized = true;
+        }
+
+        let queuing = (owd - self.owd_min).max(0) as u64;
+        self.queuing_delay_us = queuing;
+    }
+}
+
+/// Delay-based rate controller state (sender side).
 ///
 /// Embedded in `LocalConnectionState` as `Option<RateController>`.
 /// When `None`, the connection operates without CC (zero overhead).
+///
+/// Receives queuing delay from the peer's ACK frame and adjusts sending rate.
 pub struct RateController {
     config: RateControlConfig,
-
-    // ── RTT tracking ────────────────────────────────────────────────
-    /// Windowed minimum RTT (base RTT estimate).
-    min_rtt: Duration,
-    /// When `min_rtt` was last updated.
-    min_rtt_ts: Instant,
-    /// Exponentially weighted moving average of RTT, in seconds.
-    smoothed_rtt: f64,
-    /// Whether we have received at least one RTT sample.
-    rtt_initialized: bool,
-
-    // ── RTT probe ───────────────────────────────────────────────────
-    /// Outstanding RTT probe: (packet_number, send_time).
-    /// Only one probe is active at a time. Cleared when ACK arrives.
-    probe: Option<(u64, Instant)>,
 
     // ── Rate state ──────────────────────────────────────────────────
     /// Current sending rate in bytes/sec.
     rate: f64,
+    /// Whether we've received at least one queuing sample.
+    active: bool,
 
     // ── Interval tracking (batch-level pacing) ──────────────────────
     /// Bytes sent since the current pacing interval started.
@@ -52,9 +92,6 @@ pub struct RateController {
     /// Start of the current pacing interval.
     interval_start: Instant,
 }
-
-/// EWMA smoothing factor (RFC 6298 style).
-const EWMA_ALPHA: f64 = 0.125;
 
 /// Maximum pacing interval before auto-reset (prevents stale budget after idle).
 const MAX_INTERVAL: Duration = Duration::from_millis(100);
@@ -71,57 +108,55 @@ const DECREASE_GAIN: f64 = 0.2;
 impl RateController {
     /// Create a new rate controller with the given configuration.
     pub fn new(config: RateControlConfig) -> Self {
-        let now = Instant::now();
         Self {
             rate: config.initial_rate,
             config,
-            min_rtt: Duration::MAX,
-            min_rtt_ts: now,
-            smoothed_rtt: 0.0,
-            rtt_initialized: false,
-            probe: None,
+            active: false,
             bytes_sent: 0,
-            interval_start: now,
+            interval_start: Instant::now(),
         }
     }
 
-    /// Called after a data packet is encrypted and assigned a PN.
-    /// Marks this packet as the RTT probe if no probe is outstanding.
-    #[inline]
-    pub fn on_packet_sent(&mut self, pn: u64) {
-        if self.probe.is_none() {
-            self.probe = Some((pn, Instant::now()));
-        }
-    }
-
-    /// Called when an ACK is received. If the ACK covers the probe packet,
-    /// computes an RTT sample and adjusts the sending rate.
-    pub fn on_ack(&mut self, largest_acked: u64) {
-        let (probe_pn, send_time) = match self.probe {
-            Some((pn, ts)) if largest_acked >= pn => (pn, ts),
-            _ => return,
-        };
-        // Clear the probe so the next encrypt_datagram will set a new one.
-        self.probe = None;
-        let _ = probe_pn; // used only for the guard above
-
-        let rtt = send_time.elapsed();
-        self.update_rtt(rtt);
-        self.adjust_rate();
-    }
-
-    /// Returns `true` if the rate controller allows more data to be sent
-    /// in the current pacing interval.
+    /// Called when an ACK is received with the peer's reported queuing delay.
     ///
-    /// Before the first RTT sample, always returns `true` (no data to pace with).
+    /// `queuing_delay_us` is computed by the peer from OWD measurements
+    /// and carried in the ACK frame's ack_delay field.
+    pub fn on_ack(&mut self, queuing_delay_us: u64) {
+        self.active = true;
+        let rate_before = self.rate;
+
+        let queuing = queuing_delay_us as f64 / 1_000_000.0;
+        let target = self.config.target_delay.as_secs_f64();
+
+        if queuing < target * 0.2 {
+            // Well below target: increase rate.
+            self.rate *= INCREASE_FACTOR;
+        } else if queuing > target {
+            // Above target: proportional decrease, capped.
+            let excess = queuing / target;
+            let factor = (1.0 - DECREASE_GAIN * excess).max(MAX_DECREASE);
+            self.rate *= factor;
+        }
+        // else: near target, hold.
+
+        self.rate = self.rate.max(self.config.min_rate);
+
+        tracing::debug!(
+            queuing_us = queuing_delay_us,
+            rate_mbps = (self.rate * 8.0 / 1_000_000.0) as u64,
+            rate_before_mbps = (rate_before * 8.0 / 1_000_000.0) as u64,
+            "cc: rate adjustment"
+        );
+    }
+
+    /// Returns `true` if the rate controller allows more data to be sent.
     #[inline]
     pub fn can_send(&self) -> bool {
-        if !self.rtt_initialized {
+        if !self.active {
             return true;
         }
         let elapsed = self.interval_start.elapsed();
         if elapsed >= MAX_INTERVAL {
-            // Stale interval — will be reset on next on_bytes_sent().
             return true;
         }
         let allowed = self.rate * elapsed.as_secs_f64();
@@ -131,7 +166,6 @@ impl RateController {
     /// Record that `bytes` were sent on the wire.
     #[inline]
     pub fn on_bytes_sent(&mut self, bytes: usize) {
-        // Auto-reset interval if stale (after idle or long poll cycle).
         if self.interval_start.elapsed() >= MAX_INTERVAL {
             self.bytes_sent = 0;
             self.interval_start = Instant::now();
@@ -144,49 +178,6 @@ impl RateController {
     pub fn current_rate_bps(&self) -> f64 {
         self.rate * 8.0
     }
-
-    // ── Internal ────────────────────────────────────────────────────
-
-    fn update_rtt(&mut self, rtt: Duration) {
-        let rtt_secs = rtt.as_secs_f64();
-
-        // Windowed minimum RTT.
-        if rtt < self.min_rtt || self.min_rtt_ts.elapsed() > self.config.rtt_window {
-            self.min_rtt = rtt;
-            self.min_rtt_ts = Instant::now();
-        }
-
-        // EWMA smoothed RTT.
-        if !self.rtt_initialized {
-            self.smoothed_rtt = rtt_secs;
-            self.rtt_initialized = true;
-        } else {
-            self.smoothed_rtt =
-                (1.0 - EWMA_ALPHA) * self.smoothed_rtt + EWMA_ALPHA * rtt_secs;
-        }
-    }
-
-    fn adjust_rate(&mut self) {
-        let min_rtt_secs = self.min_rtt.as_secs_f64();
-        if min_rtt_secs <= 0.0 {
-            return;
-        }
-        let queuing_delay = (self.smoothed_rtt - min_rtt_secs).max(0.0);
-        let target = self.config.target_delay.as_secs_f64();
-
-        if queuing_delay < target * 0.2 {
-            // Well below target: increase rate.
-            self.rate *= INCREASE_FACTOR;
-        } else if queuing_delay > target {
-            // Above target: proportional decrease, capped.
-            let excess = queuing_delay / target;
-            let factor = (1.0 - DECREASE_GAIN * excess).max(MAX_DECREASE);
-            self.rate *= factor;
-        }
-        // else: near target, hold.
-
-        self.rate = self.rate.max(self.config.min_rate);
-    }
 }
 
 #[cfg(test)]
@@ -198,7 +189,6 @@ mod tests {
             target_delay: Duration::from_millis(5),
             initial_rate: 125_000_000.0, // 1 Gbps
             min_rate: 1_250_000.0,       // 10 Mbps
-            rtt_window: Duration::from_secs(10),
         }
     }
 
@@ -206,13 +196,12 @@ mod tests {
     fn initial_state_allows_send() {
         let rc = RateController::new(test_config());
         assert!(rc.can_send());
-        assert!(!rc.rtt_initialized);
+        assert!(!rc.active);
     }
 
     #[test]
-    fn can_send_before_rtt_always_true() {
+    fn can_send_before_active_always_true() {
         let mut rc = RateController::new(test_config());
-        // Send a lot of bytes — should still allow because no RTT yet.
         rc.on_bytes_sent(1_000_000_000);
         assert!(rc.can_send());
     }
@@ -220,156 +209,99 @@ mod tests {
     #[test]
     fn budget_enforcement() {
         let mut rc = RateController::new(test_config());
-        // Force RTT initialization with a fake sample.
-        rc.update_rtt(Duration::from_millis(1));
-        // Reset interval to now.
+        rc.on_ack(0); // activate with zero queuing
         rc.bytes_sent = 0;
         rc.interval_start = Instant::now();
-        // At 1 Gbps = 125 MB/s, in 1ms we can send ~125 KB.
-        // Sending 200 MB should exceed budget immediately.
         rc.on_bytes_sent(200_000_000);
         assert!(!rc.can_send());
     }
 
     #[test]
-    fn rtt_probe_lifecycle() {
-        let mut rc = RateController::new(test_config());
-
-        // No probe initially.
-        assert!(rc.probe.is_none());
-
-        // First packet sets probe.
-        rc.on_packet_sent(0);
-        assert!(rc.probe.is_some());
-        assert_eq!(rc.probe.unwrap().0, 0);
-
-        // Second packet doesn't overwrite.
-        rc.on_packet_sent(1);
-        assert_eq!(rc.probe.unwrap().0, 0);
-
-        // ACK for pn 0 computes RTT and clears probe.
-        std::thread::sleep(Duration::from_millis(1));
-        rc.on_ack(0);
-        assert!(rc.probe.is_none());
-        assert!(rc.rtt_initialized);
-
-        // Next packet sets a new probe.
-        rc.on_packet_sent(2);
-        assert_eq!(rc.probe.unwrap().0, 2);
-    }
-
-    #[test]
-    fn ack_below_probe_is_ignored() {
-        let mut rc = RateController::new(test_config());
-        rc.on_packet_sent(5);
-        rc.on_ack(3); // below probe pn=5
-        assert!(rc.probe.is_some()); // not cleared
-        assert!(!rc.rtt_initialized);
-    }
-
-    #[test]
-    fn rate_increases_on_low_delay() {
+    fn rate_increases_on_low_queuing() {
         let mut rc = RateController::new(test_config());
         let initial_rate = rc.rate;
-
-        // Simulate: min_rtt = 1ms, smoothed_rtt = 1ms (zero queuing).
-        rc.update_rtt(Duration::from_millis(1));
-        rc.adjust_rate();
-
+        rc.on_ack(0); // zero queuing
         assert!(rc.rate > initial_rate);
     }
 
     #[test]
-    fn rate_decreases_on_high_delay() {
+    fn rate_decreases_on_high_queuing() {
         let mut rc = RateController::new(test_config());
-
-        // Establish min_rtt = 1ms.
-        rc.update_rtt(Duration::from_millis(1));
-        let rate_after_init = rc.rate;
-
-        // Simulate high queuing: smoothed_rtt jumps to 20ms (19ms queuing >> 5ms target).
-        for _ in 0..20 {
-            rc.update_rtt(Duration::from_millis(20));
-        }
-        rc.adjust_rate();
-
-        assert!(rc.rate < rate_after_init);
-    }
-
-    #[test]
-    fn rate_never_below_min() {
-        let mut rc = RateController::new(test_config());
-
-        // Set very low rate, then force decrease.
-        rc.rate = rc.config.min_rate;
-        rc.update_rtt(Duration::from_millis(1));
-        // Simulate massive queuing delay.
-        rc.smoothed_rtt = 1.0; // 1 second
-        rc.adjust_rate();
-
-        assert_eq!(rc.rate, rc.config.min_rate);
-    }
-
-    #[test]
-    fn min_rtt_window_expiry() {
-        let config = RateControlConfig {
-            rtt_window: Duration::from_millis(50), // short window for testing
-            ..test_config()
-        };
-        let mut rc = RateController::new(config);
-
-        // Set min_rtt = 1ms.
-        rc.update_rtt(Duration::from_millis(1));
-        assert_eq!(rc.min_rtt, Duration::from_millis(1));
-
-        // Wait for window to expire.
-        std::thread::sleep(Duration::from_millis(60));
-
-        // New sample at 5ms should replace expired min_rtt.
-        rc.update_rtt(Duration::from_millis(5));
-        assert_eq!(rc.min_rtt, Duration::from_millis(5));
-    }
-
-    #[test]
-    fn interval_auto_reset_after_idle() {
-        let mut rc = RateController::new(test_config());
-        rc.update_rtt(Duration::from_millis(1));
-
-        // Send some bytes, exhaust budget.
-        rc.on_bytes_sent(200_000_000);
-        assert!(!rc.can_send());
-
-        // Simulate idle period > MAX_INTERVAL.
-        rc.interval_start = Instant::now() - Duration::from_millis(200);
-
-        // can_send should return true (stale interval).
-        assert!(rc.can_send());
-
-        // on_bytes_sent should reset interval.
-        rc.on_bytes_sent(100);
-        assert_eq!(rc.bytes_sent, 100); // reset, not accumulated
-    }
-
-    #[test]
-    fn current_rate_bps() {
-        let rc = RateController::new(test_config());
-        // 125 MB/s * 8 = 1 Gbps
-        assert!((rc.current_rate_bps() - 1_000_000_000.0).abs() < 1.0);
+        let initial_rate = rc.rate;
+        rc.on_ack(10_000); // 10ms queuing >> 5ms target
+        assert!(rc.rate < initial_rate);
     }
 
     #[test]
     fn rate_holds_near_target() {
         let mut rc = RateController::new(test_config());
-
-        // min_rtt = 1ms, target = 5ms, so hold zone is 1ms..5ms queuing.
-        rc.update_rtt(Duration::from_millis(1));
+        rc.on_ack(0); // activate
         let rate_before = rc.rate;
-
-        // Set smoothed_rtt to 4ms (3ms queuing, within 1ms..5ms hold zone).
-        rc.smoothed_rtt = 0.004;
-        rc.adjust_rate();
-
-        // Rate should not change (hold zone).
+        rc.on_ack(3000); // 3ms queuing, within 1ms..5ms hold zone
         assert_eq!(rc.rate, rate_before);
+    }
+
+    #[test]
+    fn rate_never_below_min() {
+        let mut rc = RateController::new(test_config());
+        rc.rate = rc.config.min_rate;
+        rc.on_ack(100_000); // 100ms queuing — massive
+        assert_eq!(rc.rate, rc.config.min_rate);
+    }
+
+    #[test]
+    fn interval_auto_reset_after_idle() {
+        let mut rc = RateController::new(test_config());
+        rc.on_ack(0); // activate
+        rc.on_bytes_sent(200_000_000);
+        assert!(!rc.can_send());
+        rc.interval_start = Instant::now() - Duration::from_millis(200);
+        assert!(rc.can_send());
+        rc.on_bytes_sent(100);
+        assert_eq!(rc.bytes_sent, 100);
+    }
+
+    #[test]
+    fn current_rate_bps() {
+        let rc = RateController::new(test_config());
+        assert!((rc.current_rate_bps() - 1_000_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn owd_tracker_basic() {
+        let mut tracker = OwdTracker::new();
+        assert!(!tracker.initialized);
+        assert_eq!(tracker.queuing_delay_us, 0);
+
+        // First sample — becomes the baseline.
+        let tx = (crate::coarse_now_ns() / 1000) as u32;
+        tracker.on_data_received(tx);
+        assert!(tracker.initialized);
+        assert_eq!(tracker.queuing_delay_us, 0); // no queuing on first sample
+
+        // Same-time sample — still zero queuing.
+        let tx2 = (crate::coarse_now_ns() / 1000) as u32;
+        tracker.on_data_received(tx2);
+        // Queuing should be very small (just processing time).
+        assert!(tracker.queuing_delay_us < 1000); // less than 1ms
+    }
+
+    #[test]
+    fn owd_tracker_detects_queuing() {
+        let mut tracker = OwdTracker::new();
+
+        // Establish baseline: tx was 1000us ago, rx is now.
+        let now_us = (crate::coarse_now_ns() / 1000) as u32;
+        let tx_baseline = now_us.wrapping_sub(1000); // 1ms ago
+        tracker.on_data_received(tx_baseline);
+        assert_eq!(tracker.queuing_delay_us, 0);
+
+        // Now a packet that experienced 5ms more delay:
+        // tx was 6000us ago (1ms propagation + 5ms queuing), rx is now.
+        let tx_delayed = now_us.wrapping_sub(6000);
+        tracker.on_data_received(tx_delayed);
+        // Should detect ~5000us of queuing.
+        assert!(tracker.queuing_delay_us >= 4000);
+        assert!(tracker.queuing_delay_us <= 6000);
     }
 }

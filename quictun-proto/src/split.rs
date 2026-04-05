@@ -138,6 +138,7 @@ impl TxState {
             &**self.tx_header_key,
             self.tag_len,
             buf,
+            None, // no OWD timestamp in split/DPDK path
         )
     }
 }
@@ -450,6 +451,7 @@ impl SplitConnectionState {
         let key_guard = self.tx.tx_packet_key.load();
         encrypt_ack_packet(
             &ack_ranges,
+            0, // TODO: track ack_delay in SplitConnectionState
             &self.tx.remote_cid,
             pn,
             self.tx.largest_acked(),
@@ -491,6 +493,7 @@ impl LocalConnectionState {
             largest_rx_pn,
             received,
             last_acked_pn: _,
+            owd_tracker: _,
             rate_controller: _,
         } = self;
 

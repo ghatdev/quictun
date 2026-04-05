@@ -72,6 +72,8 @@ pub struct DecryptedPacket {
     pub pn: u64,
     /// True if a CONNECTION_CLOSE frame was received.
     pub close_received: bool,
+    /// Sender's OWD timestamp (microseconds, wrapping u32) if present.
+    pub tx_timestamp: Option<u32>,
 }
 
 /// Result of decrypting a 1-RTT packet fully in-place (zero-copy).
@@ -87,6 +89,8 @@ pub struct DecryptedInPlace {
     pub pn: u64,
     /// True if a CONNECTION_CLOSE frame was received.
     pub close_received: bool,
+    /// Sender's OWD timestamp (microseconds, wrapping u32) if present.
+    pub tx_timestamp: Option<u32>,
 }
 
 /// Result of encrypting a datagram into a 1-RTT packet.
@@ -184,6 +188,7 @@ pub fn encrypt_packet(
     tx_header_key: &dyn HeaderKey,
     tag_len: usize,
     buf: &mut [u8],
+    tx_timestamp: Option<u32>,
 ) -> Result<EncryptResult, ParseError> {
     let (header_len, _pn_len) = packet::build_short_header(
         remote_cid,
@@ -195,6 +200,11 @@ pub fn encrypt_packet(
     );
 
     let mut frame_pos = header_len;
+
+    // OWD timestamp frame (must come before DATAGRAM_NO_LEN which consumes rest of packet).
+    if let Some(ts) = tx_timestamp {
+        frame_pos += frame::build_timestamp(ts, &mut buf[frame_pos..]);
+    }
 
     if !payload.is_empty() {
         let dg_len = frame::build_datagram_no_len(payload, &mut buf[frame_pos..]);
@@ -251,6 +261,7 @@ pub fn encrypt_packet_in_place(
 #[allow(clippy::too_many_arguments)]
 pub fn encrypt_ack_packet(
     ack_ranges: &[Range<u64>],
+    ack_delay_us: u64,
     remote_cid: &ConnectionId,
     pn: u64,
     largest_acked: u64,
@@ -272,7 +283,7 @@ pub fn encrypt_ack_packet(
     let mut frame_pos = header_len;
 
     if !ack_ranges.is_empty() {
-        let ack_len = frame::build_ack(ack_ranges, 0, &mut buf[frame_pos..]);
+        let ack_len = frame::build_ack(ack_ranges, ack_delay_us, &mut buf[frame_pos..]);
         frame_pos += ack_len;
     }
 
@@ -327,6 +338,7 @@ fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, Pars
     let mut datagrams: SmallVec<[Bytes; 4]> = SmallVec::new();
     let mut ack_frame = None;
     let mut close_received = false;
+    let mut tx_timestamp = None;
     let mut pos = 0;
     let decrypted_len = decrypted.len();
 
@@ -345,6 +357,11 @@ fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, Pars
                 let data_start = pos + (data.as_ptr() as usize - remaining.as_ptr() as usize);
                 let data_end = data_start + data.len();
                 datagrams.push(decrypted.slice(data_start..data_end));
+                pos = decrypted_len - rest.len();
+            }
+            frame::TIMESTAMP_TYPE => {
+                let (ts, rest) = frame::parse_timestamp(&decrypted[pos..])?;
+                tx_timestamp = Some(ts);
                 pos = decrypted_len - rest.len();
             }
             0x1c | 0x1d => {
@@ -366,6 +383,7 @@ fn parse_frames_bytes(decrypted: Bytes, pn: u64) -> Result<DecryptedPacket, Pars
         ack: ack_frame,
         pn,
         close_received,
+        tx_timestamp,
     })
 }
 
@@ -378,6 +396,7 @@ fn parse_frames_in_place(
     let mut datagrams: SmallVec<[Range<usize>; 4]> = SmallVec::new();
     let mut ack_frame = None;
     let mut close_received = false;
+    let mut tx_timestamp = None;
     let mut pos = 0;
     let decrypted_len = decrypted.len();
 
@@ -399,6 +418,11 @@ fn parse_frames_in_place(
                 datagrams.push(data_start..data_end);
                 pos = decrypted_len - rest.len();
             }
+            frame::TIMESTAMP_TYPE => {
+                let (ts, rest) = frame::parse_timestamp(&decrypted[pos..])?;
+                tx_timestamp = Some(ts);
+                pos = decrypted_len - rest.len();
+            }
             0x1c | 0x1d => {
                 close_received = true;
                 break;
@@ -418,6 +442,7 @@ fn parse_frames_in_place(
         ack: ack_frame,
         pn,
         close_received,
+        tx_timestamp,
     })
 }
 
