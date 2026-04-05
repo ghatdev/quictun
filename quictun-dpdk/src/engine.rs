@@ -917,14 +917,12 @@ pub fn run(
                                             remote_ip,
                                             identity.local_port,
                                             entry.remote_addr.port(),
-                                            result.len,
+                                            &ack_buf[..result.len],
                                             buf,
                                             0,
                                             ip_id,
                                             checksum_mode,
                                         );
-                                        buf[net::HEADER_SIZE..frame_len]
-                                            .copy_from_slice(&ack_buf[..result.len]);
                                         match checksum_mode {
                                             ChecksumMode::HardwareUdpOnly => {
                                                 mbuf.set_tx_udp_checksum_offload()
@@ -942,11 +940,12 @@ pub fn run(
                     }
                     // Flush ACK mbufs.
                     if !outer_tx_mbufs.is_empty() {
+                        let nb = outer_tx_mbufs.len() as u16;
                         let sent = port::tx_burst(
-                            outer_port_id, queue_id, &mut outer_tx_mbufs,
+                            outer_port_id, queue_id, &mut outer_tx_mbufs, nb,
                         );
-                        for &ptr in &outer_tx_mbufs[sent..] {
-                            unsafe { ffi::rte_pktmbuf_free(ptr) };
+                        for &ptr in &outer_tx_mbufs[sent as usize..] {
+                            unsafe { ffi::shim_rte_pktmbuf_free(ptr) };
                         }
                         tx_pkts += sent as u64;
                         outer_tx_mbufs.clear();
@@ -1908,7 +1907,8 @@ pub fn run_worker(
 
                     if let Some(ref ack) = decrypted.ack {
                         entry.conn.process_ack(ack);
-                        entry.on_ack(ack);
+                        // Note: ConnectionEntry doesn't have CC state — on_ack is
+                        // on ConnEntry in the pipeline I/O thread's manager instead.
                     }
                     for range in &decrypted.datagrams {
                         let abs_start = payload_offset + range.start;
