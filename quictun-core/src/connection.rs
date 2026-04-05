@@ -10,9 +10,14 @@ use crate::config::CipherSuite;
 
 // ── Crypto provider ──────────────────────────────────────────────────────────
 
-/// Build a `CryptoProvider` with the specified cipher suites.
-fn make_crypto_provider(suites: &[CipherSuite]) -> rustls::crypto::CryptoProvider {
+/// Build a `CryptoProvider` with the specified cipher suites and optional
+/// post-quantum hybrid key exchange.
+fn make_crypto_provider(
+    suites: &[CipherSuite],
+    post_quantum: bool,
+) -> rustls::crypto::CryptoProvider {
     use rustls::crypto::aws_lc_rs::cipher_suite;
+    use rustls::crypto::aws_lc_rs::kx_group;
 
     let cipher_suites: Vec<rustls::SupportedCipherSuite> = suites
         .iter()
@@ -23,8 +28,18 @@ fn make_crypto_provider(suites: &[CipherSuite]) -> rustls::crypto::CryptoProvide
         })
         .collect();
 
+    let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = if post_quantum {
+        vec![
+            kx_group::X25519MLKEM768,
+            kx_group::X25519,
+        ]
+    } else {
+        vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1]
+    };
+
     rustls::crypto::CryptoProvider {
         cipher_suites,
+        kx_groups,
         ..rustls::crypto::aws_lc_rs::default_provider()
     }
 }
@@ -84,12 +99,13 @@ pub fn build_rustls_server_tls_config(
     private_key: &PrivateKey,
     allowed_peers: &[PublicKey],
     cipher_suites: &[CipherSuite],
+    post_quantum: bool,
 ) -> Result<Arc<rustls::ServerConfig>> {
     let certified_key = private_key
         .to_certified_key()
         .context("failed to build server certified key")?;
 
-    let provider = make_crypto_provider(cipher_suites);
+    let provider = make_crypto_provider(cipher_suites, post_quantum);
     let verifier = PinnedRpkClientVerifier::new(allowed_peers);
 
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
@@ -121,12 +137,13 @@ pub fn build_rustls_client_tls_config(
     server_pubkey: &PublicKey,
     cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
+    post_quantum: bool,
 ) -> Result<Arc<rustls::ClientConfig>> {
     let certified_key = private_key
         .to_certified_key()
         .context("failed to build client certified key")?;
 
-    let provider = make_crypto_provider(cipher_suites);
+    let provider = make_crypto_provider(cipher_suites, post_quantum);
     let verifier = PinnedRpkServerVerifier::new(std::slice::from_ref(server_pubkey));
 
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -157,8 +174,9 @@ pub fn build_server_config(
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
     cipher_suites: &[CipherSuite],
+    post_quantum: bool,
 ) -> Result<quinn::ServerConfig> {
-    let tls_config = build_rustls_server_tls_config(private_key, allowed_peers, cipher_suites)?;
+    let tls_config = build_rustls_server_tls_config(private_key, allowed_peers, cipher_suites, post_quantum)?;
 
     let quic_crypto = make_quic_server_config(tls_config, cipher_suites)?;
 
@@ -176,12 +194,14 @@ pub fn build_client_config(
     tuning: &TransportTuning,
     cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
+    post_quantum: bool,
 ) -> Result<quinn::ClientConfig> {
     let tls_config = build_rustls_client_tls_config(
         private_key,
         server_pubkey,
         cipher_suites,
         enable_session_resumption,
+        post_quantum,
     )?;
 
     let quic_crypto = make_quic_client_config(tls_config, cipher_suites)?;
@@ -237,12 +257,13 @@ pub fn build_rustls_server_tls_config_x509(
     key_file: &Path,
     client_ca_file: &Path,
     cipher_suites: &[CipherSuite],
+    post_quantum: bool,
 ) -> Result<Arc<rustls::ServerConfig>> {
     let cert_chain = load_certs_from_pem(cert_file)?;
     let private_key = load_private_key_from_pem(key_file)?;
     let client_ca_roots = load_ca_roots(client_ca_file)?;
 
-    let provider = make_crypto_provider(cipher_suites);
+    let provider = make_crypto_provider(cipher_suites, post_quantum);
 
     let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_ca_roots))
         .build()
@@ -274,12 +295,13 @@ pub fn build_rustls_client_tls_config_x509(
     server_ca_file: &Path,
     cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
+    post_quantum: bool,
 ) -> Result<Arc<rustls::ClientConfig>> {
     let cert_chain = load_certs_from_pem(cert_file)?;
     let private_key = load_private_key_from_pem(key_file)?;
     let server_ca_roots = load_ca_roots(server_ca_file)?;
 
-    let provider = make_crypto_provider(cipher_suites);
+    let provider = make_crypto_provider(cipher_suites, post_quantum);
 
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -309,9 +331,10 @@ pub fn build_server_config_x509(
     keepalive: Option<Duration>,
     tuning: &TransportTuning,
     cipher_suites: &[CipherSuite],
+    post_quantum: bool,
 ) -> Result<quinn::ServerConfig> {
     let tls_config =
-        build_rustls_server_tls_config_x509(cert_file, key_file, client_ca_file, cipher_suites)?;
+        build_rustls_server_tls_config_x509(cert_file, key_file, client_ca_file, cipher_suites, post_quantum)?;
 
     let quic_crypto = make_quic_server_config(tls_config, cipher_suites)?;
 
@@ -322,6 +345,7 @@ pub fn build_server_config_x509(
 }
 
 /// Build a quinn `ClientConfig` with X.509 certificate authentication.
+#[allow(clippy::too_many_arguments)]
 pub fn build_client_config_x509(
     cert_file: &Path,
     key_file: &Path,
@@ -330,6 +354,7 @@ pub fn build_client_config_x509(
     tuning: &TransportTuning,
     cipher_suites: &[CipherSuite],
     enable_session_resumption: bool,
+    post_quantum: bool,
 ) -> Result<quinn::ClientConfig> {
     let tls_config = build_rustls_client_tls_config_x509(
         cert_file,
@@ -337,6 +362,7 @@ pub fn build_client_config_x509(
         server_ca_file,
         cipher_suites,
         enable_session_resumption,
+        post_quantum,
     )?;
 
     let quic_crypto = make_quic_client_config(tls_config, cipher_suites)?;

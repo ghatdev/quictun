@@ -26,6 +26,7 @@ async fn datagram_echo_round_trip() -> Result<()> {
         keepalive,
         &TransportTuning::default(),
         &all_ciphers,
+        false,
     )?;
     let client_config = connection::build_client_config(
         &client_key,
@@ -33,6 +34,7 @@ async fn datagram_echo_round_trip() -> Result<()> {
         keepalive,
         &TransportTuning::default(),
         &all_ciphers,
+        false,
         false,
     )?;
 
@@ -106,6 +108,7 @@ async fn rejects_unknown_client_key() -> Result<()> {
         keepalive,
         &TransportTuning::default(),
         &all_ciphers,
+        false,
     )?;
 
     // Unauthorized client tries to connect
@@ -115,6 +118,7 @@ async fn rejects_unknown_client_key() -> Result<()> {
         keepalive,
         &TransportTuning::default(),
         &all_ciphers,
+        false,
         false,
     )?;
 

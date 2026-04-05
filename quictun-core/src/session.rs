@@ -220,6 +220,7 @@ pub fn build_endpoint_setup(config: &Config) -> Result<EndpointSetup> {
     let tuning = build_transport_tuning(config)?;
     let (server_ciphers, client_ciphers) = resolve_cipher_suites(config)?;
     let first_keepalive = peers.first().and_then(|p| p.keepalive.map(Duration::from_secs));
+    let pq = config.interface.post_quantum;
 
     if is_x509(config) {
         let cert_file = Path::new(
@@ -236,7 +237,7 @@ pub fn build_endpoint_setup(config: &Config) -> Result<EndpointSetup> {
             Mode::Listener => {
                 let server_config = proto_config::build_proto_server_config_x509(
                     cert_file, key_file, ca_file, first_keepalive,
-                    &tuning, &server_ciphers,
+                    &tuning, &server_ciphers, pq,
                 )?;
                 Ok(EndpointSetup::Listener { server_config })
             }
@@ -245,7 +246,7 @@ pub fn build_endpoint_setup(config: &Config) -> Result<EndpointSetup> {
                 let keepalive = peer.keepalive.map(Duration::from_secs);
                 let client_config = proto_config::build_proto_client_config_x509(
                     cert_file, key_file, ca_file, keepalive,
-                    &tuning, &client_ciphers, config.interface.zero_rtt,
+                    &tuning, &client_ciphers, config.interface.zero_rtt, pq,
                 )?;
                 let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
                 Ok(EndpointSetup::Connector { remote_addr, client_config })
@@ -267,7 +268,7 @@ pub fn build_endpoint_setup(config: &Config) -> Result<EndpointSetup> {
             Mode::Listener => {
                 let server_config = proto_config::build_proto_server_config(
                     &private_key, &peer_pubkeys, first_keepalive,
-                    &tuning, &server_ciphers,
+                    &tuning, &server_ciphers, pq,
                 )?;
                 Ok(EndpointSetup::Listener { server_config })
             }
@@ -277,7 +278,7 @@ pub fn build_endpoint_setup(config: &Config) -> Result<EndpointSetup> {
                 let keepalive = peer.keepalive.map(Duration::from_secs);
                 let client_config = proto_config::build_proto_client_config(
                     &private_key, peer_pubkey, keepalive,
-                    &tuning, &client_ciphers, config.interface.zero_rtt,
+                    &tuning, &client_ciphers, config.interface.zero_rtt, pq,
                 )?;
                 let remote_addr = peer.endpoint.context("connector requires peer endpoint")?;
                 Ok(EndpointSetup::Connector { remote_addr, client_config })

@@ -39,6 +39,7 @@ fn make_endpoints(
         keepalive,
         &tuning,
         cipher_suites,
+        false,
     )?;
     let client_config = connection::build_client_config(
         &client_key,
@@ -46,6 +47,7 @@ fn make_endpoints(
         keepalive,
         &tuning,
         cipher_suites,
+        false,
         false,
     )?;
 
@@ -187,6 +189,7 @@ async fn idle_timeout_config() -> Result<()> {
         None, // no keepalive
         &tuning,
         &all_ciphers,
+        false,
     )?;
     let client_config = connection::build_client_config(
         &client_key,
@@ -194,6 +197,7 @@ async fn idle_timeout_config() -> Result<()> {
         None,
         &tuning,
         &all_ciphers,
+        false,
         false,
     )?;
 
@@ -308,6 +312,7 @@ async fn session_resumption_reconnect() -> Result<()> {
         keepalive,
         &tuning,
         &all_ciphers,
+        false,
     )?;
 
     // Enable session resumption
@@ -318,6 +323,7 @@ async fn session_resumption_reconnect() -> Result<()> {
         &tuning,
         &all_ciphers,
         true, // enable_session_resumption
+        false,
     )?;
 
     let server_endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse()?)?;
@@ -435,6 +441,7 @@ async fn x509_echo_round_trip() -> Result<()> {
         keepalive,
         &tuning,
         &CipherSuite::all(),
+        false,
     )?;
 
     let client_config = connection::build_client_config_x509(
@@ -444,6 +451,7 @@ async fn x509_echo_round_trip() -> Result<()> {
         keepalive,
         &tuning,
         &CipherSuite::all(),
+        false,
         false,
     )?;
 
@@ -488,6 +496,7 @@ async fn x509_rejects_untrusted_client() -> Result<()> {
         keepalive,
         &tuning,
         &CipherSuite::all(),
+        false,
     )?;
 
     // Client uses rogue cert NOT signed by the CA
@@ -498,6 +507,7 @@ async fn x509_rejects_untrusted_client() -> Result<()> {
         keepalive,
         &tuning,
         &CipherSuite::all(),
+        false,
         false,
     )?;
 

@@ -169,6 +169,9 @@ pub struct InterfaceConfig {
     pub ciphers: Option<Vec<String>>,
     #[serde(default)]
     pub zero_rtt: bool,
+    /// Enable hybrid post-quantum key exchange (X25519MLKEM768).
+    #[serde(default)]
+    pub post_quantum: bool,
     #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
     pub cert_file: Option<String>,
