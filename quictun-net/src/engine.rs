@@ -131,7 +131,6 @@ pub struct NetConfig {
     pub offload: bool,
     pub batch_size: usize,
     pub gso_max_segments: usize,
-    pub ack_interval: u32,
     pub ack_timer_ms: u32,
     pub tun_write_buf_capacity: usize,
     pub channel_capacity: usize,
@@ -170,7 +169,7 @@ impl Engine for NetEngine {
             offload: config.engine.offload,
             batch_size: config.engine.batch_size,
             gso_max_segments: config.engine.gso_max_segments,
-            ack_interval: config.engine.ack_interval,
+
             ack_timer_ms: config.engine.ack_timer_ms,
             tun_write_buf_capacity: config.engine.tun_write_buf,
             channel_capacity: config.engine.channel_capacity,
@@ -232,7 +231,6 @@ fn run_engine(
         EndpointSetup::Listener { server_config } => MultiQuicState::new(server_config.clone()),
         EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
-    multi_state.ack_interval = config.ack_interval;
     multi_state.rate_control_config = config.rate_control_config;
 
     if let EndpointSetup::Connector {
@@ -412,7 +410,10 @@ fn run_engine(
                                     }
                                     decrypted.close_received
                                 }
-                                Err(_) => false,
+                                Err(e) => {
+                                    tracing::trace!(error = %e, "decrypt failed");
+                                    false
+                                }
                             }
                         } else { false };
 
@@ -543,8 +544,16 @@ fn run_engine(
                 match manager.promote_handshake(&hs, conn_state, peers) {
                     PromoteResult::Accepted {
                         cid_key, cid_bytes, tunnel_ip, allowed_ips,
-                        remote_addr, keepalive_interval, conn_state, ..
+                        remote_addr, keepalive_interval, conn_state, evicted,
                     } => {
+                        // Clean up OS routes from evicted (reconnected) peer.
+                        if let Some(ref ev) = evicted {
+                            for net in &ev.allowed_ips {
+                                if let Err(e) = adapter.remove_os_route(*net) {
+                                    warn!(error = %e, dst = %net, "failed to remove stale OS route");
+                                }
+                            }
+                        }
                         let now_inst = Instant::now();
                         info!(
                             remote = %remote_addr, tunnel_ip = %tunnel_ip,

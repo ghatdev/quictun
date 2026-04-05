@@ -184,9 +184,17 @@ pub fn parse_ack(payload: &[u8]) -> Result<(AckFrame, &[u8]), ParseError> {
         let (ack_range, n) = read_varint(&payload[pos..])?;
         pos += n;
 
-        // Gap means gap+1 unacknowledged packets before smallest
-        let range_end = smallest.saturating_sub(gap + 2);
-        let range_start = range_end.saturating_sub(ack_range);
+        // Gap means gap+1 unacknowledged packets before smallest.
+        // Validate: smallest must be large enough for the gap.
+        let gap_size = gap.checked_add(2).ok_or(ParseError::InvalidFrame)?;
+        if gap_size > smallest {
+            return Err(ParseError::InvalidFrame);
+        }
+        let range_end = smallest - gap_size;
+        if ack_range > range_end {
+            return Err(ParseError::InvalidFrame);
+        }
+        let range_start = range_end - ack_range;
         ranges.push(range_start..range_end + 1);
         smallest = range_start;
     }

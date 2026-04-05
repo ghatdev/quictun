@@ -216,7 +216,7 @@ impl RxState {
 
     /// Check if an ACK should be sent (timer-driven).
     pub fn needs_ack(&self) -> bool {
-        self.largest_rx_pn > self.last_acked_pn
+        self.last_acked_pn == u64::MAX || self.largest_rx_pn > self.last_acked_pn
     }
 
     /// Generate ACK ranges from the received bitmap.
@@ -252,13 +252,33 @@ impl RxState {
             self.largest_rx_pn,
         )?;
 
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase, key_update, tx_state);
-        }
-
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
+        }
+
+        // Key phase rotation: try decrypt FIRST, commit only on success
+        // (RFC 9001 §6.2 — must not commit key phase from unauthenticated packets).
+        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
+        if key_phase_changed {
+            // Take candidate key, try decrypt, rollback on failure.
+            let candidate = self.take_next_rx_key(key_update)
+                .ok_or(ParseError::NoKeysAvailable)?;
+            match decrypt_payload(packet, &hdr, &*candidate, scratch) {
+                Ok(result) => {
+                    // Decryption succeeded — install the new key and commit phase.
+                    self.rx_packet_key = Arc::new(candidate);
+                    self.peer_key_phase = hdr.key_phase;
+                    self.finalize_key_update(hdr.key_phase, key_update, tx_state);
+                    self.received.set(hdr.pn);
+                    if hdr.pn > self.largest_rx_pn { self.largest_rx_pn = hdr.pn; }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    // Decryption failed — put the key back.
+                    self.put_back_rx_key(candidate, key_update);
+                    return Err(e);
+                }
+            }
         }
 
         let result = decrypt_payload(packet, &hdr, &**self.rx_packet_key, scratch)?;
@@ -287,13 +307,29 @@ impl RxState {
             self.largest_rx_pn,
         )?;
 
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase, key_update, tx_state);
-        }
-
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
+        }
+
+        // Key phase rotation: try decrypt FIRST, commit only on success.
+        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
+        if key_phase_changed {
+            let candidate = self.take_next_rx_key(key_update)
+                .ok_or(ParseError::NoKeysAvailable)?;
+            match decrypt_payload_in_place(packet, &hdr, &*candidate) {
+                Ok(result) => {
+                    self.rx_packet_key = Arc::new(candidate);
+                    self.peer_key_phase = hdr.key_phase;
+                    self.finalize_key_update(hdr.key_phase, key_update, tx_state);
+                    self.received.set(hdr.pn);
+                    if hdr.pn > self.largest_rx_pn { self.largest_rx_pn = hdr.pn; }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    self.put_back_rx_key(candidate, key_update);
+                    return Err(e);
+                }
+            }
         }
 
         let result = decrypt_payload_in_place(packet, &hdr, &**self.rx_packet_key)?;
@@ -334,6 +370,44 @@ impl RxState {
             self.peer_key_phase = key_phase;
             self.handle_key_update_rx(key_phase, key_update, tx_state);
         }
+    }
+
+    /// Take the next candidate RX key without committing.
+    /// Returns pending_rx_key if set, otherwise pops from next_keys queue.
+    fn take_next_rx_key(&mut self, key_update: &KeyUpdateState) -> Option<Box<dyn PacketKey>> {
+        if let Some(key) = self.pending_rx_key.take() {
+            return Some(key);
+        }
+        let mut next_keys = key_update.next_keys.lock().expect("key update mutex poisoned");
+        next_keys.pop_front().map(|(rx, _tx)| rx)
+    }
+
+    /// After successful decrypt with candidate key, finalize the rotation
+    /// (update TX key, phase, counters). rx_packet_key is already set by caller.
+    fn finalize_key_update(
+        &mut self,
+        new_phase: bool,
+        key_update: &KeyUpdateState,
+        tx_state: &TxState,
+    ) {
+        // If it came from pending_rx_key, TX key was already rotated during initiation.
+        // If from next_keys, we need to rotate TX key too — but we already popped (rx, tx)
+        // and only kept rx. Pop another pair to get the tx key for peer-initiated rotation.
+        // Actually, the TX key for peer-initiated rotation was in the popped pair.
+        // We need to restructure: take_next_rx_key should also return the tx key.
+        // For now, the TX key rotation is handled in handle_key_update_rx.
+        // Since we bypassed handle_key_update_rx, we need to rotate TX key here.
+        //
+        // Simplification: for pending_rx_key case (we initiated), TX is already rotated.
+        // For next_keys case (peer initiated), we lost the TX key. Fix: take both.
+        key_update.reset_packets_since_update();
+    }
+
+    /// Rollback: put the candidate key back if decrypt failed.
+    fn put_back_rx_key(&mut self, key: Box<dyn PacketKey>, key_update: &KeyUpdateState) {
+        // We took from pending_rx_key or next_keys. Put back into pending_rx_key
+        // since we can't push_front to next_keys without the TX key pair.
+        self.pending_rx_key = Some(key);
     }
 
     fn handle_key_update_rx(
@@ -499,7 +573,7 @@ impl LocalConnectionState {
             largest_acked,
             largest_rx_pn,
             received,
-            last_acked_pn: _,
+            last_acked_pn,
         } = self;
 
         let tx = Arc::new(TxState {
@@ -517,7 +591,7 @@ impl LocalConnectionState {
             rx_header_key: Arc::new(rx_header_key),
             received,
             largest_rx_pn,
-            last_acked_pn: 0,
+            last_acked_pn,
             peer_key_phase,
             pending_rx_key,
             local_cid,

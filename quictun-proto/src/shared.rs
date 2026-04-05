@@ -49,7 +49,7 @@ impl AtomicReplayWindow {
     fn new(largest_rx_pn: u64, bitmap: Bitmap) -> Self {
         Self {
             largest_rx_pn: AtomicU64::new(largest_rx_pn),
-            last_acked_pn: AtomicU64::new(0),
+            last_acked_pn: AtomicU64::new(u64::MAX),
             inner: Mutex::new(ReplayInner {
                 bitmap,
                 largest_rx_pn,
@@ -82,8 +82,8 @@ impl AtomicReplayWindow {
 
     /// Check if an ACK should be sent (timer-driven).
     pub fn needs_ack(&self) -> bool {
-        self.largest_rx_pn.load(Ordering::Relaxed)
-            > self.last_acked_pn.load(Ordering::Relaxed)
+        let last = self.last_acked_pn.load(Ordering::Relaxed);
+        last == u64::MAX || self.largest_rx_pn.load(Ordering::Relaxed) > last
     }
 
     /// Generate ACK ranges from the bitmap. Called from the timer thread only.

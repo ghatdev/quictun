@@ -228,9 +228,6 @@ pub struct EngineConfig {
     /// UDP GSO segments per sendmsg.
     #[serde(default = "default_gso_max_segments")]
     pub gso_max_segments: usize,
-    /// Packets between ACK generation.
-    #[serde(default = "default_ack_interval")]
-    pub ack_interval: u32,
     /// Standalone ACK timer interval in milliseconds.
     #[serde(default = "default_ack_timer_ms")]
     pub ack_timer_ms: u32,
@@ -288,7 +285,6 @@ impl Default for EngineConfig {
             adaptive_poll: true,
             batch_size: 64,
             gso_max_segments: 44,
-            ack_interval: 64,
             ack_timer_ms: 20,
             tun_write_buf: 256,
             channel_capacity: 4096,
@@ -411,10 +407,6 @@ fn default_batch_size() -> usize {
 
 fn default_gso_max_segments() -> usize {
     44
-}
-
-fn default_ack_interval() -> u32 {
-    64
 }
 
 fn default_ack_timer_ms() -> u32 {

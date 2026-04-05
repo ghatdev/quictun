@@ -2644,7 +2644,7 @@ pub fn run_router_pipeline_io(
         if now.duration_since(last_ack) >= ROUTER_ACK_INTERVAL {
             for (_, entry) in manager.iter() {
                 if entry.conn.replay.needs_ack() {
-                    match entry.conn.encrypt_ack(0, &mut ack_buf) {
+                    match entry.conn.encrypt_ack(entry.queuing_delay_us(), &mut ack_buf) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,

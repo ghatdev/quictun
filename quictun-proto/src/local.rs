@@ -116,20 +116,8 @@ impl LocalConnectionState {
             largest_acked: 0,
             largest_rx_pn: 0,
             received: Bitmap::new(),
-            last_acked_pn: 0,
+            last_acked_pn: u64::MAX,
         }
-    }
-
-    /// Create with a custom ACK interval (kept for API compat, interval is ignored).
-    pub fn with_ack_interval(
-        keys: crypto::Keys,
-        key_generations: VecDeque<crypto::KeyPair<Box<dyn PacketKey>>>,
-        local_cid: ConnectionId,
-        remote_cid: ConnectionId,
-        is_server: bool,
-        _ack_interval: u32,
-    ) -> Self {
-        Self::new(keys, key_generations, local_cid, remote_cid, is_server)
     }
 
     /// Decrypt an incoming 1-RTT packet, reusing a caller-provided BytesMut.
@@ -146,26 +134,33 @@ impl LocalConnectionState {
             self.largest_rx_pn,
         )?;
 
-        // Key phase rotation (single-owner, no CAS needed).
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase);
-        }
-
         // Reject duplicate packet numbers.
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
 
-        let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
-
-        // Update RX state.
-        self.received.set(hdr.pn);
-        if hdr.pn > self.largest_rx_pn {
-            self.largest_rx_pn = hdr.pn;
+        // Key phase rotation: try decrypt FIRST, commit only on success
+        // (RFC 9001 §6.2 — must not commit key phase from unauthenticated packets).
+        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
+        if key_phase_changed {
+            let candidate_key = self.peek_next_rx_key()
+                .ok_or(ParseError::NoKeysAvailable)?;
+            let result = decrypt_payload(packet, &hdr, &*candidate_key, scratch)?;
+            // Decryption succeeded — now safe to commit the key rotation.
+            self.handle_key_update_rx(hdr.key_phase);
+            self.received.set(hdr.pn);
+            if hdr.pn > self.largest_rx_pn {
+                self.largest_rx_pn = hdr.pn;
+            }
+            Ok(result)
+        } else {
+            let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
+            self.received.set(hdr.pn);
+            if hdr.pn > self.largest_rx_pn {
+                self.largest_rx_pn = hdr.pn;
+            }
+            Ok(result)
         }
-
-        Ok(result)
     }
 
     /// Decrypt an incoming 1-RTT packet fully in-place (zero heap allocation).
@@ -184,26 +179,32 @@ impl LocalConnectionState {
             self.largest_rx_pn,
         )?;
 
-        // Key phase rotation (single-owner, no CAS needed).
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase);
-        }
-
         // Reject duplicate packet numbers.
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
 
-        let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
-
-        // Update RX state.
-        self.received.set(hdr.pn);
-        if hdr.pn > self.largest_rx_pn {
-            self.largest_rx_pn = hdr.pn;
+        // Key phase rotation: try decrypt FIRST, commit only on success
+        // (RFC 9001 §6.2).
+        let key_phase_changed = hdr.key_phase != self.peer_key_phase;
+        if key_phase_changed {
+            let candidate_key = self.peek_next_rx_key()
+                .ok_or(ParseError::NoKeysAvailable)?;
+            let result = decrypt_payload_in_place(packet, &hdr, &*candidate_key)?;
+            self.handle_key_update_rx(hdr.key_phase);
+            self.received.set(hdr.pn);
+            if hdr.pn > self.largest_rx_pn {
+                self.largest_rx_pn = hdr.pn;
+            }
+            Ok(result)
+        } else {
+            let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
+            self.received.set(hdr.pn);
+            if hdr.pn > self.largest_rx_pn {
+                self.largest_rx_pn = hdr.pn;
+            }
+            Ok(result)
         }
-
-        Ok(result)
     }
 
     /// Encrypt a datagram payload into a complete 1-RTT QUIC packet.
@@ -363,7 +364,7 @@ impl LocalConnectionState {
     /// Returns true if any packets have been received since the last ACK.
     /// Called by the engine's ACK timer (~20ms), not per-packet.
     pub fn needs_ack(&self) -> bool {
-        self.largest_rx_pn > self.last_acked_pn
+        self.last_acked_pn == u64::MAX || self.largest_rx_pn > self.last_acked_pn
     }
 
     /// Generate ACK ranges from the received bitmap.
@@ -454,6 +455,18 @@ impl LocalConnectionState {
             tx_packet_key: &*self.tx_packet_key,
             tx_header_key: &*self.tx_header_key,
             tag_len: self.tag_len,
+        }
+    }
+
+    /// Peek at the next RX packet key without consuming it.
+    /// Used to try decryption before committing a key-phase change.
+    fn peek_next_rx_key(&self) -> Option<&dyn PacketKey> {
+        if let Some(key) = &self.pending_rx_key {
+            Some(&**key)
+        } else if let Some((rx, _)) = self.next_keys.front() {
+            Some(&**rx)
+        } else {
+            None
         }
     }
 

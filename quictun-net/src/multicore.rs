@@ -832,9 +832,13 @@ fn run_worker(
                             _ => continue,
                         };
 
-                        // Rate control: stop reading from TUN when over budget.
+                        // Rate control: skip this packet when over budget.
+                        // Must use `continue` (not `break`) because this code lives
+                        // inside a macro that expands in both the outer main loop and
+                        // the inner drain loop — `break` from the outer loop would kill
+                        // the entire worker thread.
                         if !manager.get(&cid).map_or(true, |e| e.can_send()) {
-                            break;
+                            continue;
                         }
 
                         #[cfg(target_os = "linux")]
@@ -902,7 +906,7 @@ fn run_worker(
                         #[cfg(not(target_os = "linux"))]
                         {
                             if let Some(entry) = manager.get_mut(&cid) {
-                                if !entry.can_send() { break; }
+                                if !entry.can_send() { continue; }
                                 let tx_ts = if cc_enabled {
                                     Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
                                 } else {
