@@ -121,10 +121,14 @@ impl TxState {
     }
 
     /// Encrypt a datagram payload using shared state. No `&mut self` needed.
+    ///
+    /// `tx_timestamp`: caller-provided OWD timestamp (microseconds, wrapping u32).
+    /// Pass `None` when CC is disabled.
     pub fn encrypt_datagram(
         &self,
         payload: &[u8],
         buf: &mut [u8],
+        tx_timestamp: Option<u32>,
     ) -> Result<EncryptResult, ParseError> {
         let pn = self.next_pn();
         let key_guard = self.tx_packet_key.load();
@@ -138,7 +142,7 @@ impl TxState {
             &**self.tx_header_key,
             self.tag_len,
             buf,
-            None, // no OWD timestamp in split/DPDK path
+            tx_timestamp,
         )
     }
 }
@@ -445,13 +449,16 @@ pub struct SplitConnectionState {
 
 impl SplitConnectionState {
     /// Encrypt a standalone ACK packet.
-    pub fn encrypt_ack(&mut self, buf: &mut [u8]) -> Result<EncryptResult, ParseError> {
+    ///
+    /// `ack_delay_us`: queuing delay to carry in the ACK frame (microseconds),
+    /// provided by the engine from the OWD tracker.
+    pub fn encrypt_ack(&mut self, ack_delay_us: u64, buf: &mut [u8]) -> Result<EncryptResult, ParseError> {
         let ack_ranges = self.rx.generate_ack_ranges();
         let pn = self.tx.next_pn();
         let key_guard = self.tx.tx_packet_key.load();
         encrypt_ack_packet(
             &ack_ranges,
-            0, // TODO: track ack_delay in SplitConnectionState
+            ack_delay_us,
             &self.tx.remote_cid,
             pn,
             self.tx.largest_acked(),
@@ -493,8 +500,6 @@ impl LocalConnectionState {
             largest_rx_pn,
             received,
             last_acked_pn: _,
-            owd_tracker: _,
-            rate_controller: _,
         } = self;
 
         let tx = Arc::new(TxState {
@@ -609,7 +614,7 @@ mod tests {
         // Encrypt via TxState (no &mut self).
         let result = split_client
             .tx
-            .encrypt_datagram(payload, &mut buf)
+            .encrypt_datagram(payload, &mut buf, None)
             .expect("encrypt");
 
         // Decrypt via RxState (sequential).
@@ -644,7 +649,7 @@ mod tests {
                     let mut buf = vec![0u8; 2048];
                     for _ in 0..1000 {
                         let result = tx
-                            .encrypt_datagram(b"test", &mut buf)
+                            .encrypt_datagram(b"test", &mut buf, None)
                             .expect("encrypt");
                         pns.push(result.pn);
                     }
@@ -676,7 +681,7 @@ mod tests {
         for _ in 0..10 {
             let result = split_server
                 .tx
-                .encrypt_datagram(b"data", &mut buf)
+                .encrypt_datagram(b"data", &mut buf, None)
                 .expect("encrypt");
             split_client
                 .rx
@@ -691,7 +696,7 @@ mod tests {
         }
 
         // Client sends standalone ACK.
-        let result = split_client.encrypt_ack(&mut buf).expect("encrypt_ack");
+        let result = split_client.encrypt_ack(0, &mut buf).expect("encrypt_ack");
 
         // Server decrypts ACK-only packet.
         let decrypted = split_server

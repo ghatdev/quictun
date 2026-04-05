@@ -370,6 +370,7 @@ fn run_engine(
                                     entry.last_rx = Instant::now();
                                     if let Some(ref ack) = decrypted.ack {
                                         entry.conn.process_ack(ack);
+                                        entry.on_ack(ack);
                                     }
                                     if !decrypted.close_received {
                                         for datagram in &decrypted.datagrams {
@@ -455,7 +456,7 @@ fn run_engine(
             match action {
                 ManagerAction::SendKeepalive { cid_key } => {
                     if let Some(entry) = manager.get_mut(&cid_key)
-                        && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
+                        && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf, None)
                     {
                         let _ = adapter.udp_socket().send_to(
                             &encrypt_buf[..r.len], entry.remote_addr,
@@ -475,12 +476,13 @@ fn run_engine(
         let now = Instant::now();
         if now >= next_ack {
             for cid_key in manager.connections_needing_ack() {
-                if let Some(entry) = manager.get_mut(&cid_key)
-                    && let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf)
-                {
-                    let _ = adapter.udp_socket().send_to(
-                        &encrypt_buf[..r.len], entry.remote_addr,
-                    );
+                if let Some(entry) = manager.get_mut(&cid_key) {
+                    let ack_delay = entry.queuing_delay_us();
+                    if let Ok(r) = entry.conn.encrypt_ack(ack_delay, &mut encrypt_buf) {
+                        let _ = adapter.udp_socket().send_to(
+                            &encrypt_buf[..r.len], entry.remote_addr,
+                        );
+                    }
                 }
             }
             next_ack = now + ack_interval;
@@ -538,6 +540,10 @@ fn run_engine(
                             conn: conn_state, tunnel_ip, allowed_ips,
                             remote_addr, keepalive_interval,
                             last_tx: now_inst, last_rx: now_inst,
+                            owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
+                            rate_controller: config.rate_control_config.map(
+                                quictun_proto::rate_control::RateController::new,
+                            ),
                         });
                     }
                     PromoteResult::Rejected { mut conn_state, remote_addr, reason } => {
@@ -609,7 +615,7 @@ fn handle_tun_rx_gso(
                 }
 
                 // Rate control: check before mutable borrow.
-                if !manager.get(&cid).map_or(true, |e| e.conn.can_send()) {
+                if !manager.get(&cid).map_or(true, |e| e.can_send()) {
                     if gso_count > 0 {
                         flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"));
                         if let Some(cur_cid) = current_cid {
@@ -623,9 +629,9 @@ fn handle_tun_rx_gso(
                 current_cid = Some(cid);
                 current_remote = Some(entry.remote_addr);
 
-                match entry.conn.encrypt_datagram(&packet[..n], &mut gso_buf[gso_pos..]) {
+                match entry.conn.encrypt_datagram(&packet[..n], &mut gso_buf[gso_pos..], None) {
                     Ok(result) => {
-                        entry.conn.on_bytes_sent(result.len);
+                        entry.on_bytes_sent(result.len);
                         if gso_count == 0 {
                             gso_segment_size = result.len; gso_pos += result.len; gso_count += 1;
                         } else if result.len == gso_segment_size {
@@ -695,11 +701,11 @@ fn handle_tun_rx_simple(
                     _ => continue,
                 };
                 let entry = match manager.get_mut(&cid) { Some(e) => e, None => continue };
-                if !entry.conn.can_send() { break; }
-                match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf) {
+                if !entry.can_send() { break; }
+                match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf, None) {
                     Ok(result) => {
                         let _ = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr);
-                        entry.conn.on_bytes_sent(result.len);
+                        entry.on_bytes_sent(result.len);
                         entry.last_tx = Instant::now();
                     }
                     Err(e) => { warn!(error = %e, "encrypt failed"); }
@@ -763,7 +769,7 @@ fn handle_tun_rx_offload(
             };
 
             // Rate control check.
-            if !manager.get(&cid).map_or(true, |e| e.conn.can_send()) {
+            if !manager.get(&cid).map_or(true, |e| e.can_send()) {
                 if let Some(prev_cid) = batch_cid {
                     if !batch_indices.is_empty() {
                         flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs);
@@ -813,9 +819,9 @@ fn flush_offload_batch(
 
     for &idx in indices {
         let pkt = &split_bufs[idx][..split_sizes[idx]];
-        match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..]) {
+        match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..], None) {
             Ok(result) => {
-                entry.conn.on_bytes_sent(result.len);
+                entry.on_bytes_sent(result.len);
                 if gso_count == 0 {
                     gso_segment_size = result.len; gso_pos += result.len; gso_count += 1;
                 } else if result.len == gso_segment_size {

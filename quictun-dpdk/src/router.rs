@@ -553,6 +553,8 @@ pub fn run_router(
                                 keepalive_interval,
                                 last_tx: now,
                                 last_rx: now,
+                                owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
+                                rate_controller: None,
                             });
 
                             // Rebuild router's own routing table with actual CID keys.
@@ -684,7 +686,7 @@ pub fn run_router(
                     ManagerAction::SendKeepalive { cid_key } => {
                         if let Some(entry) = manager.get_mut(&cid_key) {
                             let mut ka_buf = [0u8; 256];
-                            if let Ok(result) = entry.conn.encrypt_datagram(&[], &mut ka_buf) {
+                            if let Ok(result) = entry.conn.encrypt_datagram(&[], &mut ka_buf, None) {
                                 let remote_ip = match entry.remote_addr.ip() {
                                     std::net::IpAddr::V4(ip) => ip,
                                     _ => Ipv4Addr::UNSPECIFIED,
@@ -1043,7 +1045,7 @@ fn encrypt_and_send(
 
     if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
         if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
-            match entry.conn.encrypt_datagram(inner_pkt, &mut buf[net::HEADER_SIZE..]) {
+            match entry.conn.encrypt_datagram(inner_pkt, &mut buf[net::HEADER_SIZE..], None) {
                 Ok(result) => {
                     let remote_ip = match entry.remote_addr.ip() {
                         std::net::IpAddr::V4(ip) => ip,
@@ -2565,6 +2567,8 @@ pub fn run_router_pipeline_io(
                                 keepalive_interval,
                                 last_tx: now,
                                 last_rx: now,
+                                owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
+                                rate_controller: None,
                             });
 
                             tracing::info!(
@@ -2640,7 +2644,7 @@ pub fn run_router_pipeline_io(
         if now.duration_since(last_ack) >= ROUTER_ACK_INTERVAL {
             for (_, entry) in manager.iter() {
                 if entry.conn.replay.needs_ack() {
-                    match entry.conn.encrypt_ack(&mut ack_buf) {
+                    match entry.conn.encrypt_ack(0, &mut ack_buf) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,
@@ -2702,7 +2706,7 @@ pub fn run_router_pipeline_io(
                     ManagerAction::SendKeepalive { cid_key } => {
                         if let Some(entry) = manager.get_mut(&cid_key) {
                             let mut ka_buf = [0u8; 256];
-                            if let Ok(result) = entry.conn.tx.encrypt_datagram(&[], &mut ka_buf) {
+                            if let Ok(result) = entry.conn.tx.encrypt_datagram(&[], &mut ka_buf, None) {
                                 let remote_ip = match entry.remote_addr.ip() {
                                     std::net::IpAddr::V4(ip) => ip,
                                     _ => Ipv4Addr::UNSPECIFIED,
@@ -3392,7 +3396,7 @@ fn encrypt_and_send_shared(
 
     if let Ok(mut tx_mbuf) = Mbuf::alloc(mempool) {
         if let Ok(buf) = tx_mbuf.alloc_space(max_frame_len_u16) {
-            match entry.conn.tx.encrypt_datagram(inner_pkt, &mut buf[net::HEADER_SIZE..]) {
+            match entry.conn.tx.encrypt_datagram(inner_pkt, &mut buf[net::HEADER_SIZE..], None) {
                 Ok(result) => {
                     let remote_ip = match entry.remote_addr.ip() {
                         std::net::IpAddr::V4(ip) => ip,

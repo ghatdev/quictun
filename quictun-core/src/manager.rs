@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use ipnet::Ipv4Net;
 use quictun_proto::cid_to_u64;
+use quictun_proto::frame::AckFrame;
 use quictun_proto::local::LocalConnectionState;
+use quictun_proto::rate_control::{OwdTracker, RateController};
 use quictun_proto::shared::SharedConnectionState;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -73,6 +75,11 @@ impl<S: ConnectionState> ConnectionState for Arc<S> {
 ///
 /// Generic over `S` to hold different crypto state types per backend.
 /// The metadata fields (tunnel_ip, allowed_ips, timing) are always the same.
+///
+/// CC state (rate controller + OWD tracker) lives here, not in the crypto
+/// connection state. This lets CC work with any backend (Local, Shared, Split)
+/// without requiring thread-safe CC wrappers — the engine's I/O owner always
+/// has `&mut ConnEntry`, so `&mut self` CC methods just work.
 pub struct ConnEntry<S: ConnectionState> {
     pub conn: S,
     pub tunnel_ip: Ipv4Addr,
@@ -81,6 +88,57 @@ pub struct ConnEntry<S: ConnectionState> {
     pub keepalive_interval: Duration,
     pub last_tx: Instant,
     pub last_rx: Instant,
+
+    // ── Congestion control (engine-owned, not part of crypto state) ──
+    /// Receiver-side OWD tracker. Computes queuing delay from sender timestamps.
+    pub owd_tracker: OwdTracker,
+    /// Sender-side rate controller. `None` when CC is disabled.
+    pub rate_controller: Option<RateController>,
+}
+
+impl<S: ConnectionState> ConnEntry<S> {
+    /// Returns `true` if the rate controller allows more data to be sent.
+    /// Always returns `true` if no rate controller is configured.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        match &self.rate_controller {
+            Some(rc) => rc.can_send(),
+            None => true,
+        }
+    }
+
+    /// Record that `bytes` were sent on the wire.
+    #[inline]
+    pub fn on_bytes_sent(&mut self, bytes: usize) {
+        if let Some(ref mut rc) = self.rate_controller {
+            rc.on_bytes_sent(bytes);
+        }
+    }
+
+    /// Process CC feedback from an ACK frame.
+    ///
+    /// Feeds the peer's reported queuing delay to the rate controller.
+    #[inline]
+    pub fn on_ack(&mut self, ack: &AckFrame) {
+        if let Some(ref mut rc) = self.rate_controller {
+            rc.on_ack(ack.ack_delay);
+        }
+    }
+
+    /// Feed an OWD sample from a decrypted packet's timestamp.
+    ///
+    /// `tx_us`: sender's timestamp from the packet (wrapping u32 microseconds).
+    /// `rx_us`: receiver's current time (wrapping u32 microseconds), from engine clock.
+    #[inline]
+    pub fn on_owd_sample(&mut self, tx_us: u32, rx_us: u32) {
+        self.owd_tracker.on_data_received(tx_us, rx_us);
+    }
+
+    /// Current queuing delay for embedding in ACK frames.
+    #[inline]
+    pub fn queuing_delay_us(&self) -> u64 {
+        self.owd_tracker.queuing_delay_us
+    }
 }
 
 // ── Manager actions ─────────────────────────────────────────────────────
@@ -528,6 +586,8 @@ mod tests {
             keepalive_interval: Duration::from_secs(25),
             last_tx: Instant::now(),
             last_rx: Instant::now(),
+            owd_tracker: OwdTracker::new(),
+            rate_controller: None,
         }
     }
 

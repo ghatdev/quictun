@@ -298,13 +298,16 @@ impl SharedConnectionState {
     ///
     /// Called by the I/O thread (core 0) periodically when `replay.needs_ack()`.
     /// Generates ACK ranges from the replay window and encrypts them.
-    pub fn encrypt_ack(&self, buf: &mut [u8]) -> Result<crate::EncryptResult, ParseError> {
+    ///
+    /// `ack_delay_us`: queuing delay to carry in the ACK frame (microseconds),
+    /// provided by the engine from the OWD tracker.
+    pub fn encrypt_ack(&self, ack_delay_us: u64, buf: &mut [u8]) -> Result<crate::EncryptResult, ParseError> {
         let ack_ranges = self.replay.generate_ack_ranges();
         let pn = self.tx.next_pn();
         let key_guard = self.tx.load_packet_key();
         crate::encrypt_ack_packet(
             &ack_ranges,
-            0, // TODO: track ack_delay in SharedConnectionState
+            ack_delay_us,
             self.tx.remote_cid(),
             pn,
             self.tx.largest_acked(),
@@ -460,7 +463,7 @@ mod tests {
 
         let result = split_client
             .tx
-            .encrypt_datagram(payload, &mut buf)
+            .encrypt_datagram(payload, &mut buf, None)
             .expect("encrypt");
 
         let decrypted = shared_server
@@ -484,7 +487,7 @@ mod tests {
             let mut buf = vec![0u8; 2048];
             let result = split_client
                 .tx
-                .encrypt_datagram(b"test", &mut buf)
+                .encrypt_datagram(b"test", &mut buf, None)
                 .expect("encrypt");
             buf.truncate(result.len);
             encrypted.push(buf);
@@ -529,7 +532,7 @@ mod tests {
         let mut buf = vec![0u8; 2048];
         let result = split_client
             .tx
-            .encrypt_datagram(b"data", &mut buf)
+            .encrypt_datagram(b"data", &mut buf, None)
             .expect("encrypt");
 
         let mut pkt1 = buf[..result.len].to_vec();
@@ -554,7 +557,7 @@ mod tests {
             let mut buf = vec![0u8; 2048];
             let result = split_client
                 .tx
-                .encrypt_datagram(b"data", &mut buf)
+                .encrypt_datagram(b"data", &mut buf, None)
                 .expect("encrypt");
             shared_server
                 .decrypt_in_place(&mut buf[..result.len])
@@ -584,7 +587,7 @@ mod tests {
             let mut buf = vec![0u8; 2048];
             let result = split_client
                 .tx
-                .encrypt_datagram(b"data", &mut buf)
+                .encrypt_datagram(b"data", &mut buf, None)
                 .expect("encrypt");
             shared_server
                 .decrypt_in_place(&mut buf[..result.len])
@@ -594,7 +597,7 @@ mod tests {
         // Server generates and encrypts an ACK packet.
         assert!(shared_server.replay.needs_ack());
         let mut ack_buf = vec![0u8; 256];
-        let result = shared_server.encrypt_ack(&mut ack_buf).expect("encrypt_ack");
+        let result = shared_server.encrypt_ack(0, &mut ack_buf).expect("encrypt_ack");
         assert!(result.len > 0);
         assert!(result.len <= 256);
 

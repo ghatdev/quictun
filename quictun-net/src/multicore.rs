@@ -384,6 +384,7 @@ fn run_io_thread(
                 dispatch,
                 &mut encrypt_buf,
                 &mut response_buf,
+                config.rate_control_config,
             )?;
         }
 
@@ -561,6 +562,7 @@ fn io_thread_drive_handshakes(
     dispatch: &Arc<RwLock<DispatchTable>>,
     _encrypt_buf: &mut [u8],
     response_buf: &mut Vec<u8>,
+    rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 ) -> Result<()> {
     // Drain transmits.
     drain_transmits_io(adapter, multi_state, response_buf)?;
@@ -652,6 +654,10 @@ fn io_thread_drive_handshakes(
             keepalive_interval,
             last_tx: now_inst,
             last_rx: now_inst,
+            owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
+            rate_controller: rate_control_config.map(
+                quictun_proto::rate_control::RateController::new,
+            ),
         };
 
         let _ = worker_txs[worker_id].send(WorkerPacket::NewConnection {
@@ -756,6 +762,7 @@ fn run_worker(
                                     entry.last_rx = Instant::now();
                                     if let Some(ref ack) = dec.ack {
                                         entry.conn.process_ack(ack);
+                                        entry.on_ack(ack);
                                     }
                                     close_received = dec.close_received;
                                     if !close_received {
@@ -813,7 +820,7 @@ fn run_worker(
                         };
 
                         // Rate control: skip if over budget.
-                        if !manager.get(&cid).map_or(true, |e| e.conn.can_send()) {
+                        if !manager.get(&cid).map_or(true, |e| e.can_send()) {
                             continue;
                         }
 
@@ -841,9 +848,9 @@ fn run_worker(
                             if let Some(entry) = manager.get_mut(&cid) {
                                 gso_current_cid = Some(cid);
                                 gso_remote = entry.remote_addr;
-                                match entry.conn.encrypt_datagram(&data, &mut gso_buf[gso_pos..]) {
+                                match entry.conn.encrypt_datagram(&data, &mut gso_buf[gso_pos..], None) {
                                     Ok(r) => {
-                                        entry.conn.on_bytes_sent(r.len);
+                                        entry.on_bytes_sent(r.len);
                                         if gso_count == 0 {
                                             gso_segment_size = r.len;
                                             gso_pos += r.len;
@@ -871,10 +878,10 @@ fn run_worker(
                         #[cfg(not(target_os = "linux"))]
                         {
                             if let Some(entry) = manager.get_mut(&cid) {
-                                if !entry.conn.can_send() { continue; }
-                                match entry.conn.encrypt_datagram(&data, &mut encrypt_buf) {
+                                if !entry.can_send() { continue; }
+                                match entry.conn.encrypt_datagram(&data, &mut encrypt_buf, None) {
                                     Ok(r) => {
-                                        entry.conn.on_bytes_sent(r.len);
+                                        entry.on_bytes_sent(r.len);
                                         let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                                         entry.last_tx = Instant::now();
                                     }
@@ -905,7 +912,7 @@ fn run_worker(
                     match action {
                         ManagerAction::SendKeepalive { cid_key } => {
                             if let Some(entry) = manager.get_mut(&cid_key)
-                                && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
+                                && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf, None)
                             {
                                 let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                                 entry.last_tx = Instant::now();
@@ -920,10 +927,11 @@ fn run_worker(
                 }
                 if now >= next_ack {
                     for cid_key in manager.connections_needing_ack() {
-                        if let Some(entry) = manager.get_mut(&cid_key)
-                            && let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf)
-                        {
-                            let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                        if let Some(entry) = manager.get_mut(&cid_key) {
+                            let ack_delay = entry.queuing_delay_us();
+                            if let Ok(r) = entry.conn.encrypt_ack(ack_delay, &mut encrypt_buf) {
+                                let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                            }
                         }
                     }
                     next_ack = now + Duration::from_millis(ack_timer_ms);
@@ -973,7 +981,7 @@ fn run_worker(
             match action {
                 ManagerAction::SendKeepalive { cid_key } => {
                     if let Some(entry) = manager.get_mut(&cid_key)
-                        && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
+                        && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf, None)
                     {
                         let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                         entry.last_tx = Instant::now();
@@ -989,7 +997,7 @@ fn run_worker(
         if now >= next_ack {
             for cid_key in manager.connections_needing_ack() {
                 if let Some(entry) = manager.get_mut(&cid_key)
-                    && let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf)
+                    && let Ok(r) = entry.conn.encrypt_ack(entry.queuing_delay_us(), &mut encrypt_buf)
                 {
                     let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                 }

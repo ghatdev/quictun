@@ -22,8 +22,8 @@ pub struct RateControlConfig {
 
 /// OWD tracking state (receiver side — tracks delay of packets we receive).
 ///
-/// Embedded in `LocalConnectionState`. Computes queuing delay from sender
-/// timestamps and reports it in ACK frames.
+/// Computes queuing delay from sender timestamps and reports it in ACK frames.
+/// Owned by the engine layer (e.g., `ConnEntry`), not by connection state.
 pub struct OwdTracker {
     /// Windowed minimum OWD (wrapping microseconds, includes clock offset).
     owd_min: i32,
@@ -56,8 +56,10 @@ impl OwdTracker {
 
     /// Process an incoming data packet's tx_timestamp.
     /// Computes OWD and updates the queuing delay for the next ACK.
-    pub fn on_data_received(&mut self, tx_us: u32) {
-        let rx_us = (crate::coarse_now_ns() / 1000) as u32;
+    ///
+    /// `rx_us` is the receiver's current time in microseconds (wrapping u32),
+    /// provided by the engine from its own clock source.
+    pub fn on_data_received(&mut self, tx_us: u32, rx_us: u32) {
         let owd = rx_us.wrapping_sub(tx_us) as i32;
 
         if !self.initialized || owd < self.owd_min || self.owd_min_ts.elapsed() > OWD_MIN_WINDOW {
@@ -73,7 +75,7 @@ impl OwdTracker {
 
 /// Delay-based rate controller state (sender side).
 ///
-/// Embedded in `LocalConnectionState` as `Option<RateController>`.
+/// Owned by the engine layer (e.g., `ConnEntry`) as `Option<RateController>`.
 /// When `None`, the connection operates without CC (zero overhead).
 ///
 /// Receives queuing delay from the peer's ACK frame and adjusts sending rate.
@@ -277,16 +279,17 @@ mod tests {
         assert_eq!(tracker.queuing_delay_us, 0);
 
         // First sample — becomes the baseline.
-        let tx = (crate::coarse_now_ns() / 1000) as u32;
-        tracker.on_data_received(tx);
+        let now_us: u32 = 1_000_000;
+        let tx = now_us;
+        tracker.on_data_received(tx, now_us);
         assert!(tracker.initialized);
         assert_eq!(tracker.queuing_delay_us, 0); // no queuing on first sample
 
         // Same-time sample — still zero queuing.
-        let tx2 = (crate::coarse_now_ns() / 1000) as u32;
-        tracker.on_data_received(tx2);
-        // Queuing should be very small (just processing time).
-        assert!(tracker.queuing_delay_us < 1000); // less than 1ms
+        let now_us2: u32 = 1_000_100;
+        let tx2 = now_us2;
+        tracker.on_data_received(tx2, now_us2);
+        assert_eq!(tracker.queuing_delay_us, 0);
     }
 
     #[test]
@@ -294,15 +297,15 @@ mod tests {
         let mut tracker = OwdTracker::new();
 
         // Establish baseline: tx was 1000us ago, rx is now.
-        let now_us = (crate::coarse_now_ns() / 1000) as u32;
+        let now_us: u32 = 1_000_000;
         let tx_baseline = now_us.wrapping_sub(1000); // 1ms ago
-        tracker.on_data_received(tx_baseline);
+        tracker.on_data_received(tx_baseline, now_us);
         assert_eq!(tracker.queuing_delay_us, 0);
 
         // Now a packet that experienced 5ms more delay:
         // tx was 6000us ago (1ms propagation + 5ms queuing), rx is now.
         let tx_delayed = now_us.wrapping_sub(6000);
-        tracker.on_data_received(tx_delayed);
+        tracker.on_data_received(tx_delayed, now_us);
         // Should detect ~5000us of queuing.
         assert!(tracker.queuing_delay_us >= 4000);
         assert!(tracker.queuing_delay_us <= 6000);

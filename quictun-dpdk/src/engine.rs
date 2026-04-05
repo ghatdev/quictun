@@ -568,7 +568,7 @@ pub fn run(
                     // buf layout: [42 bytes for outer hdrs][old inner ETH(14)][IP payload(N)][tag space]
                     let quic_buf = &mut buf[net::HEADER_SIZE..];
 
-                    match entry.conn.encrypt_datagram_in_place(ip_payload_len, quic_buf) {
+                    match entry.conn.encrypt_datagram_in_place(ip_payload_len, quic_buf, None) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,
@@ -716,6 +716,8 @@ pub fn run(
                                 keepalive_interval,
                                 last_tx: now,
                                 last_rx: now,
+                                owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
+                                rate_controller: None,
                             });
 
                             tracing::info!(
@@ -782,7 +784,7 @@ pub fn run(
                             ManagerAction::SendKeepalive { cid_key } => {
                                 if let Some(entry) = manager.get_mut(&cid_key) {
                                     let mut ka_buf = [0u8; 256];
-                                    if let Ok(result) = entry.conn.encrypt_datagram(&[], &mut ka_buf) {
+                                    if let Ok(result) = entry.conn.encrypt_datagram(&[], &mut ka_buf, None) {
                                         let remote_ip = match entry.remote_addr.ip() {
                                             std::net::IpAddr::V4(ip) => ip,
                                             _ => Ipv4Addr::UNSPECIFIED,
@@ -1888,6 +1890,7 @@ pub fn run_worker(
                     match entry.conn.encrypt_datagram(
                         ip_payload,
                         &mut buf[net::HEADER_SIZE..],
+                        None,
                     ) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
@@ -2331,6 +2334,8 @@ pub fn run_pipeline_io(
                                 keepalive_interval,
                                 last_tx: now,
                                 last_rx: now,
+                                owd_tracker: quictun_proto::rate_control::OwdTracker::new(),
+                                rate_controller: None,
                             });
 
                             tracing::info!(
@@ -2387,7 +2392,7 @@ pub fn run_pipeline_io(
         if now.duration_since(last_ack) >= ACK_INTERVAL {
             for (_, entry) in manager.iter() {
                 if entry.conn.replay.needs_ack() {
-                    match entry.conn.encrypt_ack(&mut ack_buf) {
+                    match entry.conn.encrypt_ack(0, &mut ack_buf) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {
                                 std::net::IpAddr::V4(ip) => ip,
@@ -2449,7 +2454,7 @@ pub fn run_pipeline_io(
                     ManagerAction::SendKeepalive { cid_key } => {
                         if let Some(entry) = manager.get_mut(&cid_key) {
                             let mut ka_buf = [0u8; 256];
-                            if let Ok(result) = entry.conn.tx.encrypt_datagram(&[], &mut ka_buf) {
+                            if let Ok(result) = entry.conn.tx.encrypt_datagram(&[], &mut ka_buf, None) {
                                 let remote_ip = match entry.remote_addr.ip() {
                                     std::net::IpAddr::V4(ip) => ip,
                                     _ => Ipv4Addr::UNSPECIFIED,
@@ -2769,6 +2774,7 @@ pub fn run_pipeline_worker(
                     match entry.conn.tx.encrypt_datagram(
                         ip_payload,
                         &mut buf[net::HEADER_SIZE..],
+                        None,
                     ) {
                         Ok(result) => {
                             let remote_ip = match entry.remote_addr.ip() {

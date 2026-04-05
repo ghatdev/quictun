@@ -214,7 +214,7 @@ impl MultiQuicState {
 
         let extracted = peer::extract_1rtt_keys(&mut hs.connection)?;
         let is_server = self.server_config.is_some();
-        let mut conn_state = LocalConnectionState::with_ack_interval(
+        let conn_state = LocalConnectionState::with_ack_interval(
             extracted.keys,
             extracted.key_gens,
             *hs.connection.local_cid(),
@@ -222,10 +222,6 @@ impl MultiQuicState {
             is_server,
             self.ack_interval,
         );
-        if let Some(ref rc_config) = self.rate_control_config {
-            conn_state.set_rate_control(*rc_config);
-        }
-
         Some((hs, conn_state))
     }
 }

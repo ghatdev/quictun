@@ -80,11 +80,6 @@ pub struct LocalConnectionState {
     /// Largest RX PN at the time of the last ACK send (for timer-driven ACKs).
     pub(crate) last_acked_pn: u64,
 
-    // OWD tracking (receiver side — for packets we receive from peer).
-    pub(crate) owd_tracker: crate::rate_control::OwdTracker,
-
-    // Rate control (sender side, optional, None = no CC).
-    pub(crate) rate_controller: Option<crate::rate_control::RateController>,
 }
 
 impl LocalConnectionState {
@@ -122,8 +117,6 @@ impl LocalConnectionState {
             largest_rx_pn: 0,
             received: Bitmap::new(),
             last_acked_pn: 0,
-            owd_tracker: crate::rate_control::OwdTracker::new(),
-            rate_controller: None,
         }
     }
 
@@ -172,11 +165,6 @@ impl LocalConnectionState {
             self.largest_rx_pn = hdr.pn;
         }
 
-        // OWD tracking: compute queuing delay from sender's timestamp.
-        if let Some(tx_us) = result.tx_timestamp {
-            self.owd_tracker.on_data_received(tx_us);
-        }
-
         Ok(result)
     }
 
@@ -215,19 +203,18 @@ impl LocalConnectionState {
             self.largest_rx_pn = hdr.pn;
         }
 
-        // OWD tracking: compute queuing delay from sender's timestamp.
-        if let Some(tx_us) = result.tx_timestamp {
-            self.owd_tracker.on_data_received(tx_us);
-        }
-
         Ok(result)
     }
 
     /// Encrypt a datagram payload into a complete 1-RTT QUIC packet.
+    ///
+    /// `tx_timestamp`: caller-provided OWD timestamp (microseconds, wrapping u32).
+    /// Pass `None` when CC is disabled.
     pub fn encrypt_datagram(
         &mut self,
         payload: &[u8],
         buf: &mut [u8],
+        tx_timestamp: Option<u32>,
     ) -> Result<EncryptResult, ParseError> {
         self.packets_since_key_update += 1;
         if self.packets_since_key_update == KEY_UPDATE_THRESHOLD {
@@ -236,13 +223,6 @@ impl LocalConnectionState {
 
         let pn = self.pn_counter;
         self.pn_counter += 1;
-
-        // Include OWD timestamp if CC is enabled (5 extra bytes per packet).
-        let tx_timestamp = if self.rate_controller.is_some() {
-            Some((crate::coarse_now_ns() / 1000) as u32)
-        } else {
-            None
-        };
 
         encrypt_packet(
             payload,
@@ -263,10 +243,14 @@ impl LocalConnectionState {
     /// The payload must start at offset `1 + remote_cid.len() + 4 + 1` (= 14 for 8-byte CID).
     /// Writes the QUIC short header and DATAGRAM frame type over the first bytes,
     /// then encrypts in-place — **no payload copy**.
+    ///
+    /// `tx_timestamp`: caller-provided OWD timestamp (microseconds, wrapping u32).
+    /// Pass `None` when CC is disabled.
     pub fn encrypt_datagram_in_place(
         &mut self,
         payload_len: usize,
         buf: &mut [u8],
+        tx_timestamp: Option<u32>,
     ) -> Result<EncryptResult, ParseError> {
         self.packets_since_key_update += 1;
         if self.packets_since_key_update == KEY_UPDATE_THRESHOLD {
@@ -286,6 +270,7 @@ impl LocalConnectionState {
             &*self.tx_header_key,
             self.tag_len,
             buf,
+            tx_timestamp,
         )
     }
 
@@ -293,14 +278,15 @@ impl LocalConnectionState {
     ///
     /// Generates ACK ranges from the received bitmap and encrypts an ACK-only
     /// 1-RTT packet. Used by the timer-driven ACK path.
+    ///
+    /// `ack_delay_us`: queuing delay to carry in the ACK frame (microseconds),
+    /// provided by the engine from the OWD tracker.
     pub fn encrypt_ack(
         &mut self,
+        ack_delay_us: u64,
         buf: &mut [u8],
     ) -> Result<EncryptResult, ParseError> {
         let ack_ranges = self.generate_ack_ranges();
-
-        // Carry OWD-computed queuing delay in the ack_delay field.
-        let ack_delay_us = self.owd_tracker.queuing_delay_us;
 
         self.packets_since_key_update += 1;
         if self.packets_since_key_update == KEY_UPDATE_THRESHOLD {
@@ -401,33 +387,6 @@ impl LocalConnectionState {
     pub fn process_ack(&mut self, ack: &AckFrame) {
         if ack.largest_acked > self.largest_acked {
             self.largest_acked = ack.largest_acked;
-        }
-        if let Some(ref mut rc) = self.rate_controller {
-            // ack_delay carries the peer's OWD-computed queuing delay (microseconds).
-            rc.on_ack(ack.ack_delay);
-        }
-    }
-
-    /// Configure the delay-based rate controller.
-    pub fn set_rate_control(&mut self, config: crate::rate_control::RateControlConfig) {
-        self.rate_controller = Some(crate::rate_control::RateController::new(config));
-    }
-
-    /// Returns `true` if the rate controller allows more data to be sent.
-    /// Always returns `true` if no rate controller is configured.
-    #[inline]
-    pub fn can_send(&self) -> bool {
-        match &self.rate_controller {
-            Some(rc) => rc.can_send(),
-            None => true,
-        }
-    }
-
-    /// Notify the rate controller that bytes were sent on the wire.
-    #[inline]
-    pub fn on_bytes_sent(&mut self, bytes: usize) {
-        if let Some(ref mut rc) = self.rate_controller {
-            rc.on_bytes_sent(bytes);
         }
     }
 

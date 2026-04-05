@@ -237,6 +237,7 @@ pub fn encrypt_packet_in_place(
     tx_header_key: &dyn HeaderKey,
     tag_len: usize,
     buf: &mut [u8],
+    tx_timestamp: Option<u32>,
 ) -> Result<EncryptResult, ParseError> {
     let (header_len, _pn_len) = packet::build_short_header(
         remote_cid,
@@ -247,10 +248,22 @@ pub fn encrypt_packet_in_place(
         buf,
     );
 
-    // Write DATAGRAM frame type byte. Payload is already at buf[header_len + 1..].
-    buf[header_len] = 0x30; // DATAGRAM_NO_LEN
+    let mut frame_pos = header_len;
 
-    let frame_pos = header_len + 1 + payload_len;
+    // OWD timestamp frame (must come before DATAGRAM_NO_LEN which consumes rest of packet).
+    if let Some(ts) = tx_timestamp {
+        frame_pos += frame::build_timestamp(ts, &mut buf[frame_pos..]);
+    }
+
+    // Write DATAGRAM frame type byte. Payload is already at buf[frame_pos + 1..].
+    // If timestamp was added, we need to shift the payload forward.
+    let ts_overhead = frame_pos - header_len;
+    if ts_overhead > 0 {
+        // Shift payload right by ts_overhead bytes to make room for timestamp.
+        buf.copy_within(header_len + 1..header_len + 1 + payload_len, frame_pos + 1);
+    }
+    buf[frame_pos] = 0x30; // DATAGRAM_NO_LEN
+    frame_pos += 1 + payload_len;
 
     seal_packet(remote_cid, pn, header_len, frame_pos, tx_packet_key, tx_header_key, tag_len, buf)
 }
@@ -455,14 +468,6 @@ pub fn cid_to_u64(cid: &[u8]) -> u64 {
     let len = cid.len().min(8);
     buf[..len].copy_from_slice(&cid[..len]);
     u64::from_ne_bytes(buf)
-}
-
-/// Coarse monotonic timestamp in nanoseconds (shared epoch across threads).
-pub fn coarse_now_ns() -> u64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 /// Convert quinn-proto key generations to (rx, tx) pairs.
