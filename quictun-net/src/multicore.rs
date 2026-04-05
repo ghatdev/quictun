@@ -1,25 +1,21 @@
 //! Per-connection multi-core engine (Phase 4).
 //!
-//! Architecture (from docs/v2-design-seed.md §3):
+//! Architecture:
 //!
 //! ```text
 //! ┌──────────────┐
-//! │  I/O Thread   │  recvmmsg → CID parse → dispatch to worker
-//! │               │  Also: handshake packets → MultiQuicState → promote
-//! │               │  Maintains: CID→worker table, global route table
+//! │  I/O Thread   │  UDP RX: recvmmsg → CID parse → dispatch to worker
+//! │               │  TUN RX: recv_multiple → IP lookup → dispatch to worker
+//! │               │  Handshakes: MultiQuicState → promote → assign worker
 //! ├──────────────┤
-//! │  Worker 0     │  Owns ConnectionManager with connections A, B
-//! │               │  decrypt → is_allowed_source → write to TUN
-//! │               │  encrypt → send to UDP
-//! │  Worker 1     │  Owns ConnectionManager with connections C, D
-//! │               │  (same as Worker 0 for its connections)
-//! ├──────────────┤
-//! │  TUN Reader   │  TUN read → global route lookup → dispatch to worker
-//! │               │  Worker encrypts → sends via UDP
+//! │  Worker 0     │  Outer: decrypt → allowed_source → TUN write (GRO pool)
+//! │               │  Inner: encrypt → GSO batch → UDP send
+//! │  Worker 1     │  (same, for its connections)
 //! └──────────────┘
 //! ```
 //!
-//! Workers read from crossbeam channels, process, and write directly to TUN/UDP
+//! I/O thread handles both UDP and TUN reads (using recv_multiple for proper
+//! GRO splitting when offload=true). Workers write directly to TUN/UDP
 //! (both are thread-safe for concurrent writes).
 
 use std::io;
@@ -237,34 +233,7 @@ pub fn run_multicore(
         worker_handles.push(handle);
     }
 
-    // Spawn TUN reader thread.
-    let reader_tun_fd = unsafe { libc::dup(tun_raw_fd) };
-    if reader_tun_fd < 0 {
-        return Err(io::Error::last_os_error())
-            .context("failed to dup TUN fd for TUN reader");
-    }
-    let tun_reader_dispatch = dispatch.clone();
-    let tun_reader_shutdown = shutdown.clone();
-    let tun_reader_worker_txs = worker_txs.clone();
-    let tunnel_ip = config.tunnel_ip;
-    let tun_reader_offload = config.offload;
-
-    let tun_reader_handle = std::thread::Builder::new()
-        .name("tun-reader".into())
-        .spawn(move || {
-            run_tun_reader(
-                reader_tun_fd,
-                tun_reader_dispatch,
-                tun_reader_worker_txs,
-                tun_reader_shutdown,
-                tunnel_ip,
-                tun_reader_offload,
-            );
-            unsafe { libc::close(reader_tun_fd) };
-        })
-        .context("failed to spawn TUN reader")?;
-
-    // Run I/O thread (this thread).
+    // Run I/O thread (this thread) — also handles TUN reads via recv_multiple.
     let result = run_io_thread(
         adapter,
         multi_state,
@@ -283,7 +252,6 @@ pub fn run_multicore(
     for handle in worker_handles {
         let _ = handle.join();
     }
-    let _ = tun_reader_handle.join();
 
     result
 }
@@ -300,9 +268,33 @@ fn run_io_thread(
     shutdown: &Arc<AtomicBool>,
 ) -> Result<RunResult> {
     let cid_len = config.cid_len;
+    let tunnel_ip = config.tunnel_ip;
     let mut recv_batch = OuterRecvBatch::new(config.batch_size);
     let mut response_buf = vec![0u8; 4096];
     let mut encrypt_buf = vec![0u8; 2048];
+
+    // TUN RX buffers (offload path uses recv_multiple for GRO splitting).
+    #[cfg(target_os = "linux")]
+    let offload_enabled = config.offload;
+    #[cfg(target_os = "linux")]
+    let mut tun_original_buf = if config.offload {
+        vec![0u8; quictun_tun::VIRTIO_NET_HDR_LEN + 65535]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun_split_bufs = if config.offload {
+        vec![vec![0u8; 1500]; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun_split_sizes = if config.offload {
+        vec![0usize; quictun_tun::IDEAL_BATCH_SIZE]
+    } else {
+        Vec::new()
+    };
+    let mut tun_pkt_buf = [0u8; 1500];
 
     loop {
         let timeout = Duration::from_millis(100); // 100ms poll tick
@@ -346,6 +338,39 @@ fn run_io_thread(
                 worker_txs,
                 dispatch,
             )?;
+        }
+
+        // ── Inner (TUN) RX → dispatch to workers ──
+        if readiness.inner {
+            #[cfg(target_os = "linux")]
+            if offload_enabled {
+                io_thread_handle_tun_offload(
+                    adapter,
+                    worker_txs,
+                    dispatch,
+                    tunnel_ip,
+                    &mut tun_original_buf,
+                    &mut tun_split_bufs,
+                    &mut tun_split_sizes,
+                );
+            } else {
+                io_thread_handle_tun_simple(
+                    adapter,
+                    worker_txs,
+                    dispatch,
+                    tunnel_ip,
+                    &mut tun_pkt_buf,
+                );
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            io_thread_handle_tun_simple(
+                adapter,
+                worker_txs,
+                dispatch,
+                tunnel_ip,
+                &mut tun_pkt_buf,
+            );
         }
 
         // ── Drive handshakes ──
@@ -430,6 +455,97 @@ fn io_thread_handle_outer(
                 };
                 // Try send — drop packet if channel full (backpressure).
                 let _ = worker_txs[worker_id].try_send(packet);
+            }
+        }
+    }
+}
+
+/// Dispatch a single IP packet from TUN to the appropriate worker.
+fn dispatch_inner_packet(
+    pkt: &[u8],
+    tunnel_ip: Ipv4Addr,
+    worker_txs: &[Sender<WorkerPacket>],
+    dispatch: &Arc<RwLock<DispatchTable>>,
+) {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return;
+    }
+    let dest_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    if dest_ip == tunnel_ip {
+        return;
+    }
+
+    let table = dispatch.read();
+    let worker_id = if let Some(wid) = table.lookup_worker_by_ip(dest_ip) {
+        wid
+    } else if worker_txs.len() == 1 {
+        0
+    } else {
+        return;
+    };
+    drop(table);
+
+    let packet = WorkerPacket::Inner {
+        data: pkt.to_vec(),
+    };
+    let _ = worker_txs[worker_id].try_send(packet);
+}
+
+/// TUN RX with offload: use recv_multiple for proper GRO splitting.
+#[cfg(target_os = "linux")]
+fn io_thread_handle_tun_offload(
+    adapter: &mut KernelAdapter,
+    worker_txs: &[Sender<WorkerPacket>],
+    dispatch: &Arc<RwLock<DispatchTable>>,
+    tunnel_ip: Ipv4Addr,
+    original_buf: &mut [u8],
+    split_bufs: &mut [Vec<u8>],
+    split_sizes: &mut [usize],
+) {
+    loop {
+        let n_pkts = match adapter.tun().recv_multiple(original_buf, split_bufs, split_sizes, 0) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                debug!(error = %e, "TUN recv_multiple failed");
+                break;
+            }
+        };
+
+        for i in 0..n_pkts {
+            let pkt_len = split_sizes[i];
+            dispatch_inner_packet(
+                &split_bufs[i][..pkt_len],
+                tunnel_ip,
+                worker_txs,
+                dispatch,
+            );
+        }
+    }
+}
+
+/// TUN RX without offload: simple per-packet read.
+fn io_thread_handle_tun_simple(
+    adapter: &mut KernelAdapter,
+    worker_txs: &[Sender<WorkerPacket>],
+    dispatch: &Arc<RwLock<DispatchTable>>,
+    tunnel_ip: Ipv4Addr,
+    pkt_buf: &mut [u8],
+) {
+    loop {
+        match adapter.tun().recv(pkt_buf) {
+            Ok(n) => {
+                dispatch_inner_packet(
+                    &pkt_buf[..n],
+                    tunnel_ip,
+                    worker_txs,
+                    dispatch,
+                );
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                debug!(error = %e, "TUN recv failed");
+                break;
             }
         }
     }
@@ -723,9 +839,22 @@ fn run_worker(
                                     Ok(r) => {
                                         if gso_count == 0 {
                                             gso_segment_size = r.len;
+                                            gso_pos += r.len;
+                                            gso_count += 1;
+                                        } else if r.len == gso_segment_size {
+                                            gso_pos += r.len;
+                                            gso_count += 1;
+                                        } else {
+                                            // Size changed — flush current batch, start new.
+                                            crate::engine_v2::flush_gso(
+                                                udp, &gso_buf, gso_pos, gso_segment_size, gso_remote,
+                                            );
+                                            entry.last_tx = Instant::now();
+                                            gso_buf.copy_within(gso_pos..gso_pos + r.len, 0);
+                                            gso_segment_size = r.len;
+                                            gso_pos = r.len;
+                                            gso_count = 1;
                                         }
-                                        gso_pos += r.len;
-                                        gso_count += 1;
                                     }
                                     Err(e) => { warn!(error = %e, "encrypt failed"); }
                                 }
@@ -869,92 +998,7 @@ fn run_worker(
     debug!(worker = id, "worker stopped");
 }
 
-// ── TUN reader thread ───────────────────────────────────────────────────
-
-fn run_tun_reader(
-    tun_fd: RawFd,
-    dispatch: Arc<RwLock<DispatchTable>>,
-    worker_txs: Vec<Sender<WorkerPacket>>,
-    shutdown: Arc<AtomicBool>,
-    tunnel_ip: Ipv4Addr,
-    offload_enabled: bool,
-) {
-    // With TUN offload, reads include a virtio_net_hdr prefix.
-    #[cfg(target_os = "linux")]
-    let hdr_len: usize = if offload_enabled { quictun_tun::VIRTIO_NET_HDR_LEN } else { 0 };
-    #[cfg(not(target_os = "linux"))]
-    let hdr_len: usize = 0;
-    let _ = offload_enabled;
-
-    let mut buf = [0u8; 65536]; // Large enough for GRO coalesced + virtio hdr
-    debug!("TUN reader started");
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let n = tun_read(tun_fd, &mut buf);
-        match n {
-            Ok(n) => {
-                if n < hdr_len + 20 {
-                    continue;
-                }
-
-                // Skip virtio header to find IP header.
-                let ip_start = hdr_len;
-                // Skip non-IPv4 packets.
-                if buf[ip_start] >> 4 != 4 {
-                    continue;
-                }
-                let dest_ip = Ipv4Addr::new(
-                    buf[ip_start + 16], buf[ip_start + 17],
-                    buf[ip_start + 18], buf[ip_start + 19],
-                );
-
-                // Skip packets destined to our own tunnel IP.
-                if dest_ip == tunnel_ip {
-                    continue;
-                }
-
-                let table = dispatch.read();
-
-                // Look up which worker handles this destination.
-                let worker_id = if let Some(wid) = table.lookup_worker_by_ip(dest_ip) {
-                    wid
-                } else if worker_txs.len() == 1 {
-                    // Single worker fallback.
-                    0
-                } else {
-                    continue;
-                };
-
-                drop(table);
-
-                // Send only the IP payload (strip virtio header if present).
-                let packet = WorkerPacket::Inner {
-                    data: buf[ip_start..n].to_vec(),
-                };
-                let _ = worker_txs[worker_id].try_send(packet);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // TUN is non-blocking — brief sleep to avoid busy spin.
-                std::thread::sleep(Duration::from_micros(100));
-            }
-            Err(e) => {
-                warn!(error = %e, "TUN read error");
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
-
-    debug!("TUN reader stopped");
-}
-
-// ── Raw TUN fd helpers ──────────────────────────────────────────────────
+// ── Raw TUN fd helper ──────────────────────────────────────────────────
 
 /// Write a packet to TUN via raw fd (thread-safe, no SyncDevice needed).
 fn tun_write(fd: RawFd, pkt: &[u8]) {
@@ -966,17 +1010,5 @@ fn tun_write(fd: RawFd, pkt: &[u8]) {
         if err.kind() != io::ErrorKind::WouldBlock {
             warn!(error = %err, len = pkt.len(), "tun_write failed");
         }
-    }
-}
-
-/// Read a packet from TUN via raw fd.
-fn tun_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let ret = unsafe {
-        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret as usize)
     }
 }
