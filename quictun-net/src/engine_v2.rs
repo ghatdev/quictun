@@ -154,6 +154,10 @@ pub fn run_v2(
 
     // ── Main poll loop ──────────────────────────────────────────────────
     loop {
+        // Flush GSO batch from previous TUN RX iteration.
+        #[cfg(target_os = "linux")]
+        adapter.flush_gso_batch();
+
         // Drain buffered TUN writes.
         while let Some(pkt) = tun_write_buf.front() {
             match adapter.tun().send(pkt) {
@@ -568,7 +572,7 @@ fn handle_tun_rx_gso(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn flush_gso(
+fn flush_gso(
     udp: &std::net::UdpSocket,
     gso_buf: &[u8],
     gso_pos: usize,

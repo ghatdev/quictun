@@ -247,6 +247,7 @@ pub fn run_multicore(
     let tun_reader_shutdown = shutdown.clone();
     let tun_reader_worker_txs = worker_txs.clone();
     let tunnel_ip = config.tunnel_ip;
+    let tun_reader_offload = config.offload;
 
     let tun_reader_handle = std::thread::Builder::new()
         .name("tun-reader".into())
@@ -257,6 +258,7 @@ pub fn run_multicore(
                 tun_reader_worker_txs,
                 tun_reader_shutdown,
                 tunnel_ip,
+                tun_reader_offload,
             );
             unsafe { libc::close(reader_tun_fd) };
         })
@@ -632,32 +634,39 @@ fn run_worker(
                         let mut close_received = false;
 
                         if let Some(entry) = manager.get_mut(&cid_key) {
-                            if let Ok(dec) = entry.conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
-                                entry.last_rx = Instant::now();
-                                if let Some(ref ack) = dec.ack {
-                                    entry.conn.process_ack(ack);
-                                }
-                                close_received = dec.close_received;
-                                if !close_received {
-                                    for dg in &dec.datagrams {
-                                        if dg.len() < 20 {
-                                            continue;
-                                        }
-                                        let src_ip = Ipv4Addr::new(dg[12], dg[13], dg[14], dg[15]);
-                                        if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
-                                            continue;
-                                        }
-                                        #[cfg(target_os = "linux")]
-                                        if offload_enabled {
-                                            gro_tx_pool.push_datagram(dg);
-                                        } else {
+                            match entry.conn.decrypt_packet_with_buf(&mut data, &mut scratch) {
+                                Ok(dec) => {
+                                    entry.last_rx = Instant::now();
+                                    if let Some(ref ack) = dec.ack {
+                                        entry.conn.process_ack(ack);
+                                    }
+                                    close_received = dec.close_received;
+                                    if !close_received {
+                                        for dg in &dec.datagrams {
+                                            if dg.len() < 20 {
+                                                continue;
+                                            }
+                                            let src_ip = Ipv4Addr::new(dg[12], dg[13], dg[14], dg[15]);
+                                            if !peer::is_allowed_source(&entry.allowed_ips, src_ip) {
+                                                continue;
+                                            }
+                                            #[cfg(target_os = "linux")]
+                                            if offload_enabled {
+                                                gro_tx_pool.push_datagram(dg);
+                                            } else {
+                                                tun_write(tun_fd, dg);
+                                            }
+                                            #[cfg(not(target_os = "linux"))]
                                             tun_write(tun_fd, dg);
                                         }
-                                        #[cfg(not(target_os = "linux"))]
-                                        tun_write(tun_fd, dg);
                                     }
                                 }
+                                Err(e) => {
+                                    warn!(error = %e, "worker decrypt failed");
+                                }
                             }
+                        } else {
+                            warn!(cid_key, "worker: CID not found");
                         }
 
                         if close_received {
@@ -868,8 +877,16 @@ fn run_tun_reader(
     worker_txs: Vec<Sender<WorkerPacket>>,
     shutdown: Arc<AtomicBool>,
     tunnel_ip: Ipv4Addr,
+    offload_enabled: bool,
 ) {
-    let mut buf = [0u8; 1500];
+    // With TUN offload, reads include a virtio_net_hdr prefix.
+    #[cfg(target_os = "linux")]
+    let hdr_len: usize = if offload_enabled { quictun_tun::VIRTIO_NET_HDR_LEN } else { 0 };
+    #[cfg(not(target_os = "linux"))]
+    let hdr_len: usize = 0;
+    let _ = offload_enabled;
+
+    let mut buf = [0u8; 65536]; // Large enough for GRO coalesced + virtio hdr
     debug!("TUN reader started");
 
     loop {
@@ -880,11 +897,20 @@ fn run_tun_reader(
         let n = tun_read(tun_fd, &mut buf);
         match n {
             Ok(n) => {
-                if n < 20 {
+                if n < hdr_len + 20 {
                     continue;
                 }
 
-                let dest_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+                // Skip virtio header to find IP header.
+                let ip_start = hdr_len;
+                // Skip non-IPv4 packets.
+                if buf[ip_start] >> 4 != 4 {
+                    continue;
+                }
+                let dest_ip = Ipv4Addr::new(
+                    buf[ip_start + 16], buf[ip_start + 17],
+                    buf[ip_start + 18], buf[ip_start + 19],
+                );
 
                 // Skip packets destined to our own tunnel IP.
                 if dest_ip == tunnel_ip {
@@ -905,8 +931,9 @@ fn run_tun_reader(
 
                 drop(table);
 
+                // Send only the IP payload (strip virtio header if present).
                 let packet = WorkerPacket::Inner {
-                    data: buf[..n].to_vec(),
+                    data: buf[ip_start..n].to_vec(),
                 };
                 let _ = worker_txs[worker_id].try_send(packet);
             }
@@ -931,8 +958,14 @@ fn run_tun_reader(
 
 /// Write a packet to TUN via raw fd (thread-safe, no SyncDevice needed).
 fn tun_write(fd: RawFd, pkt: &[u8]) {
-    unsafe {
-        libc::write(fd, pkt.as_ptr() as *const libc::c_void, pkt.len());
+    let ret = unsafe {
+        libc::write(fd, pkt.as_ptr() as *const libc::c_void, pkt.len())
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::WouldBlock {
+            warn!(error = %err, len = pkt.len(), "tun_write failed");
+        }
     }
 }
 
