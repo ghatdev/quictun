@@ -18,6 +18,9 @@ use quinn_proto::crypto::{HeaderKey, PacketKey};
 use smallvec::SmallVec;
 use tracing::warn;
 
+/// Pre-computed key pair (RX packet key, TX packet key) for key updates.
+type KeyPairQueue = VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>;
+
 use crate::bitmap::Bitmap;
 use crate::local::generate_ack_ranges_from_bitmap;
 use crate::{
@@ -178,7 +181,7 @@ impl RxState {
 
     /// Take the bitmap out (for SharedConnectionState).
     pub fn take_bitmap(&mut self) -> Bitmap {
-        std::mem::replace(&mut self.received, Bitmap::new())
+        std::mem::take(&mut self.received)
     }
 
     /// Current peer key phase.
@@ -361,7 +364,7 @@ impl RxState {
 
 /// Key update coordination state — shared between TX initiation and RX handling.
 pub struct KeyUpdateState {
-    next_keys: Mutex<VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>,
+    next_keys: Mutex<KeyPairQueue>,
     packets_since_key_update: AtomicU64,
     key_exhausted: AtomicBool,
 }
@@ -375,7 +378,7 @@ impl KeyUpdateState {
     /// Lock the next_keys deque (for SharedConnectionState key rotation).
     pub fn next_keys(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>, std::sync::PoisonError<std::sync::MutexGuard<'_, VecDeque<(Box<dyn PacketKey>, Box<dyn PacketKey>)>>>> {
+    ) -> Result<std::sync::MutexGuard<'_, KeyPairQueue>, std::sync::PoisonError<std::sync::MutexGuard<'_, KeyPairQueue>>> {
         self.next_keys.lock()
     }
 

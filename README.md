@@ -94,7 +94,7 @@ address = "10.0.0.1/24"
 listen_port = 443
 
 [engine]
-threads = 2                # 1 = single-thread, >1 = pipeline
+threads = 2                # 1 = single-thread, >1 = multi-core
 offload = true             # GRO/GSO (Linux)
 cc = "none"                # no congestion control
 
@@ -141,8 +141,8 @@ quictun down <config.toml>      # Bring down tunnel
 |-----------|---------|---------|
 | QUIC | quinn | 0.11.9 |
 | QUIC protocol | quinn-proto (forked) | 0.11.13 |
-| TLS 1.3 | rustls | 0.23.36 |
-| Crypto | aws-lc-rs | 1.16.0 |
+| TLS 1.3 | rustls | 0.23.37 |
+| Crypto | aws-lc-rs | 1.16.2 |
 | DPDK | source build (static) | 25.11.0 LTS |
 
 ALPN: `quictun-01`

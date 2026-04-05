@@ -382,19 +382,19 @@ impl<S: ConnectionState> ConnectionManager<S> {
             .find(|(_, e)| e.tunnel_ip == tunnel_ip)
             .map(|(&cid, _)| cid);
 
-        if let Some(old) = old_cid {
-            if let Some(entry) = self.remove_connection(old) {
-                info!(
-                    tunnel_ip = %entry.tunnel_ip,
-                    old_cid = %hex::encode(old.to_ne_bytes()),
-                    "evicted stale connection (peer reconnected)"
-                );
-                return Some(EvictedInfo {
-                    cid_key: old,
-                    tunnel_ip: entry.tunnel_ip,
-                    allowed_ips: entry.allowed_ips,
-                });
-            }
+        if let Some(old) = old_cid
+            && let Some(entry) = self.remove_connection(old)
+        {
+            info!(
+                tunnel_ip = %entry.tunnel_ip,
+                old_cid = %hex::encode(old.to_ne_bytes()),
+                "evicted stale connection (peer reconnected)"
+            );
+            return Some(EvictedInfo {
+                cid_key: old,
+                tunnel_ip: entry.tunnel_ip,
+                allowed_ips: entry.allowed_ips,
+            });
         }
         None
     }

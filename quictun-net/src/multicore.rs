@@ -56,7 +56,7 @@ enum WorkerPacket {
     /// New connection assigned to this worker.
     NewConnection {
         cid_key: u64,
-        entry: ConnEntry<LocalConnectionState>,
+        entry: Box<ConnEntry<LocalConnectionState>>,
     },
     /// Shutdown signal.
     Shutdown,
@@ -188,8 +188,8 @@ pub fn run_multicore(
 
     // Spawn worker threads.
     let mut worker_handles = Vec::with_capacity(num_workers);
-    for i in 0..num_workers {
-        let rx = worker_rxs[i].take().expect("worker rx already taken");
+    for (i, worker_rx) in worker_rxs.iter_mut().enumerate() {
+        let rx = worker_rx.take().expect("worker rx already taken");
         let notify = notify_tx.clone();
         let shutdown_flag = shutdown.clone();
         let udp = udp_arc.clone();
@@ -390,10 +390,10 @@ fn run_io_thread(
         // ── Handshake timeouts ──
         let now = Instant::now();
         for hs in multi_state.handshakes.values_mut() {
-            if let Some(t) = hs.connection.poll_timeout() {
-                if now >= t {
-                    hs.connection.handle_timeout(now);
-                }
+            if let Some(t) = hs.connection.poll_timeout()
+                && now >= t
+            {
+                hs.connection.handle_timeout(now);
             }
         }
 
@@ -551,6 +551,7 @@ fn io_thread_handle_tun_simple(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn io_thread_drive_handshakes(
     adapter: &mut KernelAdapter,
     multi_state: &mut MultiQuicState,
@@ -655,7 +656,7 @@ fn io_thread_drive_handshakes(
 
         let _ = worker_txs[worker_id].send(WorkerPacket::NewConnection {
             cid_key,
-            entry,
+            entry: Box::new(entry),
         });
     }
 
@@ -740,11 +741,11 @@ fn run_worker(
 
                 WorkerPacket::NewConnection { cid_key, entry } => {
                     info!(worker = id, tunnel_ip = %entry.tunnel_ip, "received new connection");
-                    manager.insert_connection(cid_key, entry);
+                    manager.insert_connection(cid_key, *entry);
                 }
 
                 WorkerPacket::Outer { data } => {
-                    if cid_len > 0 && data.len() >= 1 + cid_len {
+                    if cid_len > 0 && data.len() > cid_len {
                         let mut data = data;
                         let cid_key = cid_to_u64(&data[1..1 + cid_len]);
                         let mut close_received = false;
@@ -895,11 +896,11 @@ fn run_worker(
                 for action in manager.sweep_timeouts() {
                     match action {
                         ManagerAction::SendKeepalive { cid_key } => {
-                            if let Some(entry) = manager.get_mut(&cid_key) {
-                                if let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf) {
-                                    let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
-                                    entry.last_tx = Instant::now();
-                                }
+                            if let Some(entry) = manager.get_mut(&cid_key)
+                                && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
+                            {
+                                let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                                entry.last_tx = Instant::now();
                             }
                         }
                         ManagerAction::ConnectionRemoved { cid_key, tunnel_ip, allowed_ips, .. } => {
@@ -911,10 +912,10 @@ fn run_worker(
                 }
                 if now >= next_ack {
                     for cid_key in manager.connections_needing_ack() {
-                        if let Some(entry) = manager.get_mut(&cid_key) {
-                            if let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf) {
-                                let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
-                            }
+                        if let Some(entry) = manager.get_mut(&cid_key)
+                            && let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf)
+                        {
+                            let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                         }
                     }
                     next_ack = now + Duration::from_millis(ack_timer_ms);
@@ -963,11 +964,11 @@ fn run_worker(
         for action in manager.sweep_timeouts() {
             match action {
                 ManagerAction::SendKeepalive { cid_key } => {
-                    if let Some(entry) = manager.get_mut(&cid_key) {
-                        if let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf) {
-                            let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
-                            entry.last_tx = Instant::now();
-                        }
+                    if let Some(entry) = manager.get_mut(&cid_key)
+                        && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
+                    {
+                        let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
+                        entry.last_tx = Instant::now();
                     }
                 }
                 ManagerAction::ConnectionRemoved { cid_key, tunnel_ip, allowed_ips, .. } => {
@@ -979,10 +980,10 @@ fn run_worker(
         }
         if now >= next_ack {
             for cid_key in manager.connections_needing_ack() {
-                if let Some(entry) = manager.get_mut(&cid_key) {
-                    if let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf) {
-                        let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
-                    }
+                if let Some(entry) = manager.get_mut(&cid_key)
+                    && let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf)
+                {
+                    let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                 }
             }
             next_ack = now + Duration::from_millis(ack_timer_ms);

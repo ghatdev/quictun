@@ -366,7 +366,7 @@ impl LocalConnectionState {
     pub fn into_shared(self) -> SharedConnectionState {
         let mut split = self.into_split();
         let tag_len = split.tx.tag_len();
-        let local_cid = split.rx.local_cid().clone();
+        let local_cid = *split.rx.local_cid();
         let local_cid_len = split.rx.local_cid_len();
         let largest_rx_pn = split.rx.largest_rx_pn();
         let peer_kp = split.rx.peer_key_phase();

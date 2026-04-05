@@ -139,15 +139,15 @@ impl NatTable {
         now: Instant,
     ) -> Option<SnatResult> {
         // Fast path: existing mapping.
-        if let Some(&idx) = self.forward.get(key) {
-            if let Some(entry) = &mut self.entries[idx] {
-                entry.last_seen = now;
-                return Some(SnatResult {
-                    nat_port: entry.nat_port,
-                    peer_tunnel_ip: entry.peer_tunnel_ip,
-                    peer_cid: entry.peer_cid,
-                });
-            }
+        if let Some(&idx) = self.forward.get(key)
+            && let Some(entry) = &mut self.entries[idx]
+        {
+            entry.last_seen = now;
+            return Some(SnatResult {
+                nat_port: entry.nat_port,
+                peer_tunnel_ip: entry.peer_tunnel_ip,
+                peer_cid: entry.peer_cid,
+            });
         }
 
         // Allocate a new NAT port.
@@ -301,7 +301,7 @@ pub fn compute_port_ranges(n_workers: usize) -> Vec<(u16, u16)> {
 ///
 /// Used by the dispatcher to route return traffic to the correct worker.
 pub fn worker_for_port(port: u16, n_workers: usize) -> Option<usize> {
-    if port < NAT_PORT_START || port > NAT_PORT_END {
+    if !(NAT_PORT_START..=NAT_PORT_END).contains(&port) {
         return None;
     }
     let total = (NAT_PORT_END - NAT_PORT_START + 1) as usize;
@@ -385,7 +385,7 @@ pub fn apply_dnat(packet: &mut [u8], orig_src_ip: Ipv4Addr, orig_src_port: u16) 
 /// Incrementally fix IP header checksum after an address change.
 fn fix_ip_checksum_for_addr_change(packet: &mut [u8], old_addr: &[u8; 4], new_addr: &[u8; 4]) {
     let old_cksum = u16::from_be_bytes([packet[10], packet[11]]);
-    let mut sum: i32 = !(old_cksum) as u16 as i32;
+    let mut sum: i32 = (!old_cksum) as i32;
 
     // Subtract old address words, add new address words.
     let old_w0 = u16::from_be_bytes([old_addr[0], old_addr[1]]);
@@ -393,9 +393,9 @@ fn fix_ip_checksum_for_addr_change(packet: &mut [u8], old_addr: &[u8; 4], new_ad
     let new_w0 = u16::from_be_bytes([new_addr[0], new_addr[1]]);
     let new_w1 = u16::from_be_bytes([new_addr[2], new_addr[3]]);
 
-    sum += !(old_w0) as u16 as i32;
+    sum += (!old_w0) as i32;
     sum += new_w0 as i32;
-    sum += !(old_w1) as u16 as i32;
+    sum += (!old_w1) as i32;
     sum += new_w1 as i32;
 
     while sum > 0xffff {
@@ -430,7 +430,7 @@ fn fix_l4_checksum(
         return;
     }
 
-    let mut sum: i32 = !(old_cksum) as u16 as i32;
+    let mut sum: i32 = (!old_cksum) as i32;
 
     // IP address change (pseudo-header).
     let old_w0 = u16::from_be_bytes([old_addr[0], old_addr[1]]);
@@ -438,13 +438,13 @@ fn fix_l4_checksum(
     let new_w0 = u16::from_be_bytes([new_addr[0], new_addr[1]]);
     let new_w1 = u16::from_be_bytes([new_addr[2], new_addr[3]]);
 
-    sum += !(old_w0) as u16 as i32;
+    sum += (!old_w0) as i32;
     sum += new_w0 as i32;
-    sum += !(old_w1) as u16 as i32;
+    sum += (!old_w1) as i32;
     sum += new_w1 as i32;
 
     // Port change.
-    sum += !(old_port) as u16 as i32;
+    sum += (!old_port) as i32;
     sum += new_port as i32;
 
     while sum > 0xffff {

@@ -393,12 +393,12 @@ fn run_engine(
                             }
                         } else { false };
 
-                    if close_received {
-                        if let Some(entry) = manager.remove_connection(cid_key) {
-                            info!(tunnel_ip = %entry.tunnel_ip, "peer sent CONNECTION_CLOSE");
-                            for net in &entry.allowed_ips {
-                                let _ = adapter.remove_os_route(*net);
-                            }
+                    if close_received
+                        && let Some(entry) = manager.remove_connection(cid_key)
+                    {
+                        info!(tunnel_ip = %entry.tunnel_ip, "peer sent CONNECTION_CLOSE");
+                        for net in &entry.allowed_ips {
+                            let _ = adapter.remove_os_route(*net);
                         }
                     }
                 }
@@ -450,13 +450,13 @@ fn run_engine(
         for action in actions {
             match action {
                 ManagerAction::SendKeepalive { cid_key } => {
-                    if let Some(entry) = manager.get_mut(&cid_key) {
-                        if let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf) {
-                            let _ = adapter.udp_socket().send_to(
-                                &encrypt_buf[..r.len], entry.remote_addr,
-                            );
-                            entry.last_tx = Instant::now();
-                        }
+                    if let Some(entry) = manager.get_mut(&cid_key)
+                        && let Ok(r) = entry.conn.encrypt_datagram(&[], &mut encrypt_buf)
+                    {
+                        let _ = adapter.udp_socket().send_to(
+                            &encrypt_buf[..r.len], entry.remote_addr,
+                        );
+                        entry.last_tx = Instant::now();
                     }
                 }
                 ManagerAction::ConnectionRemoved { allowed_ips, .. } => {
@@ -471,12 +471,12 @@ fn run_engine(
         let now = Instant::now();
         if now >= next_ack {
             for cid_key in manager.connections_needing_ack() {
-                if let Some(entry) = manager.get_mut(&cid_key) {
-                    if let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf) {
-                        let _ = adapter.udp_socket().send_to(
-                            &encrypt_buf[..r.len], entry.remote_addr,
-                        );
-                    }
+                if let Some(entry) = manager.get_mut(&cid_key)
+                    && let Ok(r) = entry.conn.encrypt_ack(&mut encrypt_buf)
+                {
+                    let _ = adapter.udp_socket().send_to(
+                        &encrypt_buf[..r.len], entry.remote_addr,
+                    );
                 }
             }
             next_ack = now + ack_interval;
@@ -502,8 +502,10 @@ fn run_engine(
 
             let hs_now = Instant::now();
             for hs in multi_state.handshakes.values_mut() {
-                if let Some(t) = hs.connection.poll_timeout() {
-                    if hs_now >= t { hs.connection.handle_timeout(hs_now); }
+                if let Some(t) = hs.connection.poll_timeout()
+                    && hs_now >= t
+                {
+                    hs.connection.handle_timeout(hs_now);
                 }
             }
 
@@ -840,25 +842,25 @@ pub(crate) fn create_udp_socket(
     let _ = sock.set_send_buffer_size(send_buf);
     let _ = sock.set_recv_buffer_size(recv_buf);
 
-    if let Ok(actual_recv) = sock.recv_buffer_size() {
-        if actual_recv < recv_buf / 2 {
-            warn!(
-                requested = recv_buf,
-                actual = actual_recv,
-                "UDP recv buffer clamped by kernel — set net.core.rmem_max >= {} to avoid packet drops",
-                recv_buf,
-            );
-        }
+    if let Ok(actual_recv) = sock.recv_buffer_size()
+        && actual_recv < recv_buf / 2
+    {
+        warn!(
+            requested = recv_buf,
+            actual = actual_recv,
+            "UDP recv buffer clamped by kernel — set net.core.rmem_max >= {} to avoid packet drops",
+            recv_buf,
+        );
     }
-    if let Ok(actual_send) = sock.send_buffer_size() {
-        if actual_send < send_buf / 2 {
-            warn!(
-                requested = send_buf,
-                actual = actual_send,
-                "UDP send buffer clamped by kernel — set net.core.wmem_max >= {}",
-                send_buf,
-            );
-        }
+    if let Ok(actual_send) = sock.send_buffer_size()
+        && actual_send < send_buf / 2
+    {
+        warn!(
+            requested = send_buf,
+            actual = actual_send,
+            "UDP send buffer clamped by kernel — set net.core.wmem_max >= {}",
+            send_buf,
+        );
     }
 
     sock.bind(&addr.into())

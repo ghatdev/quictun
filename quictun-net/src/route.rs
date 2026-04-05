@@ -200,8 +200,8 @@ fn pf_route_inner(fd: i32, msg_type: u8, dst: Ipv4Net, ifname: &str) -> io::Resu
     hdr.rtm_msglen = msg_len as u16;
     hdr.rtm_version = libc::RTM_VERSION as u8;
     hdr.rtm_type = msg_type;
-    hdr.rtm_addrs = (libc::RTA_DST | libc::RTA_NETMASK) as i32;
-    hdr.rtm_flags = (libc::RTF_UP | libc::RTF_STATIC) as i32;
+    hdr.rtm_addrs = libc::RTA_DST | libc::RTA_NETMASK;
+    hdr.rtm_flags = libc::RTF_UP | libc::RTF_STATIC;
     hdr.rtm_pid = unsafe { libc::getpid() };
     hdr.rtm_seq = 1;
 

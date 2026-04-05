@@ -285,6 +285,7 @@ pub fn encrypt_ack_packet(
 }
 
 /// Shared AEAD seal + header protection for encrypt_packet/encrypt_ack_packet.
+#[allow(clippy::too_many_arguments)]
 fn seal_packet(
     remote_cid: &ConnectionId,
     pn: u64,

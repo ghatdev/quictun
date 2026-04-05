@@ -121,8 +121,8 @@ fn find_mss_option(opts: &[u8]) -> Option<usize> {
 /// Given old checksum HC, old value m, new value m', computes:
 ///   HC' = ~(~HC + ~m + m')
 fn incremental_checksum_update(old_cksum: u16, old_val: u16, new_val: u16) -> u16 {
-    let mut sum: i32 = !(old_cksum) as u16 as i32;
-    sum += !(old_val) as u16 as i32;
+    let mut sum: i32 = (!old_cksum) as i32;
+    sum += (!old_val) as i32;
     sum += new_val as i32;
     // Fold carry.
     while sum > 0xffff {

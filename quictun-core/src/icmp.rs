@@ -164,8 +164,8 @@ fn internet_checksum(data: &[u8]) -> u16 {
 
 /// RFC 1624 incremental checksum update.
 fn incremental_update(old_cksum: u16, old_val: u16, new_val: u16) -> u16 {
-    let mut sum: i32 = !(old_cksum) as u16 as i32;
-    sum += !(old_val) as u16 as i32;
+    let mut sum: i32 = (!old_cksum) as i32;
+    sum += (!old_val) as i32;
     sum += new_val as i32;
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);

@@ -585,12 +585,10 @@ impl Config {
         }
 
         // ── DPDK field validation ──
-        if backend != Backend::Kernel {
-            if self.engine.dpdk_local_ip.is_none() {
-                return Err(ConfigError::Invalid(
-                    "DPDK backends require dpdk_local_ip in [engine]".into(),
-                ));
-            }
+        if backend != Backend::Kernel && self.engine.dpdk_local_ip.is_none() {
+            return Err(ConfigError::Invalid(
+                "DPDK backends require dpdk_local_ip in [engine]".into(),
+            ));
         }
 
         Ok(())
