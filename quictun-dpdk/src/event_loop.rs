@@ -226,10 +226,17 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
     } else if hw_udp_cksum && hw_ip_cksum {
         tracing::info!("using hardware TX checksum offload (UDP + IP)");
         ChecksumMode::HardwareFull
-    } else if hw_udp_cksum {
-        tracing::info!("using hardware TX UDP checksum offload (IP in software)");
-        ChecksumMode::HardwareUdpOnly
     } else {
+        // Don't trust HW UDP offload without HW IP offload.
+        // virtio-pci on Proxmox reports hw_udp_cksum=true but doesn't actually
+        // compute checksums on TX — packets go out with invalid checksums,
+        // causing kernel UDP stacks (non-DPDK peers) to silently drop them.
+        if hw_udp_cksum && !hw_ip_cksum {
+            tracing::warn!(
+                "NIC reports hw_udp_cksum but not hw_ip_cksum — \
+                 falling back to software (virtio TX offload unreliable)"
+            );
+        }
         tracing::info!("using optimized software UDP checksum");
         ChecksumMode::Software
     };
