@@ -450,7 +450,7 @@ fn default_target_delay_ms() -> u64 {
 }
 
 fn default_initial_rate_mbps() -> u64 {
-    1000
+    10000
 }
 
 fn default_min_rate_mbps() -> u64 {

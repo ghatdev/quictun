@@ -258,6 +258,10 @@ fn run_engine(
 
     info!("engine starting");
 
+    // ── CC timestamps ──────────────────────────────────────────────────
+    let cc_epoch = Instant::now();
+    let cc_enabled = config.rate_control_config.is_some();
+
     // ── Pre-allocated buffers ───────────────────────────────────────────
     let mut recv_batch = OuterRecvBatch::new(config.batch_size);
     let mut scratch = BytesMut::with_capacity(MAX_PACKET);
@@ -375,6 +379,11 @@ fn run_engine(
                                         entry.conn.process_ack(ack);
                                         entry.on_ack(ack);
                                     }
+                                    // OWD sample from sender's timestamp.
+                                    if let Some(tx_us) = decrypted.tx_timestamp {
+                                        let rx_us = (cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32;
+                                        entry.on_owd_sample(tx_us, rx_us);
+                                    }
                                     if !decrypted.close_received {
                                         for datagram in &decrypted.datagrams {
                                             if datagram.len() < 20 { continue; }
@@ -440,16 +449,19 @@ fn run_engine(
                     &mut manager, adapter.tun(), adapter.udp_socket(),
                     &mut gso_buf, &mut tun_original_buf,
                     &mut tun_split_bufs, &mut tun_split_sizes,
+                    cc_epoch, cc_enabled,
                 );
             } else {
                 handle_tun_rx_gso(
                     &mut manager, adapter.tun(), adapter.udp_socket(), &mut gso_buf,
+                    cc_epoch, cc_enabled,
                 );
             }
 
             #[cfg(not(target_os = "linux"))]
             handle_tun_rx_simple(
                 &mut manager, adapter.tun(), adapter.udp_socket(), &mut encrypt_buf,
+                cc_epoch, cc_enabled,
             );
         }
 
@@ -581,6 +593,8 @@ fn handle_tun_rx_gso(
     tun: &tun_rs::SyncDevice,
     udp: &std::net::UdpSocket,
     gso_buf: &mut [u8],
+    cc_epoch: Instant,
+    cc_enabled: bool,
 ) {
     let max_segs = gso_buf.len() / MAX_PACKET;
     let mut gso_pos: usize = 0;
@@ -632,7 +646,12 @@ fn handle_tun_rx_gso(
                 current_cid = Some(cid);
                 current_remote = Some(entry.remote_addr);
 
-                match entry.conn.encrypt_datagram(&packet[..n], &mut gso_buf[gso_pos..], None) {
+                let tx_ts = if cc_enabled {
+                    Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
+                } else {
+                    None
+                };
+                match entry.conn.encrypt_datagram(&packet[..n], &mut gso_buf[gso_pos..], tx_ts) {
                     Ok(result) => {
                         entry.on_bytes_sent(result.len);
                         if gso_count == 0 {
@@ -689,6 +708,8 @@ fn handle_tun_rx_simple(
     tun: &tun_rs::SyncDevice,
     udp: &std::net::UdpSocket,
     encrypt_buf: &mut [u8],
+    cc_epoch: Instant,
+    cc_enabled: bool,
 ) {
     let mut packet = [0u8; MAX_PACKET];
     loop {
@@ -705,7 +726,12 @@ fn handle_tun_rx_simple(
                 };
                 let entry = match manager.get_mut(&cid) { Some(e) => e, None => continue };
                 if !entry.can_send() { break; }
-                match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf, None) {
+                let tx_ts = if cc_enabled {
+                    Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
+                } else {
+                    None
+                };
+                match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf, tx_ts) {
                     Ok(result) => {
                         let _ = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr);
                         entry.on_bytes_sent(result.len);
@@ -745,6 +771,8 @@ fn handle_tun_rx_offload(
     original_buf: &mut [u8],
     split_bufs: &mut [Vec<u8>],
     split_sizes: &mut [usize],
+    cc_epoch: Instant,
+    cc_enabled: bool,
 ) {
     use smallvec::SmallVec;
     let max_segs = gso_buf.len() / MAX_PACKET;
@@ -775,7 +803,7 @@ fn handle_tun_rx_offload(
             if !manager.get(&cid).map_or(true, |e| e.can_send()) {
                 if let Some(prev_cid) = batch_cid {
                     if !batch_indices.is_empty() {
-                        flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs);
+                        flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs, cc_epoch, cc_enabled);
                     }
                 }
                 break;
@@ -783,7 +811,7 @@ fn handle_tun_rx_offload(
 
             if let Some(prev_cid) = batch_cid {
                 if prev_cid != cid && !batch_indices.is_empty() {
-                    flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs);
+                    flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs, cc_epoch, cc_enabled);
                     batch_indices.clear();
                 }
             }
@@ -791,14 +819,14 @@ fn handle_tun_rx_offload(
             batch_indices.push(i);
 
             if batch_indices.len() >= max_segs {
-                flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, cid, max_segs);
+                flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, cid, max_segs, cc_epoch, cc_enabled);
                 batch_indices.clear();
             }
         }
 
         if let Some(cid) = batch_cid {
             if !batch_indices.is_empty() {
-                flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, cid, max_segs);
+                flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, cid, max_segs, cc_epoch, cc_enabled);
             }
         }
     }
@@ -814,6 +842,8 @@ fn flush_offload_batch(
     indices: &[usize],
     cid: u64,
     _max_segs: usize,
+    cc_epoch: Instant,
+    cc_enabled: bool,
 ) {
     let entry = match manager.get_mut(&cid) { Some(e) => e, None => return };
     let mut gso_pos = 0usize;
@@ -822,7 +852,12 @@ fn flush_offload_batch(
 
     for &idx in indices {
         let pkt = &split_bufs[idx][..split_sizes[idx]];
-        match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..], None) {
+        let tx_ts = if cc_enabled {
+            Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
+        } else {
+            None
+        };
+        match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..], tx_ts) {
             Ok(result) => {
                 entry.on_bytes_sent(result.len);
                 if gso_count == 0 {

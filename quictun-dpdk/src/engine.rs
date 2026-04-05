@@ -507,8 +507,11 @@ pub fn run(
         } else {
             BURST_SIZE as u16
         };
-        let nb = if !pending_outer_tx.is_empty() {
-            0 // back-pressure: drain pending mbufs first
+        // Rate-limit backpressure: skip inner RX when CC says stop.
+        let cc_blocked = cc_enabled
+            && manager.values().next().map_or(false, |e| !e.can_send());
+        let nb = if !pending_outer_tx.is_empty() || cc_blocked {
+            0 // back-pressure: drain pending mbufs / wait for CC budget
         } else {
             port::rx_burst(inner.port_id, 0, &mut inner_rx_mbufs, inner_burst)
         };
@@ -561,8 +564,15 @@ pub fn run(
                     };
 
                     // CC: check rate controller before sending.
+                    // Break (not continue) to stop processing more inner
+                    // packets — leaving them in the kernel TUN buffer is
+                    // better than dropping them one by one.
                     if !entry.can_send() {
-                        continue;
+                        // Free remaining mbufs from this burst.
+                        for j in (i + 1)..nb as usize {
+                            unsafe { ffi::shim_rte_pktmbuf_free(inner_rx_mbufs[j]) };
+                        }
+                        break;
                     }
 
                     // Zero-copy encrypt: reuse the inner RX mbuf.

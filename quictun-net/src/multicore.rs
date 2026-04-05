@@ -200,6 +200,7 @@ pub fn run_multicore(
         let cid_len = config.cid_len;
         let offload = config.offload;
         let gso_segs = config.gso_max_segments;
+        let rc_config = config.rate_control_config;
 
         // dup() the TUN fd for this worker.
         let worker_tun_fd = unsafe { libc::dup(tun_raw_fd) };
@@ -225,6 +226,7 @@ pub fn run_multicore(
                     offload,
                     gso_segs,
                     shutdown_flag,
+                    rc_config,
                 );
                 // Close the dup'd fd.
                 unsafe { libc::close(worker_tun_fd) };
@@ -295,6 +297,10 @@ fn run_io_thread(
         Vec::new()
     };
     let mut tun_pkt_buf = [0u8; MAX_PACKET];
+
+    // CC timestamps for delay-based congestion control.
+    let cc_epoch = Instant::now();
+    let cc_enabled = config.rate_control_config.is_some();
 
     loop {
         let timeout = Duration::from_millis(100); // 100ms poll tick
@@ -706,7 +712,10 @@ fn run_worker(
     offload_enabled: bool,
     gso_max_segments: usize,
     shutdown: Arc<AtomicBool>,
+    rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 ) {
+    let cc_epoch = Instant::now();
+    let cc_enabled = rate_control_config.is_some();
     let mut manager = ConnectionManager::<LocalConnectionState>::new(
         tunnel_ip, false, max_peers, idle_timeout,
     );
@@ -764,6 +773,10 @@ fn run_worker(
                                         entry.conn.process_ack(ack);
                                         entry.on_ack(ack);
                                     }
+                                    if let Some(tx_us) = dec.tx_timestamp {
+                                        let rx_us = (cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32;
+                                        entry.on_owd_sample(tx_us, rx_us);
+                                    }
                                     close_received = dec.close_received;
                                     if !close_received {
                                         for dg in &dec.datagrams {
@@ -819,9 +832,9 @@ fn run_worker(
                             _ => continue,
                         };
 
-                        // Rate control: skip if over budget.
+                        // Rate control: stop reading from TUN when over budget.
                         if !manager.get(&cid).map_or(true, |e| e.can_send()) {
-                            continue;
+                            break;
                         }
 
                         #[cfg(target_os = "linux")]
@@ -848,7 +861,12 @@ fn run_worker(
                             if let Some(entry) = manager.get_mut(&cid) {
                                 gso_current_cid = Some(cid);
                                 gso_remote = entry.remote_addr;
-                                match entry.conn.encrypt_datagram(&data, &mut gso_buf[gso_pos..], None) {
+                                let tx_ts = if cc_enabled {
+                                    Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
+                                } else {
+                                    None
+                                };
+                                match entry.conn.encrypt_datagram(&data, &mut gso_buf[gso_pos..], tx_ts) {
                                     Ok(r) => {
                                         entry.on_bytes_sent(r.len);
                                         if gso_count == 0 {
@@ -878,8 +896,13 @@ fn run_worker(
                         #[cfg(not(target_os = "linux"))]
                         {
                             if let Some(entry) = manager.get_mut(&cid) {
-                                if !entry.can_send() { continue; }
-                                match entry.conn.encrypt_datagram(&data, &mut encrypt_buf, None) {
+                                if !entry.can_send() { break; }
+                                let tx_ts = if cc_enabled {
+                                    Some((cc_epoch.elapsed().as_micros() & 0xFFFF_FFFF) as u32)
+                                } else {
+                                    None
+                                };
+                                match entry.conn.encrypt_datagram(&data, &mut encrypt_buf, tx_ts) {
                                     Ok(r) => {
                                         entry.on_bytes_sent(r.len);
                                         let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
