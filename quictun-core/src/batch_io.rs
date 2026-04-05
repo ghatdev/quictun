@@ -225,9 +225,10 @@ pub fn send_gso(
         iov_len: buf.len(),
     };
 
-    // cmsg buffer for UDP_SEGMENT (u16).
+    // cmsg buffer for UDP_SEGMENT (u16). Stack-allocated to avoid heap alloc per call.
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
+    debug_assert!(cmsg_space <= 64, "CMSG_SPACE(u16) unexpectedly large: {cmsg_space}");
+    let mut cmsg_buf = [0u8; 64];
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &sockaddr as *const _ as *mut libc::c_void;
@@ -268,7 +269,8 @@ pub fn recv_gro(fd: &impl AsRawFd, buf: &mut [u8]) -> io::Result<(usize, usize)>
     };
 
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
+    debug_assert!(cmsg_space <= 64, "CMSG_SPACE(u16) unexpectedly large: {cmsg_space}");
+    let mut cmsg_buf = [0u8; 64];
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iovec;
@@ -313,7 +315,8 @@ pub fn recv_gro_from(
     };
 
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
+    debug_assert!(cmsg_space <= 64, "CMSG_SPACE(u16) unexpectedly large: {cmsg_space}");
+    let mut cmsg_buf = [0u8; 64];
 
     let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
