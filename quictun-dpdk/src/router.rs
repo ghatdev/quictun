@@ -31,6 +31,7 @@ use quictun_proto::cid_to_u64;
 use quictun_proto::shared::SharedConnectionState;
 
 use crate::engine::resolve_completed_handshake;
+use crate::event_loop::{DpdkConfig, SendPtr};
 
 use quictun_proto::local::LocalConnectionState;
 
@@ -3474,4 +3475,195 @@ fn rebuild_routing_table_shared(
             .unwrap_or(u32::from(peer.tunnel_ip) as u64);
         routing_table.add_peer_routes(cid_key, &peer.allowed_ips);
     }
+}
+
+// ── Entry point (single-core / multi-core dispatch) ────────────────��────
+
+/// Top-level entry point for router mode (single-core or multicore).
+///
+/// Handles the single vs multicore dispatch, port reconfiguration for
+/// multi-queue TX, thread spawning, and scope join.
+/// Called from `event_loop::run()` after shared setup.
+#[allow(clippy::too_many_arguments)]
+pub fn entry(
+    outer_port_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    multi_state: &mut MultiQuicState,
+    identity: &mut NetIdentity,
+    arp_table: &mut ArpTable,
+    shutdown: Arc<AtomicBool>,
+    dpdk_config: &DpdkConfig,
+    checksum_mode: ChecksumMode,
+    server_config_clone: Option<Arc<quinn_proto::ServerConfig>>,
+) -> Result<()> {
+    let n_cores = dpdk_config.n_cores.max(1);
+    let mss_clamp = if dpdk_config.mss_clamp > 0 {
+        dpdk_config.mss_clamp
+    } else {
+        dpdk_config.tunnel_mtu.saturating_sub(40) // auto: MTU - IP(20) - TCP(20)
+    };
+
+    if n_cores == 1 {
+        tracing::info!(
+            enable_nat = dpdk_config.enable_nat,
+            mss_clamp,
+            "starting router mode (single NIC, single core)"
+        );
+        return run_router(
+            outer_port_id,
+            0, // queue_id
+            mempool,
+            multi_state,
+            identity,
+            arp_table,
+            shutdown,
+            dpdk_config.adaptive_poll,
+            checksum_mode,
+            &dpdk_config.peers,
+            dpdk_config.enable_nat,
+            mss_clamp,
+            dpdk_config.tunnel_ip,
+            dpdk_config.tunnel_mtu,
+            dpdk_config.max_peers,
+            dpdk_config.idle_timeout,
+        );
+    }
+
+    // Multi-core router: pipeline architecture (SharedConnectionState).
+    // Core 0 = I/O (RX classify, handshake, ACK, keepalive),
+    // Workers 1..N = crypto + routing + NAT (round-robin, any connection).
+    let n_workers = n_cores - 1;
+
+    // Restrict to listener mode.
+    let multi_server_config = server_config_clone
+        .ok_or_else(|| anyhow::anyhow!("multi-core router requires listener mode"))?;
+    let mut multi_state = MultiQuicState::new(multi_server_config);
+
+    // Router workers TX directly on per-worker TX queues. Reconfigure
+    // outer port with N TX queues. (Virtio-pci drops on queue > 0;
+    // router pipeline on virtio requires outer_tx ring approach — TODO.)
+    crate::port::stop_port(outer_port_id);
+    let (new_mac, hw_udp, hw_ip) =
+        crate::port::configure_port_dispatcher(outer_port_id, n_cores as u16, mempool)?;
+    identity.local_mac = new_mac;
+    let checksum_mode = if dpdk_config.no_udp_checksum {
+        ChecksumMode::None
+    } else if hw_udp && hw_ip {
+        ChecksumMode::HardwareFull
+    } else if hw_udp {
+        ChecksumMode::HardwareUdpOnly
+    } else {
+        ChecksumMode::Software
+    };
+
+    // Create per-worker router pipeline ring bundles (2 rings each).
+    let mut pipeline_rings: Vec<RouterPipelineRings> = Vec::with_capacity(n_workers);
+    for i in 0..n_workers {
+        pipeline_rings.push(RouterPipelineRings::new(i)?);
+    }
+
+    // Compute NAT port ranges.
+    let port_ranges = quictun_core::nat::compute_port_ranges(n_workers);
+
+    let adaptive_poll = dpdk_config.adaptive_poll;
+    let enable_nat = dpdk_config.enable_nat;
+    let tunnel_ip = dpdk_config.tunnel_ip;
+    let tunnel_mtu = dpdk_config.tunnel_mtu;
+    let peers = &dpdk_config.peers;
+
+    tracing::info!(
+        n_workers,
+        enable_nat,
+        mss_clamp,
+        "starting router pipeline mode (multi-core)"
+    );
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_workers);
+
+        for (idx, rings) in pipeline_rings.iter().enumerate() {
+            let shutdown = shutdown.clone();
+            let worker_identity = identity.clone();
+            let worker_arp = arp_table.clone();
+            let mempool = SendPtr(mempool);
+            let (port_start, port_end) = port_ranges[idx];
+            let peers_ref = peers;
+
+            handles.push(s.spawn(move || -> Result<()> {
+                let mempool = mempool.as_ptr();
+                let core_idx = idx + 1; // core 0 is I/O
+                let tx_queue = core_idx as u16;
+
+                // Pin thread to CPU.
+                #[cfg(target_os = "linux")]
+                {
+                    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                    unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
+                    let ret = unsafe {
+                        libc::sched_setaffinity(
+                            0,
+                            std::mem::size_of::<libc::cpu_set_t>(),
+                            &cpuset,
+                        )
+                    };
+                    if ret == 0 {
+                        tracing::info!(core = core_idx, "pinned router pipeline worker to CPU");
+                    } else {
+                        tracing::warn!(core = core_idx, "failed to pin router pipeline worker to CPU");
+                    }
+                }
+
+                run_router_pipeline_worker(
+                    outer_port_id,
+                    tx_queue,
+                    mempool,
+                    rings,
+                    &worker_identity,
+                    &worker_arp,
+                    &shutdown,
+                    adaptive_poll,
+                    checksum_mode,
+                    peers_ref,
+                    enable_nat,
+                    mss_clamp,
+                    tunnel_ip,
+                    tunnel_mtu,
+                    core_idx,
+                    port_start,
+                    port_end,
+                )
+            }));
+        }
+
+        // Run pipeline I/O on core 0 (this thread).
+        let io_result = run_router_pipeline_io(
+            outer_port_id,
+            mempool,
+            &mut multi_state,
+            &pipeline_rings,
+            identity,
+            arp_table,
+            &shutdown,
+            adaptive_poll,
+            checksum_mode,
+            peers,
+            enable_nat,
+            tunnel_ip,
+            n_workers,
+            dpdk_config.max_peers,
+            dpdk_config.idle_timeout,
+        );
+
+        // Signal shutdown and wait for workers.
+        shutdown.store(true, Ordering::Release);
+        let mut result = io_result;
+        for handle in handles {
+            if let Err(e) = handle.join().expect("router pipeline worker panicked") {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
+        result
+    })
 }

@@ -7,7 +7,8 @@ use anyhow::Result;
 use bytes::BytesMut;
 use rustc_hash::FxHashMap;
 
-use crate::dispatch::ConnectionEntry;
+use crate::dispatch::{ConnectionEntry, PipelineRings};
+use crate::event_loop::{DpdkConfig, SendPtr};
 use crate::ffi;
 use crate::mbuf::Mbuf;
 use crate::net::{self, ArpTable, ChecksumMode, NetIdentity, ParsedPacket};
@@ -1977,7 +1978,7 @@ pub fn run_worker(
 // Workers 1..N = crypto workers (decrypt/encrypt via SharedConnectionState).
 // Packets are round-robin distributed — any worker processes any connection.
 
-use crate::dispatch::{PipelineConnection, PipelineControlMessage, PipelineRings};
+use crate::dispatch::{PipelineConnection, PipelineControlMessage};
 use quictun_proto::shared::SharedConnectionState;
 
 /// ACK generation interval.
@@ -2855,4 +2856,148 @@ fn format_mac(mac: &[u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+// ── Entry point (single-core / multi-core dispatch) ─────────────────────
+
+/// Top-level entry point for virtio/TAP mode (single-core or multicore).
+///
+/// Handles the single vs multicore dispatch, thread spawning, and scope join.
+/// Called from `event_loop::run()` after shared setup.
+#[allow(clippy::too_many_arguments)]
+pub fn entry(
+    outer_port_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    multi_state: &mut MultiQuicState,
+    inner_ports: Vec<InnerPort>,
+    identity: &NetIdentity,
+    arp_table: &mut ArpTable,
+    shutdown: Arc<AtomicBool>,
+    dpdk_config: &DpdkConfig,
+    checksum_mode: ChecksumMode,
+    server_config_clone: Option<Arc<quinn_proto::ServerConfig>>,
+) -> Result<()> {
+    let n_cores = dpdk_config.n_cores.max(1);
+
+    if n_cores == 1 {
+        let inner = inner_ports
+            .into_iter()
+            .next()
+            .expect("exactly 1 inner port");
+        return run(
+            outer_port_id,
+            0, // queue_id
+            mempool,
+            multi_state,
+            identity,
+            arp_table,
+            inner,
+            shutdown,
+            dpdk_config.adaptive_poll,
+            checksum_mode,
+            &dpdk_config.peers,
+            dpdk_config.tunnel_ip,
+            dpdk_config.max_peers,
+            dpdk_config.idle_timeout,
+        );
+    }
+
+    // Multi-core: pipeline architecture (SharedConnectionState).
+    // Core 0 = I/O, Workers 1..N = crypto (round-robin, any-connection).
+    let n_workers = n_cores - 1;
+
+    // Build multi-client QUIC state (listener only for multi-core).
+    let multi_server_config = server_config_clone
+        .ok_or_else(|| anyhow::anyhow!("multi-core DPDK requires listener mode"))?;
+    let mut multi_state = MultiQuicState::new(multi_server_config);
+
+    // Create per-worker pipeline ring bundles.
+    let mut pipeline_rings: Vec<PipelineRings> = Vec::with_capacity(n_workers);
+    for i in 0..n_workers {
+        pipeline_rings.push(PipelineRings::new(i)?);
+    }
+
+    // Single inner port on core 0.
+    let inner = inner_ports
+        .into_iter()
+        .next()
+        .expect("at least 1 inner port");
+
+    let adaptive_poll = dpdk_config.adaptive_poll;
+
+    // Spawn pipeline worker threads (pinned to cores 1..N).
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_workers);
+
+        for (idx, rings) in pipeline_rings.iter().enumerate() {
+            let shutdown = shutdown.clone();
+            let worker_identity = identity.clone();
+            let inner_eth_hdr = &inner.eth_hdr;
+            let mempool = SendPtr(mempool);
+
+            handles.push(s.spawn(move || -> Result<()> {
+                let mempool = mempool.as_ptr();
+                let core_idx = idx + 1; // core 0 is I/O
+                // Pin thread to CPU.
+                #[cfg(target_os = "linux")]
+                {
+                    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                    unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
+                    let ret = unsafe {
+                        libc::sched_setaffinity(
+                            0,
+                            std::mem::size_of::<libc::cpu_set_t>(),
+                            &cpuset,
+                        )
+                    };
+                    if ret == 0 {
+                        tracing::info!(core = core_idx, "pinned pipeline worker to CPU");
+                    } else {
+                        tracing::warn!(core = core_idx, "failed to pin pipeline worker to CPU");
+                    }
+                }
+
+                run_pipeline_worker(
+                    mempool,
+                    rings,
+                    inner_eth_hdr,
+                    &worker_identity,
+                    &shutdown,
+                    adaptive_poll,
+                    checksum_mode,
+                    core_idx,
+                )
+            }));
+        }
+
+        // Run pipeline I/O on core 0 (this thread).
+        let io_result = run_pipeline_io(
+            outer_port_id,
+            mempool,
+            &mut multi_state,
+            &pipeline_rings,
+            identity,
+            arp_table,
+            &inner,
+            &dpdk_config.peers,
+            &shutdown,
+            adaptive_poll,
+            checksum_mode,
+            dpdk_config.tunnel_ip,
+            dpdk_config.max_peers,
+            dpdk_config.idle_timeout,
+        );
+
+        // Signal shutdown and wait for workers.
+        shutdown.store(true, Ordering::Release);
+        let mut result = io_result;
+        for handle in handles {
+            if let Err(e) = handle.join().expect("pipeline worker panicked") {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
+        result
+    })
 }

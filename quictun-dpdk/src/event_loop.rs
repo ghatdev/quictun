@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::dispatch::{PipelineRings, RouterPipelineRings};
 use crate::eal::Eal;
 use crate::engine::{self, InnerEthHeader, InnerPort};
 use crate::ffi;
@@ -21,11 +20,11 @@ use quictun_core::peer::PeerConfig;
 /// SAFETY: The caller must ensure that the pointee is safe to access from another
 /// thread. DPDK mempools (`rte_mempool`) are thread-safe by design.
 #[derive(Clone, Copy)]
-struct SendPtr<T>(*mut T);
+pub(crate) struct SendPtr<T>(pub(crate) *mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
-    fn as_ptr(self) -> *mut T {
+    pub(crate) fn as_ptr(self) -> *mut T {
         self.0
     }
 }
@@ -293,189 +292,23 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
 
     // Router mode: no inner port, single NIC handles everything.
     if dpdk_config.router {
-        // Set up signal handler.
         let sig_shutdown = shutdown.clone();
         unsafe {
             libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
         }
         SHUTDOWN_FLAG.store(Arc::into_raw(sig_shutdown) as usize, Ordering::Release);
 
-        let mss_clamp = if dpdk_config.mss_clamp > 0 {
-            dpdk_config.mss_clamp
-        } else {
-            dpdk_config.tunnel_mtu.saturating_sub(40) // auto: MTU - IP(20) - TCP(20)
-        };
-
-        if n_cores == 1 {
-            // Single-core router: existing path.
-            tracing::info!(
-                enable_nat = dpdk_config.enable_nat,
-                mss_clamp,
-                "starting router mode (single NIC, single core)"
-            );
-
-            let result = crate::router::run_router(
-                dpdk_config.port_id,
-                0, // queue_id
-                mempool,
-                &mut multi_state,
-                &identity,
-                &mut arp_table,
-                shutdown.clone(),
-                dpdk_config.adaptive_poll,
-                checksum_mode,
-                &dpdk_config.peers,
-                dpdk_config.enable_nat,
-                mss_clamp,
-                dpdk_config.tunnel_ip,
-                dpdk_config.tunnel_mtu,
-                dpdk_config.max_peers,
-                dpdk_config.idle_timeout,
-            );
-
-            shutdown.store(true, Ordering::Release);
-            port::close_port(dpdk_config.port_id);
-            return result;
-        }
-
-        // Multi-core router: pipeline architecture (SharedConnectionState).
-        // Core 0 = I/O (RX classify, handshake, ACK, keepalive),
-        // Workers 1..N = crypto + routing + NAT (round-robin, any connection).
-        let n_workers = n_cores - 1;
-
-        // Restrict to listener mode.
-        let multi_server_config = server_config_clone
-            .ok_or_else(|| anyhow::anyhow!("multi-core router requires listener mode"))?;
-        let mut multi_state = MultiQuicState::new(multi_server_config);
-
-        // Router workers TX directly on per-worker TX queues. Reconfigure
-        // outer port with N TX queues. (Virtio-pci drops on queue > 0;
-        // router pipeline on virtio requires outer_tx ring approach — TODO.)
-        port::stop_port(dpdk_config.port_id);
-        let (new_mac, hw_udp, hw_ip) =
-            port::configure_port_dispatcher(dpdk_config.port_id, n_cores as u16, mempool)?;
-        identity.local_mac = new_mac;
-        let checksum_mode = if dpdk_config.no_udp_checksum {
-            ChecksumMode::None
-        } else if hw_udp && hw_ip {
-            ChecksumMode::HardwareFull
-        } else if hw_udp {
-            ChecksumMode::HardwareUdpOnly
-        } else {
-            ChecksumMode::Software
-        };
-
-        // Create per-worker router pipeline ring bundles (2 rings each).
-        let mut pipeline_rings: Vec<RouterPipelineRings> = Vec::with_capacity(n_workers);
-        for i in 0..n_workers {
-            pipeline_rings.push(RouterPipelineRings::new(i)?);
-        }
-
-        // Compute NAT port ranges.
-        let port_ranges = quictun_core::nat::compute_port_ranges(n_workers);
-
-        let adaptive_poll = dpdk_config.adaptive_poll;
-        let outer_port_id = dpdk_config.port_id;
-        let enable_nat = dpdk_config.enable_nat;
-        let tunnel_ip = dpdk_config.tunnel_ip;
-        let tunnel_mtu = dpdk_config.tunnel_mtu;
-        let peers = &dpdk_config.peers;
-
-        tracing::info!(
-            n_workers,
-            enable_nat,
-            mss_clamp,
-            "starting router pipeline mode (multi-core)"
+        let result = crate::router::entry(
+            dpdk_config.port_id,
+            mempool,
+            &mut multi_state,
+            &mut identity,
+            &mut arp_table,
+            shutdown.clone(),
+            &dpdk_config,
+            checksum_mode,
+            server_config_clone,
         );
-
-        let result = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_workers);
-
-            for (idx, rings) in pipeline_rings.iter().enumerate() {
-                let shutdown = shutdown.clone();
-                let worker_identity = identity.clone();
-                let worker_arp = arp_table.clone();
-                let mempool = SendPtr(mempool);
-                let (port_start, port_end) = port_ranges[idx];
-                let peers_ref = peers;
-
-                handles.push(s.spawn(move || -> Result<()> {
-                    let mempool = mempool.as_ptr();
-                    let core_idx = idx + 1; // core 0 is I/O
-                    let tx_queue = core_idx as u16;
-
-                    // Pin thread to CPU.
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-                        unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
-                        let ret = unsafe {
-                            libc::sched_setaffinity(
-                                0,
-                                std::mem::size_of::<libc::cpu_set_t>(),
-                                &cpuset,
-                            )
-                        };
-                        if ret == 0 {
-                            tracing::info!(core = core_idx, "pinned router pipeline worker to CPU");
-                        } else {
-                            tracing::warn!(core = core_idx, "failed to pin router pipeline worker to CPU");
-                        }
-                    }
-
-                    crate::router::run_router_pipeline_worker(
-                        outer_port_id,
-                        tx_queue,
-                        mempool,
-                        rings,
-                        &worker_identity,
-                        &worker_arp,
-                        &shutdown,
-                        adaptive_poll,
-                        checksum_mode,
-                        peers_ref,
-                        enable_nat,
-                        mss_clamp,
-                        tunnel_ip,
-                        tunnel_mtu,
-                        core_idx,
-                        port_start,
-                        port_end,
-                    )
-                }));
-            }
-
-            // Run pipeline I/O on core 0 (this thread).
-            let io_result = crate::router::run_router_pipeline_io(
-                outer_port_id,
-                mempool,
-                &mut multi_state,
-                &pipeline_rings,
-                &identity,
-                &mut arp_table,
-                &shutdown,
-                adaptive_poll,
-                checksum_mode,
-                peers,
-                enable_nat,
-                tunnel_ip,
-                n_workers,
-                dpdk_config.max_peers,
-                dpdk_config.idle_timeout,
-            );
-
-            // Signal shutdown and wait for workers.
-            shutdown.store(true, Ordering::Release);
-            let mut result = io_result;
-            for handle in handles {
-                if let Err(e) = handle.join().expect("router pipeline worker panicked") {
-                    if result.is_ok() {
-                        result = Err(e);
-                    }
-                }
-            }
-            result
-        });
 
         shutdown.store(true, Ordering::Release);
         port::close_port(dpdk_config.port_id);
@@ -577,135 +410,20 @@ pub fn run(local_addr: SocketAddr, setup: EndpointSetup, dpdk_config: DpdkConfig
         pin_vhost_threads(n_cores);
     }
 
-    // ── 8. Run engine(s) ──────────────────────────────────────────
+    // ── 8. Run engine ──────────────────────────────────────────────
 
-    let result = if n_cores == 1 {
-        // Single-core: run directly on this thread.
-        // Handles 1..N connections via connection table (no multi-client flag needed).
-        let inner = inner_ports
-            .into_iter()
-            .next()
-            .expect("exactly 1 inner port");
-
-        engine::run(
-            dpdk_config.port_id,
-            0, // queue_id
-            mempool,
-            &mut multi_state,
-            &identity,
-            &mut arp_table,
-            inner,
-            shutdown.clone(),
-            dpdk_config.adaptive_poll,
-            checksum_mode,
-            &dpdk_config.peers,
-            dpdk_config.tunnel_ip,
-            dpdk_config.max_peers,
-            dpdk_config.idle_timeout,
-        )
-    } else {
-        // Multi-core: pipeline architecture (SharedConnectionState).
-        // Core 0 = I/O, Workers 1..N = crypto (round-robin, any-connection).
-        let n_workers = n_cores - 1;
-
-        // Outer port already configured with n_cores TX queues at startup.
-
-        // Build multi-client QUIC state (listener only for multi-core).
-        let multi_server_config = server_config_clone
-            .ok_or_else(|| anyhow::anyhow!("multi-core DPDK requires listener mode"))?;
-        let mut multi_state = MultiQuicState::new(multi_server_config);
-
-        // Create per-worker pipeline ring bundles.
-        let mut pipeline_rings: Vec<PipelineRings> = Vec::with_capacity(n_workers);
-        for i in 0..n_workers {
-            pipeline_rings.push(PipelineRings::new(i)?);
-        }
-
-        // Single inner port on core 0.
-        let inner = inner_ports
-            .into_iter()
-            .next()
-            .expect("at least 1 inner port");
-
-        let adaptive_poll = dpdk_config.adaptive_poll;
-        let outer_port_id = dpdk_config.port_id;
-
-        // Spawn pipeline worker threads (pinned to cores 1..N).
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_workers);
-
-            for (idx, rings) in pipeline_rings.iter().enumerate() {
-                let shutdown = shutdown.clone();
-                let worker_identity = identity.clone();
-                let inner_eth_hdr = &inner.eth_hdr;
-                let mempool = SendPtr(mempool);
-
-                handles.push(s.spawn(move || -> Result<()> {
-                    let mempool = mempool.as_ptr();
-                    let core_idx = idx + 1; // core 0 is I/O
-                    // Pin thread to CPU.
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-                        unsafe { libc::CPU_SET(core_idx, &mut cpuset) };
-                        let ret = unsafe {
-                            libc::sched_setaffinity(
-                                0,
-                                std::mem::size_of::<libc::cpu_set_t>(),
-                                &cpuset,
-                            )
-                        };
-                        if ret == 0 {
-                            tracing::info!(core = core_idx, "pinned pipeline worker to CPU");
-                        } else {
-                            tracing::warn!(core = core_idx, "failed to pin pipeline worker to CPU");
-                        }
-                    }
-
-                    engine::run_pipeline_worker(
-                        mempool,
-                        rings,
-                        inner_eth_hdr,
-                        &worker_identity,
-                        &shutdown,
-                        adaptive_poll,
-                        checksum_mode,
-                        core_idx,
-                    )
-                }));
-            }
-
-            // Run pipeline I/O on core 0 (this thread).
-            let io_result = engine::run_pipeline_io(
-                outer_port_id,
-                mempool,
-                &mut multi_state,
-                &pipeline_rings,
-                &identity,
-                &mut arp_table,
-                &inner,
-                &dpdk_config.peers,
-                &shutdown,
-                adaptive_poll,
-                checksum_mode,
-                dpdk_config.tunnel_ip,
-                dpdk_config.max_peers,
-                dpdk_config.idle_timeout,
-            );
-
-            // Signal shutdown and wait for workers.
-            shutdown.store(true, Ordering::Release);
-            let mut result = io_result;
-            for handle in handles {
-                if let Err(e) = handle.join().expect("pipeline worker panicked") {
-                    if result.is_ok() {
-                        result = Err(e);
-                    }
-                }
-            }
-            result
-        })
-    };
+    let result = engine::entry(
+        dpdk_config.port_id,
+        mempool,
+        &mut multi_state,
+        inner_ports,
+        &identity,
+        &mut arp_table,
+        shutdown.clone(),
+        &dpdk_config,
+        checksum_mode,
+        server_config_clone,
+    );
 
     // ── 9. Cleanup ───────────────────────────────────────────────
 
