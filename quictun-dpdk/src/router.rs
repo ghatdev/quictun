@@ -34,24 +34,57 @@ use crate::engine::resolve_completed_handshake;
 
 use quictun_proto::local::LocalConnectionState;
 
+/// Minimal view of a connection for building TX frames.
+///
+/// Abstracts over [`ConnectionEntry`] (multi-core workers, has cached MAC) and
+/// [`ConnEntry<LocalConnectionState>`] (single-core ConnectionManager, no MAC).
+pub(crate) struct ConnView<'a> {
+    pub conn: &'a mut LocalConnectionState,
+    pub remote_addr: SocketAddr,
+    pub remote_mac: [u8; 6],
+}
+
 /// Connection table lookup trait for router helper functions.
 ///
-/// Allows both `FxHashMap<u64, ConnectionEntry>` (multi-core workers) and
-/// `ConnectionManager<LocalConnectionState>` (single-core) to use the same
-/// `handle_decrypted_packet` / `encrypt_return_to_peer` helpers.
+/// Returns a [`ConnView`] that provides the fields needed to build TX frames.
+/// MAC address comes from the entry (multi-core cache) or ArpTable (single-core).
 pub(crate) trait ConnLookup {
-    fn conn_get_mut(&mut self, key: &u64) -> Option<&mut ConnectionEntry>;
+    fn conn_view(&mut self, key: &u64) -> Option<ConnView<'_>>;
 }
 
 impl ConnLookup for FxHashMap<u64, ConnectionEntry> {
-    fn conn_get_mut(&mut self, key: &u64) -> Option<&mut ConnectionEntry> {
-        self.get_mut(key)
+    fn conn_view(&mut self, key: &u64) -> Option<ConnView<'_>> {
+        self.get_mut(key).map(|e| ConnView {
+            conn: &mut e.conn,
+            remote_addr: e.remote_addr,
+            remote_mac: e.remote_mac,
+        })
     }
 }
 
-impl ConnLookup for ConnectionManager<LocalConnectionState> {
-    fn conn_get_mut(&mut self, key: &u64) -> Option<&mut ConnectionEntry> {
-        self.get_mut(key)
+/// Wrapper that pairs ConnectionManager with ArpTable for ConnLookup.
+///
+/// Single-core paths use this: MAC is resolved from ArpTable at lookup time
+/// instead of being cached per-connection.
+pub(crate) struct ManagerWithArp<'a> {
+    pub manager: &'a mut ConnectionManager<LocalConnectionState>,
+    pub arp_table: &'a ArpTable,
+}
+
+impl ConnLookup for ManagerWithArp<'_> {
+    fn conn_view(&mut self, key: &u64) -> Option<ConnView<'_>> {
+        self.manager.get_mut(key).map(|e| {
+            let remote_ip = match e.remote_addr.ip() {
+                std::net::IpAddr::V4(ip) => ip,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let mac = self.arp_table.lookup(remote_ip).unwrap_or([0xff; 6]);
+            ConnView {
+                conn: &mut e.conn,
+                remote_addr: e.remote_addr,
+                remote_mac: mac,
+            }
+        })
     }
 }
 
@@ -239,7 +272,6 @@ pub fn run_router(
                                     Ok(decrypted) => {
                                         // Update peer address on every authenticated packet.
                                         entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                                        entry.remote_mac = src_mac;
                                         entry.last_rx = now;
 
                                         if let Some(ref ack) = decrypted.ack {
@@ -267,13 +299,17 @@ pub fn run_router(
                                         mss::clamp_mss(inner_pkt, mss_clamp_val);
                                     }
 
+                                    let mut conn_lookup = ManagerWithArp {
+                                        manager: &mut manager,
+                                        arp_table,
+                                    };
                                     handle_decrypted_packet(
                                         inner_pkt,
                                         cid_key,
                                         src_tunnel_ip,
                                         &routing_table,
                                         &mut nat_table,
-                                        &mut manager,
+                                        &mut conn_lookup,
                                         identity,
                                         arp_table,
                                         mempool,
@@ -353,10 +389,14 @@ pub fn run_router(
                             let ip_start = ETH_HLEN;
                             let ip_pkt = &data[ip_start..];
 
+                            let mut conn_lookup = ManagerWithArp {
+                                manager: &mut manager,
+                                arp_table,
+                            };
                             encrypt_return_to_peer(
                                 ip_pkt,
                                 &dnat_result,
-                                &mut manager,
+                                &mut conn_lookup,
                                 identity,
                                 arp_table,
                                 mempool,
@@ -394,10 +434,14 @@ pub fn run_router(
                             ) {
                                 nat_reverse += 1;
 
+                                let mut conn_lookup = ManagerWithArp {
+                                    manager: &mut manager,
+                                    arp_table,
+                                };
                                 encrypt_return_to_peer(
                                     ipv4.payload,
                                     &dnat_result,
-                                    &mut manager,
+                                    &mut conn_lookup,
                                     identity,
                                     arp_table,
                                     mempool,
@@ -424,10 +468,14 @@ pub fn run_router(
                                     1, icmp_id, ipv4.src_ip, 0, now,
                                 ) {
                                     nat_reverse += 1;
+                                    let mut conn_lookup = ManagerWithArp {
+                                        manager: &mut manager,
+                                        arp_table,
+                                    };
                                     encrypt_return_to_peer(
                                         ipv4.payload,
                                         &dnat_result,
-                                        &mut manager,
+                                        &mut conn_lookup,
                                         identity,
                                         arp_table,
                                         mempool,
@@ -486,14 +534,6 @@ pub fn run_router(
                                     "router: evicted stale connection"
                                 );
                             }
-                            // Resolve remote MAC (DPDK-specific).
-                            let remote_ip = match remote_addr.ip() {
-                                std::net::IpAddr::V4(ip) => ip,
-                                _ => Ipv4Addr::UNSPECIFIED,
-                            };
-                            let remote_mac = arp_table.lookup(remote_ip)
-                                .unwrap_or([0xff; 6]);
-
                             manager.insert_connection(cid_key, ConnEntry {
                                 conn: conn_state,
                                 tunnel_ip: peer_ip,
@@ -502,7 +542,6 @@ pub fn run_router(
                                 keepalive_interval,
                                 last_tx: now,
                                 last_rx: now,
-                                remote_mac,
                             });
 
                             // Rebuild router's own routing table with actual CID keys.
@@ -639,13 +678,15 @@ pub fn run_router(
                                     std::net::IpAddr::V4(ip) => ip,
                                     _ => Ipv4Addr::UNSPECIFIED,
                                 };
+                                let ka_mac = arp_table.lookup(remote_ip)
+                                    .unwrap_or([0xff; 6]);
                                 ip_id = ip_id.wrapping_add(1);
                                 let frame_len = net::HEADER_SIZE + result.len;
                                 if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
                                     if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
                                         net::build_udp_packet(
                                             &identity.local_mac,
-                                            &entry.remote_mac,
+                                            &ka_mac,
                                             identity.local_ip,
                                             remote_ip,
                                             identity.local_port,
@@ -771,7 +812,7 @@ fn handle_decrypted_packet(
         if df_set {
             *frag_needed_count += 1;
             if let Some(icmp_pkt) = icmp::build_frag_needed(inner_pkt, tunnel_ip, tunnel_mtu) {
-                if let Some(entry) = connections.conn_get_mut(&src_cid) {
+                if let Some(entry) = connections.conn_view(&src_cid) {
                     encrypt_and_send(
                         &icmp_pkt,
                         entry,
@@ -793,7 +834,7 @@ fn handle_decrypted_packet(
     match routing_table.lookup(dst_ip) {
         RouteAction::ForwardToPeer(peer_cid) => {
             // Hub-and-spoke: re-encrypt to another peer.
-            if let Some(peer_entry) = connections.conn_get_mut(&peer_cid) {
+            if let Some(peer_entry) = connections.conn_view(&peer_cid) {
                 *hub_spoke_count += 1;
                 encrypt_and_send(
                     inner_pkt,
@@ -862,7 +903,7 @@ fn handle_decrypted_packet(
             if ttl <= 1 {
                 *ttl_drop_count += 1;
                 if let Some(icmp_pkt) = icmp::build_time_exceeded(inner_pkt, tunnel_ip) {
-                    if let Some(entry) = connections.conn_get_mut(&src_cid) {
+                    if let Some(entry) = connections.conn_view(&src_cid) {
                         encrypt_and_send(
                             &icmp_pkt,
                             entry,
@@ -892,7 +933,7 @@ fn handle_decrypted_packet(
             let mut reply = inner_pkt.to_vec();
             if quictun_core::icmp::echo_reply_inplace(&mut reply) {
                 // Send reply back to the peer that sent it.
-                if let Some(entry) = connections.conn_get_mut(&src_cid) {
+                if let Some(entry) = connections.conn_view(&src_cid) {
                     encrypt_and_send(
                         &reply,
                         entry,
@@ -909,7 +950,7 @@ fn handle_decrypted_packet(
         RouteAction::Drop => {
             *no_route_drop_count += 1;
             if let Some(icmp_pkt) = icmp::build_dest_unreachable(inner_pkt, tunnel_ip, 0) {
-                if let Some(entry) = connections.conn_get_mut(&src_cid) {
+                if let Some(entry) = connections.conn_view(&src_cid) {
                     encrypt_and_send(
                         &icmp_pkt,
                         entry,
@@ -949,7 +990,7 @@ fn encrypt_return_to_peer(
         mss::clamp_mss(&mut modified, mss_clamp_val);
     }
 
-    let Some(entry) = connections.conn_get_mut(&dnat.peer_cid) else {
+    let Some(entry) = connections.conn_view(&dnat.peer_cid) else {
         return;
     };
 
@@ -970,7 +1011,7 @@ fn encrypt_return_to_peer(
 #[allow(clippy::too_many_arguments)]
 fn encrypt_and_send(
     inner_pkt: &[u8],
-    entry: &mut ConnectionEntry,
+    entry: &mut ConnView<'_>,
     identity: &NetIdentity,
     mempool: *mut ffi::rte_mempool,
     outer_tx_mbufs: &mut Vec<*mut ffi::rte_mbuf>,

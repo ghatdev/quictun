@@ -81,9 +81,6 @@ pub struct ConnEntry<S: ConnectionState> {
     pub keepalive_interval: Duration,
     pub last_tx: Instant,
     pub last_rx: Instant,
-    /// Destination MAC for raw Ethernet frame construction (DPDK only).
-    /// Kernel backend sets this to `[0; 6]` and ignores it.
-    pub remote_mac: [u8; 6],
 }
 
 // ── Manager actions ─────────────────────────────────────────────────────
@@ -531,7 +528,6 @@ mod tests {
             keepalive_interval: Duration::from_secs(25),
             last_tx: Instant::now(),
             last_rx: Instant::now(),
-            remote_mac: [0; 6],
         }
     }
 

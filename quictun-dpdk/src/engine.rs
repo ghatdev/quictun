@@ -345,7 +345,6 @@ pub fn run(
                         ) {
                             Ok(decrypted) => {
                                 entry.remote_addr = SocketAddr::new(src_ip.into(), src_port);
-                                entry.remote_mac = src_mac;
                                 entry.last_rx = now;
 
                                 if let Some(ref ack) = decrypted.ack {
@@ -574,10 +573,12 @@ pub fn run(
                                 std::net::IpAddr::V4(ip) => ip,
                                 _ => Ipv4Addr::UNSPECIFIED,
                             };
+                            let remote_mac = arp_table.lookup(remote_ip)
+                                .unwrap_or([0xff; 6]);
                             ip_id = ip_id.wrapping_add(1);
                             net::build_udp_packet_inplace(
                                 &identity.local_mac,
-                                &entry.remote_mac,
+                                &remote_mac,
                                 identity.local_ip,
                                 remote_ip,
                                 identity.local_port,
@@ -706,14 +707,6 @@ pub fn run(
                                     "evicted stale connection"
                                 );
                             }
-                            // Resolve remote MAC (DPDK-specific).
-                            let remote_ip = match remote_addr.ip() {
-                                std::net::IpAddr::V4(ip) => ip,
-                                _ => Ipv4Addr::UNSPECIFIED,
-                            };
-                            let remote_mac = arp_table.lookup(remote_ip)
-                                .unwrap_or([0xff; 6]);
-
                             manager.insert_connection(cid_key, ConnEntry {
                                 conn: conn_state,
                                 tunnel_ip: peer_ip,
@@ -722,7 +715,6 @@ pub fn run(
                                 keepalive_interval,
                                 last_tx: now,
                                 last_rx: now,
-                                remote_mac,
                             });
 
                             tracing::info!(
@@ -793,13 +785,15 @@ pub fn run(
                                             std::net::IpAddr::V4(ip) => ip,
                                             _ => Ipv4Addr::UNSPECIFIED,
                                         };
+                                        let ka_mac = arp_table.lookup(remote_ip)
+                                            .unwrap_or([0xff; 6]);
                                         ip_id = ip_id.wrapping_add(1);
                                         let frame_len = net::HEADER_SIZE + result.len;
                                         if let Ok(mut mbuf) = Mbuf::alloc(mempool) {
                                             if let Ok(buf) = mbuf.alloc_space(frame_len as u16) {
                                                 net::build_udp_packet(
                                                     &identity.local_mac,
-                                                    &entry.remote_mac,
+                                                    &ka_mac,
                                                     identity.local_ip,
                                                     remote_ip,
                                                     identity.local_port,
