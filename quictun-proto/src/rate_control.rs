@@ -105,6 +105,9 @@ const MAX_DECREASE: f64 = 0.5;
 /// Proportional decrease gain.
 const DECREASE_GAIN: f64 = 0.2;
 
+/// Maximum rate cap (100 Gbps = 12.5 GB/s) to prevent f64 overflow.
+const MAX_RATE: f64 = 12_500_000_000.0;
+
 impl RateController {
     /// Create a new rate controller with the given configuration.
     pub fn new(config: RateControlConfig) -> Self {
@@ -139,7 +142,7 @@ impl RateController {
         }
         // else: near target, hold.
 
-        self.rate = self.rate.max(self.config.min_rate);
+        self.rate = self.rate.clamp(self.config.min_rate, MAX_RATE);
 
         tracing::debug!(
             queuing_us = queuing_delay_us,
