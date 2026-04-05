@@ -40,7 +40,7 @@ use quictun_core::routing::RouteAction;
 use quictun_proto::cid_to_u64;
 use quictun_proto::local::LocalConnectionState;
 use rustc_hash::FxHashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::adapter::KernelAdapter;
 use crate::engine::NetConfig;
@@ -477,7 +477,9 @@ fn io_thread_handle_outer(
                     data: batch.bufs[i][..n].to_vec(),
                 };
                 // Try send — drop packet if channel full (backpressure).
-                let _ = worker_txs[worker_id].try_send(packet);
+                if worker_txs[worker_id].try_send(packet).is_err() {
+                    trace!(worker = worker_id, "worker channel full, dropping outer packet");
+                }
             }
         }
     }
@@ -511,7 +513,9 @@ fn dispatch_inner_packet(
     let packet = WorkerPacket::Inner {
         data: pkt.to_vec(),
     };
-    let _ = worker_txs[worker_id].try_send(packet);
+    if worker_txs[worker_id].try_send(packet).is_err() {
+        trace!(worker = worker_id, "worker channel full, dropping inner packet");
+    }
 }
 
 /// TUN RX with offload: use recv_multiple for proper GRO splitting.
