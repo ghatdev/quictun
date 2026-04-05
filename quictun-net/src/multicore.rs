@@ -58,6 +58,8 @@ enum WorkerPacket {
         cid_key: u64,
         entry: Box<ConnEntry<LocalConnectionState>>,
     },
+    /// Evict a stale connection (peer reconnected on a new handshake).
+    EvictConnection { cid_key: u64 },
     /// Shutdown signal.
     Shutdown,
 }
@@ -87,6 +89,8 @@ struct DispatchTable {
     ip_to_worker: Vec<(ipnet::Ipv4Net, usize)>,
     /// Number of connections per worker (for least-loaded assignment).
     worker_load: Vec<usize>,
+    /// Tunnel IP → CID key, for reconnect eviction lookup.
+    tunnel_ip_to_cid: FxHashMap<Ipv4Addr, u64>,
 }
 
 impl DispatchTable {
@@ -95,6 +99,7 @@ impl DispatchTable {
             cid_to_worker: FxHashMap::default(),
             ip_to_worker: Vec::new(),
             worker_load: vec![0; num_workers],
+            tunnel_ip_to_cid: FxHashMap::default(),
         }
     }
 
@@ -107,8 +112,15 @@ impl DispatchTable {
             .unwrap_or(0)
     }
 
-    fn register(&mut self, cid_key: u64, allowed_ips: &[ipnet::Ipv4Net], worker_id: usize) {
+    fn register(
+        &mut self,
+        cid_key: u64,
+        tunnel_ip: Ipv4Addr,
+        allowed_ips: &[ipnet::Ipv4Net],
+        worker_id: usize,
+    ) {
         self.cid_to_worker.insert(cid_key, worker_id);
+        self.tunnel_ip_to_cid.insert(tunnel_ip, cid_key);
         for net in allowed_ips {
             self.ip_to_worker.push((*net, worker_id));
         }
@@ -120,11 +132,15 @@ impl DispatchTable {
 
     fn unregister(&mut self, cid_key: u64, allowed_ips: &[ipnet::Ipv4Net], worker_id: usize) {
         self.cid_to_worker.remove(&cid_key);
+        // Only remove routes owned by this worker. If two peers have overlapping
+        // allowed_ips, removing one must not delete the other's routes.
         self.ip_to_worker
-            .retain(|(net, _)| !allowed_ips.contains(net));
+            .retain(|(net, wid)| !(*wid == worker_id && allowed_ips.contains(net)));
         if self.worker_load[worker_id] > 0 {
             self.worker_load[worker_id] -= 1;
         }
+        // Remove tunnel_ip → CID mapping.
+        self.tunnel_ip_to_cid.retain(|_, &mut cid| cid != cid_key);
     }
 
     fn lookup_worker_by_cid(&self, cid_key: u64) -> Option<usize> {
@@ -612,11 +628,29 @@ fn io_thread_drive_handshakes(
         // Assign to least-loaded worker.
         let mut table = dispatch.write();
 
-        // TODO: reconnect eviction in multi-core requires notifying the worker
-        // that owns the old connection. For now, skip eviction — the worker's
-        // sweep_timeouts will clean up the old connection on idle timeout.
+        // Reconnect eviction: if this tunnel_ip already has a connection,
+        // unregister it from the dispatch table and tell the owning worker
+        // to drop the old connection state.
+        if let Some(&old_cid) = table.tunnel_ip_to_cid.get(&tunnel_ip) {
+            if let Some(old_worker) = table.lookup_worker_by_cid(old_cid) {
+                // Unregister from dispatch table first so no new packets
+                // are routed to the stale connection.
+                table.unregister(old_cid, &allowed_ips, old_worker);
+                // Tell the worker to evict. OS route cleanup happens when
+                // the worker sends ConnectionRemoved back.
+                let _ = worker_txs[old_worker].try_send(WorkerPacket::EvictConnection {
+                    cid_key: old_cid,
+                });
+                info!(
+                    tunnel_ip = %tunnel_ip,
+                    old_cid = %hex::encode(old_cid.to_ne_bytes()),
+                    worker = old_worker,
+                    "evicting stale connection from dispatch table (peer reconnected)"
+                );
+            }
+        }
 
-        // Max peers check.
+        // Max peers check (after eviction so reconnects don't count double).
         let total_connections: usize = table.worker_load.iter().sum();
         if max_peers > 0 && total_connections >= max_peers {
             warn!(
@@ -633,7 +667,7 @@ fn io_thread_drive_handshakes(
         }
 
         let worker_id = table.least_loaded_worker();
-        table.register(cid_key, &allowed_ips, worker_id);
+        table.register(cid_key, tunnel_ip, &allowed_ips, worker_id);
         drop(table);
 
         info!(
@@ -757,6 +791,21 @@ fn run_worker(
                 WorkerPacket::NewConnection { cid_key, entry } => {
                     info!(worker = id, tunnel_ip = %entry.tunnel_ip, "received new connection");
                     manager.insert_connection(cid_key, *entry);
+                }
+
+                WorkerPacket::EvictConnection { cid_key } => {
+                    if let Some(removed) = manager.remove_connection(cid_key) {
+                        info!(
+                            worker = id,
+                            tunnel_ip = %removed.tunnel_ip,
+                            "evicted stale connection (peer reconnected)"
+                        );
+                        let _ = notify_tx.send(WorkerNotification::ConnectionRemoved {
+                            cid_key,
+                            tunnel_ip: removed.tunnel_ip,
+                            allowed_ips: removed.allowed_ips,
+                        });
+                    }
                 }
 
                 WorkerPacket::Outer { data } => {
