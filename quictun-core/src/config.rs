@@ -249,6 +249,21 @@ pub struct EngineConfig {
     /// Use the v2 engine (shared event loop + ConnectionManager).
     #[serde(default)]
     pub engine_v2: bool,
+    /// Data-plane congestion control: "none" (default) or "delay".
+    #[serde(default = "default_data_cc")]
+    pub data_cc: String,
+    /// Target queuing delay in milliseconds (delay-based CC).
+    #[serde(default = "default_target_delay_ms")]
+    pub target_delay_ms: u64,
+    /// Initial sending rate in Mbps (delay-based CC).
+    #[serde(default = "default_initial_rate_mbps")]
+    pub initial_rate_mbps: u64,
+    /// Minimum sending rate floor in Mbps (delay-based CC).
+    #[serde(default = "default_min_rate_mbps")]
+    pub min_rate_mbps: u64,
+    /// Windowed min-RTT reset interval in seconds (delay-based CC).
+    #[serde(default = "default_rtt_window_secs")]
+    pub rtt_window_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -280,6 +295,49 @@ impl Default for EngineConfig {
             poll_events: 64,
             max_peers: 256,
             engine_v2: false,
+            data_cc: "none".to_owned(),
+            target_delay_ms: 5,
+            initial_rate_mbps: 1000,
+            min_rate_mbps: 10,
+            rtt_window_secs: 10,
+        }
+    }
+}
+
+/// Data-plane congestion control algorithm selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataPlaneCc {
+    /// No congestion control (default). Packets sent as fast as they can be encrypted.
+    None,
+    /// Delay-based rate controller. Reacts to queuing delay, not loss.
+    Delay,
+}
+
+impl std::str::FromStr for DataPlaneCc {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "delay" => Ok(Self::Delay),
+            _ => Err(format!(
+                "unknown data-plane CC: {s} (expected none, delay)"
+            )),
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Build a `RateControlConfig` from the engine config, or `None` if CC is disabled.
+    pub fn rate_control_config(&self) -> Option<quictun_proto::rate_control::RateControlConfig> {
+        use std::time::Duration;
+        match self.data_cc.parse::<DataPlaneCc>() {
+            Ok(DataPlaneCc::Delay) => Some(quictun_proto::rate_control::RateControlConfig {
+                target_delay: Duration::from_millis(self.target_delay_ms),
+                initial_rate: self.initial_rate_mbps as f64 * 125_000.0,
+                min_rate: self.min_rate_mbps as f64 * 125_000.0,
+                rtt_window: Duration::from_secs(self.rtt_window_secs),
+            }),
+            _ => None,
         }
     }
 }
@@ -382,6 +440,26 @@ fn default_max_peers() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_data_cc() -> String {
+    "none".to_owned()
+}
+
+fn default_target_delay_ms() -> u64 {
+    5
+}
+
+fn default_initial_rate_mbps() -> u64 {
+    1000
+}
+
+fn default_min_rate_mbps() -> u64 {
+    10
+}
+
+fn default_rtt_window_secs() -> u64 {
+    10
 }
 
 // ── Config methods ───────────────────────────────────────────────────────────

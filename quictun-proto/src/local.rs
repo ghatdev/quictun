@@ -79,6 +79,9 @@ pub struct LocalConnectionState {
     pub(crate) received: Bitmap,
     /// Largest RX PN at the time of the last ACK send (for timer-driven ACKs).
     pub(crate) last_acked_pn: u64,
+
+    // Rate control (optional, None = no CC).
+    pub(crate) rate_controller: Option<crate::rate_control::RateController>,
 }
 
 impl LocalConnectionState {
@@ -116,6 +119,7 @@ impl LocalConnectionState {
             largest_rx_pn: 0,
             received: Bitmap::new(),
             last_acked_pn: 0,
+            rate_controller: None,
         }
     }
 
@@ -219,7 +223,7 @@ impl LocalConnectionState {
         let pn = self.pn_counter;
         self.pn_counter += 1;
 
-        encrypt_packet(
+        let result = encrypt_packet(
             payload,
             &self.remote_cid,
             pn,
@@ -229,7 +233,11 @@ impl LocalConnectionState {
             &*self.tx_header_key,
             self.tag_len,
             buf,
-        )
+        );
+        if result.is_ok() && let Some(ref mut rc) = self.rate_controller {
+            rc.on_packet_sent(pn);
+        }
+        result
     }
 
     /// Encrypt a datagram in-place where the payload is already positioned in `buf`.
@@ -250,7 +258,7 @@ impl LocalConnectionState {
         let pn = self.pn_counter;
         self.pn_counter += 1;
 
-        encrypt_packet_in_place(
+        let result = encrypt_packet_in_place(
             payload_len,
             &self.remote_cid,
             pn,
@@ -260,7 +268,11 @@ impl LocalConnectionState {
             &*self.tx_header_key,
             self.tag_len,
             buf,
-        )
+        );
+        if result.is_ok() && let Some(ref mut rc) = self.rate_controller {
+            rc.on_packet_sent(pn);
+        }
+        result
     }
 
     /// Encrypt a standalone ACK packet.
@@ -371,6 +383,32 @@ impl LocalConnectionState {
     pub fn process_ack(&mut self, ack: &AckFrame) {
         if ack.largest_acked > self.largest_acked {
             self.largest_acked = ack.largest_acked;
+        }
+        if let Some(ref mut rc) = self.rate_controller {
+            rc.on_ack(ack.largest_acked);
+        }
+    }
+
+    /// Configure the delay-based rate controller.
+    pub fn set_rate_control(&mut self, config: crate::rate_control::RateControlConfig) {
+        self.rate_controller = Some(crate::rate_control::RateController::new(config));
+    }
+
+    /// Returns `true` if the rate controller allows more data to be sent.
+    /// Always returns `true` if no rate controller is configured.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        match &self.rate_controller {
+            Some(rc) => rc.can_send(),
+            None => true,
+        }
+    }
+
+    /// Notify the rate controller that bytes were sent on the wire.
+    #[inline]
+    pub fn on_bytes_sent(&mut self, bytes: usize) {
+        if let Some(ref mut rc) = self.rate_controller {
+            rc.on_bytes_sent(bytes);
         }
     }
 

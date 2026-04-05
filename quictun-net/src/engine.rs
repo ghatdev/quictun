@@ -139,6 +139,8 @@ pub struct NetConfig {
     pub max_peers: usize,
     /// Server name for TLS SNI / hostname verification.
     pub server_name: String,
+    /// Data-plane rate control config. `None` = no CC.
+    pub rate_control_config: Option<quictun_proto::rate_control::RateControlConfig>,
 }
 
 
@@ -176,6 +178,7 @@ impl Engine for NetEngine {
             max_peers: config.engine.max_peers,
             server_name: config.interface.server_name.clone()
                 .unwrap_or_else(|| "quictun".to_owned()),
+            rate_control_config: config.engine.rate_control_config(),
         };
         run_engine(local_addr, setup, net_config)
     }
@@ -227,6 +230,7 @@ fn run_engine(
         EndpointSetup::Connector { .. } => MultiQuicState::new_connector(),
     };
     multi_state.ack_interval = config.ack_interval;
+    multi_state.rate_control_config = config.rate_control_config;
 
     if let EndpointSetup::Connector {
         remote_addr,
@@ -604,12 +608,24 @@ fn handle_tun_rx_gso(
                     }
                 }
 
+                // Rate control: check before mutable borrow.
+                if !manager.get(&cid).map_or(true, |e| e.conn.can_send()) {
+                    if gso_count > 0 {
+                        flush_gso(udp, gso_buf, gso_pos, gso_segment_size, current_remote.expect("remote set"));
+                        if let Some(cur_cid) = current_cid {
+                            if let Some(e) = manager.get_mut(&cur_cid) { e.last_tx = Instant::now(); }
+                        }
+                    }
+                    break;
+                }
+
                 let entry = match manager.get_mut(&cid) { Some(e) => e, None => continue };
                 current_cid = Some(cid);
                 current_remote = Some(entry.remote_addr);
 
                 match entry.conn.encrypt_datagram(&packet[..n], &mut gso_buf[gso_pos..]) {
                     Ok(result) => {
+                        entry.conn.on_bytes_sent(result.len);
                         if gso_count == 0 {
                             gso_segment_size = result.len; gso_pos += result.len; gso_count += 1;
                         } else if result.len == gso_segment_size {
@@ -679,9 +695,11 @@ fn handle_tun_rx_simple(
                     _ => continue,
                 };
                 let entry = match manager.get_mut(&cid) { Some(e) => e, None => continue };
+                if !entry.conn.can_send() { break; }
                 match entry.conn.encrypt_datagram(&packet[..n], encrypt_buf) {
                     Ok(result) => {
                         let _ = udp.send_to(&encrypt_buf[..result.len], entry.remote_addr);
+                        entry.conn.on_bytes_sent(result.len);
                         entry.last_tx = Instant::now();
                     }
                     Err(e) => { warn!(error = %e, "encrypt failed"); }
@@ -744,6 +762,16 @@ fn handle_tun_rx_offload(
                 _ => continue,
             };
 
+            // Rate control check.
+            if !manager.get(&cid).map_or(true, |e| e.conn.can_send()) {
+                if let Some(prev_cid) = batch_cid {
+                    if !batch_indices.is_empty() {
+                        flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs);
+                    }
+                }
+                break;
+            }
+
             if let Some(prev_cid) = batch_cid {
                 if prev_cid != cid && !batch_indices.is_empty() {
                     flush_offload_batch(udp, manager, gso_buf, split_bufs, split_sizes, &batch_indices, prev_cid, max_segs);
@@ -787,6 +815,7 @@ fn flush_offload_batch(
         let pkt = &split_bufs[idx][..split_sizes[idx]];
         match entry.conn.encrypt_datagram(pkt, &mut gso_buf[gso_pos..]) {
             Ok(result) => {
+                entry.conn.on_bytes_sent(result.len);
                 if gso_count == 0 {
                     gso_segment_size = result.len; gso_pos += result.len; gso_count += 1;
                 } else if result.len == gso_segment_size {

@@ -491,6 +491,7 @@ impl LocalConnectionState {
             largest_rx_pn,
             received,
             last_acked_pn: _,
+            rate_controller: _,
         } = self;
 
         let tx = Arc::new(TxState {

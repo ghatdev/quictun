@@ -12,6 +12,7 @@ pub mod bitmap;
 pub mod frame;
 pub mod local;
 pub mod packet;
+pub mod rate_control;
 pub mod shared;
 pub mod split;
 

@@ -812,6 +812,11 @@ fn run_worker(
                             _ => continue,
                         };
 
+                        // Rate control: skip if over budget.
+                        if !manager.get(&cid).map_or(true, |e| e.conn.can_send()) {
+                            continue;
+                        }
+
                         #[cfg(target_os = "linux")]
                         {
                             // Flush GSO batch if CID changed or batch full.
@@ -838,6 +843,7 @@ fn run_worker(
                                 gso_remote = entry.remote_addr;
                                 match entry.conn.encrypt_datagram(&data, &mut gso_buf[gso_pos..]) {
                                     Ok(r) => {
+                                        entry.conn.on_bytes_sent(r.len);
                                         if gso_count == 0 {
                                             gso_segment_size = r.len;
                                             gso_pos += r.len;
@@ -865,8 +871,10 @@ fn run_worker(
                         #[cfg(not(target_os = "linux"))]
                         {
                             if let Some(entry) = manager.get_mut(&cid) {
+                                if !entry.conn.can_send() { continue; }
                                 match entry.conn.encrypt_datagram(&data, &mut encrypt_buf) {
                                     Ok(r) => {
+                                        entry.conn.on_bytes_sent(r.len);
                                         let _ = udp.send_to(&encrypt_buf[..r.len], entry.remote_addr);
                                         entry.last_tx = Instant::now();
                                     }
