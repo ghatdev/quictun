@@ -57,14 +57,14 @@ RFC 9000 and RFC 9001 for the subset it implements.
 
 - Streams, flow control — tunnel is DATAGRAM-only, fire-and-forget
 - Loss detection, retransmission — inner TCP handles its own recovery
-- Congestion control — avoids double-CC with inner TCP (delay-based CC planned)
+- Loss-based congestion control — avoids double-CC with inner TCP
 
 **Not yet implemented (planned):**
 
 - Connection migration + PATH_CHALLENGE/RESPONSE — tunnel drops on network change today
 - CID rotation — fixed CIDs allow observer tracking; rotation preserves privacy
 - Spin bit — passive RTT measurement for operators
-- ECN passthrough — useful when delay-based CC is added
+- ECN passthrough — useful for augmenting delay-based CC
 
 **Design note: fixed 4-byte PN.** Standard QUIC uses 1-4 byte variable PN encoding
 based on `largest_acked`, creating a TX→RX state dependency. quictun-proto uses fixed
@@ -73,6 +73,32 @@ This enables lock-free parallel encrypt across pipeline workers and multi-core D
 and preserves the zero-copy mbuf layout where QUIC header (13) + DATAGRAM type (1) =
 14 bytes = Ethernet header size. Cost: 2 extra bytes/pkt for the first ~47ms of a
 connection (after that, variable PN would need 3-4 bytes anyway at line rate).
+
+### Congestion Control
+
+Optional delay-based rate controller (`data_cc = "delay"` in `[engine]`). Default is `"none"`.
+
+Uses **one-way delay (OWD)** measurement: each data packet carries a 4-byte sender timestamp.
+The receiver computes the forward-path queuing delay and reports it in ACK frames. The sender
+adjusts its rate based on how much queuing the peer observes — no RTT measurement needed,
+no interaction with inner TCP's congestion control.
+
+| Signal | Reaction |
+|--------|----------|
+| Queuing < 20% of target | Increase rate 5% |
+| Queuing > target | Proportional decrease (up to 50%) |
+| No congestion | Hold rate |
+
+On a LAN benchmark, `data_cc = "delay"` achieved **8.56 Gbps** (38% faster than `"none"`)
+with 65% fewer TCP retransmits, because pacing prevents the burst-and-retransmit cycle.
+
+```toml
+[engine]
+data_cc = "delay"          # "none" (default) or "delay"
+target_delay_ms = 5        # queuing delay tolerance
+initial_rate_mbps = 1000   # starting rate
+min_rate_mbps = 10         # floor
+```
 
 ### Data Planes
 
@@ -100,7 +126,8 @@ listen_port = 443
 [engine]
 threads = 2                # 1 = single-thread, >1 = multi-core
 offload = true             # GRO/GSO (Linux)
-cc = "none"                # no congestion control
+cc = "none"                # handshake CC (quinn)
+data_cc = "delay"          # data-plane CC: "none" or "delay"
 
 [[peers]]
 public_key = "base64-encoded-public-key"
