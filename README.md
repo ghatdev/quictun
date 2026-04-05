@@ -8,6 +8,7 @@ A high-performance VPN tunnel over QUIC + TLS 1.3
 
 - **Standards-based** — QUIC (RFC 9000), TLS 1.3 (RFC 8446), QUIC Datagrams (RFC 9221). No custom crypto.
 - **FIPS-ready** — All cryptography via aws-lc-rs (FIPS 140-3 Certificate #4631).
+- **Post-quantum ready** — Hybrid X25519MLKEM768 key exchange protects tunnel traffic against harvest-now-decrypt-later attacks. ML-DSA authentication planned when rustls adds provider support.
 - **CA-ready** — RPK for pinned identities by default, but the TLS 1.3 handshake supports full X.509 CA chains for enterprise deployments.
 - **Firewall traversal** — UDP 443, indistinguishable from HTTP/3 to DPI.
 - **Low overhead** — 20-byte per-packet overhead with zero-length CIDs (vs. WireGuard's 32 bytes).
@@ -107,6 +108,27 @@ allowed_ips = ["10.0.0.0/24"]
 keepalive = 25
 ```
 
+### Post-quantum key exchange
+
+Add `post_quantum = true` to `[interface]` on **both** sides:
+
+```toml
+[interface]
+mode = "connector"
+private_key = "base64-encoded-private-key"
+address = "10.0.0.2/24"
+post_quantum = true
+
+[peer]
+public_key = "base64-encoded-public-key"
+allowed_ips = ["10.0.0.0/24"]
+endpoint = "1.2.3.4:443"
+```
+
+This negotiates X25519MLKEM768 (hybrid classical + ML-KEM-768) for key exchange,
+with X25519 fallback. Authentication remains P-256 ECDSA.
+If only one side enables it, the handshake falls back to classical X25519.
+
 ### Listener (DPDK engine)
 
 ```toml
@@ -146,6 +168,7 @@ quictun down <config.toml>      # Bring down tunnel
 | QUIC protocol | quinn-proto (forked) | 0.11.13 |
 | TLS 1.3 | rustls | 0.23.37 |
 | Crypto | aws-lc-rs | 1.16.2 |
+| PQ KEX | ML-KEM-768 (FIPS 203) | via aws-lc-rs |
 | DPDK | source build (static) | 25.11.0 LTS |
 
 ALPN: `quictun-01`
