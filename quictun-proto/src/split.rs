@@ -252,17 +252,16 @@ impl RxState {
             self.largest_rx_pn,
         )?;
 
-        // Key phase rotation (old pattern — TODO: fix decrypt-before-commit).
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase, key_update, tx_state);
-        }
+        // Key phase rotation: decrypt-before-commit (RFC 9001 §6.2).
+        let result = if hdr.key_phase != self.peer_key_phase {
+            self.try_decrypt_with_next_key(packet, &hdr, scratch, key_update, tx_state)?
+        } else {
+            decrypt_payload(packet, &hdr, &**self.rx_packet_key, scratch)?
+        };
 
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
-
-        let result = decrypt_payload(packet, &hdr, &**self.rx_packet_key, scratch)?;
 
         self.received.set(hdr.pn);
         if hdr.pn > self.largest_rx_pn {
@@ -288,16 +287,16 @@ impl RxState {
             self.largest_rx_pn,
         )?;
 
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase, key_update, tx_state);
-        }
+        // Key phase rotation: decrypt-before-commit (RFC 9001 §6.2).
+        let result = if hdr.key_phase != self.peer_key_phase {
+            self.try_decrypt_with_next_key_in_place(packet, &hdr, key_update, tx_state)?
+        } else {
+            decrypt_payload_in_place(packet, &hdr, &**self.rx_packet_key)?
+        };
 
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
-
-        let result = decrypt_payload_in_place(packet, &hdr, &**self.rx_packet_key)?;
 
         self.received.set(hdr.pn);
         if hdr.pn > self.largest_rx_pn {
@@ -325,6 +324,10 @@ impl RxState {
     }
 
     /// Check key phase on a decrypted packet header (after worker decrypted it).
+    ///
+    /// Only safe to call when AEAD has already succeeded (e.g., from a decrypt
+    /// worker that verified the packet). For the full decrypt path, use
+    /// `decrypt_packet_with_buf` or `decrypt_packet_in_place` instead.
     pub fn check_key_phase(
         &mut self,
         key_phase: bool,
@@ -332,77 +335,139 @@ impl RxState {
         tx_state: &TxState,
     ) {
         if key_phase != self.peer_key_phase {
-            self.peer_key_phase = key_phase;
-            self.handle_key_update_rx(key_phase, key_update, tx_state);
+            self.commit_key_rotation(key_phase, key_update, tx_state);
         }
     }
 
-    /// Take the next candidate RX key without committing.
-    /// Returns pending_rx_key if set, otherwise pops from next_keys queue.
-    fn take_next_rx_key(&mut self, key_update: &KeyUpdateState) -> Option<Box<dyn PacketKey>> {
-        if let Some(key) = self.pending_rx_key.take() {
-            return Some(key);
+    /// Try decrypting with candidate keys on key-phase change (RFC 9001 §6.2).
+    ///
+    /// `decrypt_payload` copies to scratch, so no payload save/restore needed.
+    fn try_decrypt_with_next_key(
+        &mut self,
+        packet: &[u8],
+        hdr: &crate::packet::ShortHeader,
+        scratch: &mut BytesMut,
+        key_update: &KeyUpdateState,
+        tx_state: &TxState,
+    ) -> Result<DecryptedPacket, ParseError> {
+        // 1. Try pending_rx_key (we initiated rotation, peer is responding).
+        if let Some(candidate) = self.pending_rx_key.take() {
+            match decrypt_payload(packet, hdr, &*candidate, scratch) {
+                Ok(result) => {
+                    self.rx_packet_key = Arc::new(candidate);
+                    self.commit_key_rotation(hdr.key_phase, key_update, tx_state);
+                    tracing::debug!("key update: RX rotated (peer responded to our initiation)");
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.pending_rx_key = Some(candidate);
+                }
+            }
         }
-        let mut next_keys = key_update.next_keys.lock().expect("key update mutex poisoned");
-        next_keys.pop_front().map(|(rx, _tx)| rx)
-    }
 
-    /// After successful decrypt with candidate key, finalize the rotation
-    /// (update TX key, phase, counters). rx_packet_key is already set by caller.
-    fn finalize_key_update(
-        &mut self,
-        new_phase: bool,
-        key_update: &KeyUpdateState,
-        tx_state: &TxState,
-    ) {
-        // If it came from pending_rx_key, TX key was already rotated during initiation.
-        // If from next_keys, we need to rotate TX key too — but we already popped (rx, tx)
-        // and only kept rx. Pop another pair to get the tx key for peer-initiated rotation.
-        // Actually, the TX key for peer-initiated rotation was in the popped pair.
-        // We need to restructure: take_next_rx_key should also return the tx key.
-        // For now, the TX key rotation is handled in handle_key_update_rx.
-        // Since we bypassed handle_key_update_rx, we need to rotate TX key here.
-        //
-        // Simplification: for pending_rx_key case (we initiated), TX is already rotated.
-        // For next_keys case (peer initiated), we lost the TX key. Fix: take both.
-        key_update.reset_packets_since_update();
-    }
-
-    /// Rollback: put the candidate key back if decrypt failed.
-    fn put_back_rx_key(&mut self, key: Box<dyn PacketKey>, key_update: &KeyUpdateState) {
-        // We took from pending_rx_key or next_keys. Put back into pending_rx_key
-        // since we can't push_front to next_keys without the TX key pair.
-        self.pending_rx_key = Some(key);
-    }
-
-    fn handle_key_update_rx(
-        &mut self,
-        new_phase: bool,
-        key_update: &KeyUpdateState,
-        tx_state: &TxState,
-    ) {
-        if let Some(new_rx) = self.pending_rx_key.take() {
-            self.rx_packet_key = Arc::new(new_rx);
-            tracing::debug!("key update: RX rotated (peer responded to our initiation)");
-        } else {
+        // 2. Try next_keys (peer-initiated rotation).
+        {
             let mut next_keys = key_update
                 .next_keys
                 .lock()
                 .expect("key update mutex poisoned");
-            if let Some((new_rx, new_tx)) = next_keys.pop_front() {
-                self.rx_packet_key = Arc::new(new_rx);
-                tx_state.tx_packet_key.store(Arc::new(new_tx));
-                tracing::debug!("key update: rotated to new keys (peer-initiated)");
-            } else {
-                key_update.key_exhausted.store(true, Ordering::Relaxed);
-                warn!("key update: no pre-computed keys available, connection must be closed");
-                return;
+            if let Some((candidate_rx, candidate_tx)) = next_keys.pop_front() {
+                // Drop lock before crypto.
+                drop(next_keys);
+                match decrypt_payload(packet, hdr, &*candidate_rx, scratch) {
+                    Ok(result) => {
+                        self.rx_packet_key = Arc::new(candidate_rx);
+                        tx_state.tx_packet_key.store(Arc::new(candidate_tx));
+                        self.commit_key_rotation(hdr.key_phase, key_update, tx_state);
+                        tracing::debug!("key update: rotated to new keys (peer-initiated)");
+                        return Ok(result);
+                    }
+                    Err(_) => {
+                        let mut next_keys = key_update
+                            .next_keys
+                            .lock()
+                            .expect("key update mutex poisoned");
+                        next_keys.push_front((candidate_rx, candidate_tx));
+                    }
+                }
             }
         }
+
+        // 3. Fall back to current key (key_phase bit may have been corrupted).
+        decrypt_payload(packet, hdr, &**self.rx_packet_key, scratch)
+    }
+
+    /// Try decrypting in-place with candidate keys on key-phase change.
+    ///
+    /// AEAD modifies the buffer in-place, so we save and restore the payload
+    /// region between attempts.
+    fn try_decrypt_with_next_key_in_place(
+        &mut self,
+        packet: &mut [u8],
+        hdr: &crate::packet::ShortHeader,
+        key_update: &KeyUpdateState,
+        tx_state: &TxState,
+    ) -> Result<DecryptedInPlace, ParseError> {
+        let saved = packet[hdr.payload_offset..].to_vec();
+
+        // 1. Try pending_rx_key (we initiated rotation, peer is responding).
+        if let Some(candidate) = self.pending_rx_key.take() {
+            match decrypt_payload_in_place(packet, hdr, &*candidate) {
+                Ok(result) => {
+                    self.rx_packet_key = Arc::new(candidate);
+                    self.commit_key_rotation(hdr.key_phase, key_update, tx_state);
+                    tracing::debug!("key update: RX rotated (peer responded to our initiation)");
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.pending_rx_key = Some(candidate);
+                    packet[hdr.payload_offset..].copy_from_slice(&saved);
+                }
+            }
+        }
+
+        // 2. Try next_keys (peer-initiated rotation).
+        {
+            let mut next_keys = key_update
+                .next_keys
+                .lock()
+                .expect("key update mutex poisoned");
+            if let Some((candidate_rx, candidate_tx)) = next_keys.pop_front() {
+                drop(next_keys);
+                match decrypt_payload_in_place(packet, hdr, &*candidate_rx) {
+                    Ok(result) => {
+                        self.rx_packet_key = Arc::new(candidate_rx);
+                        tx_state.tx_packet_key.store(Arc::new(candidate_tx));
+                        self.commit_key_rotation(hdr.key_phase, key_update, tx_state);
+                        tracing::debug!("key update: rotated to new keys (peer-initiated)");
+                        return Ok(result);
+                    }
+                    Err(_) => {
+                        let mut next_keys = key_update
+                            .next_keys
+                            .lock()
+                            .expect("key update mutex poisoned");
+                        next_keys.push_front((candidate_rx, candidate_tx));
+                        packet[hdr.payload_offset..].copy_from_slice(&saved);
+                    }
+                }
+            }
+        }
+
+        // 3. Fall back to current key (key_phase bit may have been corrupted).
+        decrypt_payload_in_place(packet, hdr, &**self.rx_packet_key)
+    }
+
+    /// Commit a key rotation after successful AEAD verification.
+    fn commit_key_rotation(
+        &mut self,
+        new_phase: bool,
+        key_update: &KeyUpdateState,
+        tx_state: &TxState,
+    ) {
+        self.peer_key_phase = new_phase;
         tx_state.key_phase.store(new_phase, Ordering::Relaxed);
-        key_update
-            .packets_since_key_update
-            .store(0, Ordering::Relaxed);
+        key_update.reset_packets_since_update();
     }
 }
 

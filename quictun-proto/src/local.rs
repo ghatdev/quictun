@@ -134,22 +134,19 @@ impl LocalConnectionState {
             self.largest_rx_pn,
         )?;
 
-        // Key phase rotation.
-        // TODO: this commits before AEAD verification (RFC 9001 §6.2 violation).
-        // A proper fix must peek/try decrypt first, but the current peek approach
-        // has a subtle bug causing connection death at key rotation (~7M packets).
-        // Keeping the old (insecure) pattern until the fix is corrected.
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase);
-        }
+        // Key phase rotation: decrypt-before-commit (RFC 9001 §6.2).
+        // Try candidate keys first; only commit rotation after AEAD succeeds.
+        // decrypt_payload copies to scratch, so no payload save/restore needed.
+        let result = if hdr.key_phase != self.peer_key_phase {
+            self.try_decrypt_with_next_key(packet, &hdr, scratch)?
+        } else {
+            decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?
+        };
 
         // Reject duplicate packet numbers.
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
-
-        let result = decrypt_payload(packet, &hdr, &*self.rx_packet_key, scratch)?;
 
         // Update RX state.
         self.received.set(hdr.pn);
@@ -176,17 +173,18 @@ impl LocalConnectionState {
             self.largest_rx_pn,
         )?;
 
-        // Key phase rotation (see TODO above).
-        if hdr.key_phase != self.peer_key_phase {
-            self.peer_key_phase = hdr.key_phase;
-            self.handle_key_update_rx(hdr.key_phase);
-        }
+        // Key phase rotation: decrypt-before-commit (RFC 9001 §6.2).
+        // Try candidate keys first; only commit rotation after AEAD succeeds.
+        // In-place AEAD corrupts the buffer on failure, so save/restore payload.
+        let result = if hdr.key_phase != self.peer_key_phase {
+            self.try_decrypt_with_next_key_in_place(packet, &hdr)?
+        } else {
+            decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?
+        };
 
         if self.received.test(hdr.pn) {
             return Err(ParseError::DuplicatePacket);
         }
-
-        let result = decrypt_payload_in_place(packet, &hdr, &*self.rx_packet_key)?;
 
         self.received.set(hdr.pn);
         if hdr.pn > self.largest_rx_pn {
@@ -447,31 +445,103 @@ impl LocalConnectionState {
         }
     }
 
-    /// Peek at the next RX packet key without consuming it.
-    /// Used to try decryption before committing a key-phase change.
-    fn peek_next_rx_key(&self) -> Option<&dyn PacketKey> {
-        if let Some(key) = &self.pending_rx_key {
-            Some(&**key)
-        } else if let Some((rx, _)) = self.next_keys.front() {
-            Some(&**rx)
-        } else {
-            None
+    /// Try decrypting with candidate keys on key-phase change (RFC 9001 §6.2).
+    ///
+    /// Takes candidate keys out, tries AEAD, commits rotation on success or
+    /// puts keys back on failure. Only called during key rotation (~once per
+    /// 7M packets), so the payload save/restore cost is negligible.
+    fn try_decrypt_with_next_key(
+        &mut self,
+        packet: &[u8],
+        hdr: &crate::packet::ShortHeader,
+        scratch: &mut BytesMut,
+    ) -> Result<DecryptedPacket, ParseError> {
+        // 1. Try pending_rx_key (we initiated rotation, peer is responding).
+        if let Some(candidate) = self.pending_rx_key.take() {
+            match decrypt_payload(packet, hdr, &*candidate, scratch) {
+                Ok(result) => {
+                    self.rx_packet_key = candidate;
+                    self.commit_key_rotation(hdr.key_phase);
+                    tracing::debug!("key update: RX rotated (peer responded to our initiation)");
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.pending_rx_key = Some(candidate);
+                }
+            }
         }
+
+        // 2. Try next_keys (peer-initiated rotation).
+        if let Some((candidate_rx, candidate_tx)) = self.next_keys.pop_front() {
+            match decrypt_payload(packet, hdr, &*candidate_rx, scratch) {
+                Ok(result) => {
+                    self.rx_packet_key = candidate_rx;
+                    self.tx_packet_key = candidate_tx;
+                    self.commit_key_rotation(hdr.key_phase);
+                    tracing::debug!("key update: rotated to new keys (peer-initiated)");
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.next_keys.push_front((candidate_rx, candidate_tx));
+                }
+            }
+        }
+
+        // 3. Fall back to current key (key_phase bit may have been corrupted).
+        decrypt_payload(packet, hdr, &*self.rx_packet_key, scratch)
     }
 
-    fn handle_key_update_rx(&mut self, new_phase: bool) {
-        if let Some(new_rx) = self.pending_rx_key.take() {
-            self.rx_packet_key = new_rx;
-            tracing::debug!("key update: RX rotated (peer responded to our initiation)");
-        } else if let Some((new_rx, new_tx)) = self.next_keys.pop_front() {
-            self.rx_packet_key = new_rx;
-            self.tx_packet_key = new_tx;
-            tracing::debug!("key update: rotated to new keys (peer-initiated)");
-        } else {
-            self.key_exhausted = true;
-            warn!("key update: no pre-computed keys available, connection must be closed");
-            return;
+    /// Try decrypting in-place with candidate keys on key-phase change.
+    ///
+    /// AEAD modifies the buffer in-place, so we save and restore the payload
+    /// region between attempts.
+    fn try_decrypt_with_next_key_in_place(
+        &mut self,
+        packet: &mut [u8],
+        hdr: &crate::packet::ShortHeader,
+    ) -> Result<DecryptedInPlace, ParseError> {
+        let saved = packet[hdr.payload_offset..].to_vec();
+
+        // 1. Try pending_rx_key (we initiated rotation, peer is responding).
+        if let Some(candidate) = self.pending_rx_key.take() {
+            match decrypt_payload_in_place(packet, hdr, &*candidate) {
+                Ok(result) => {
+                    self.rx_packet_key = candidate;
+                    self.commit_key_rotation(hdr.key_phase);
+                    tracing::debug!("key update: RX rotated (peer responded to our initiation)");
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.pending_rx_key = Some(candidate);
+                    packet[hdr.payload_offset..].copy_from_slice(&saved);
+                }
+            }
         }
+
+        // 2. Try next_keys (peer-initiated rotation).
+        if let Some((candidate_rx, candidate_tx)) = self.next_keys.pop_front() {
+            match decrypt_payload_in_place(packet, hdr, &*candidate_rx) {
+                Ok(result) => {
+                    self.rx_packet_key = candidate_rx;
+                    self.tx_packet_key = candidate_tx;
+                    self.commit_key_rotation(hdr.key_phase);
+                    tracing::debug!("key update: rotated to new keys (peer-initiated)");
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.next_keys.push_front((candidate_rx, candidate_tx));
+                    packet[hdr.payload_offset..].copy_from_slice(&saved);
+                }
+            }
+        }
+
+        // 3. Fall back to current key (key_phase bit may have been corrupted).
+        decrypt_payload_in_place(packet, hdr, &*self.rx_packet_key)
+    }
+
+    /// Commit a key rotation after successful AEAD verification.
+    fn commit_key_rotation(&mut self, new_phase: bool) {
+        self.peer_key_phase = new_phase;
         self.key_phase = new_phase;
         self.packets_since_key_update = 0;
     }
